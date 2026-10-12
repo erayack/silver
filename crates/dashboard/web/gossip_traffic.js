@@ -93,7 +93,7 @@ export function render(inst, ui, nowS, specs) {
   const rest = [...entries.keys()].filter((k) => !picked.includes(k));
 
   const layers = [
-    { label: CONTROL, counters: [CONTROL], colour: 0 },
+    ...(ui.hideControl ? [] : [{ label: CONTROL, counters: [CONTROL], colour: 0 }]),
     ...picked.map((k, i) => ({ label: k, counters: entries.get(k).topics, colour: i + 1 })),
     ...(ui.hideOther ? [] : [{ label: OTHER, counters: rest.flatMap((k) => entries.get(k).topics), colour: OTHER_COLOUR }]),
   ].map((layer) => {
@@ -104,7 +104,7 @@ export function render(inst, ui, nowS, specs) {
   // Largest first, so each lower layer is drawn over the one above it.
   const order = layers.map((_, i) => i).reverse();
   const sum = (ys) => ys.reduce((total, v) => total + (v ?? 0), 0);
-  const blockX = layers[0].blockX;
+  const blockX = layers[0]?.blockX ?? null;
   specs.set('gossip-traffic', {
     labels: order.map((i) => layers[i].label),
     data: [w.xs, ...order.map((i) => tops[i])],
@@ -123,7 +123,7 @@ export function render(inst, ui, nowS, specs) {
   const colourOf = new Map(picked.map((n, i) => [n, i + 1]));
   const listed = [...new Set([...picked, ...ranked])];
   const rows = [
-    listRow(CONTROL, totals.get(CONTROL) ?? 0, 0, null),
+    listRow(CONTROL, totals.get(CONTROL) ?? 0, ui.hideControl ? null : 0, !ui.hideControl),
     listRow(OTHER, rest.reduce((t, k) => t + bytesOf(k), 0), ui.hideOther ? null : OTHER_COLOUR, !ui.hideOther),
     ...listed.map((k) => listRow(k, bytesOf(k), colourOf.get(k) ?? null, colourOf.has(k))),
   ].join('');
@@ -149,6 +149,10 @@ export function click(target, ui) {
   if (!topic) return false;
   if (topic === OTHER) {
     ui.hideOther = !ui.hideOther;
+    return true;
+  }
+  if (topic === CONTROL) {
+    ui.hideControl = !ui.hideControl;
     return true;
   }
   const picked = ui.picked ?? [...(ui.autoPicked ?? [])];
