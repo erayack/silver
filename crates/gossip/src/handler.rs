@@ -4,9 +4,9 @@ use buffa::MessageView;
 use flux::spine::SpineAdapter;
 use silver_common::{
     Error, GOSSIP_TOPIC_COUNTER_SLOTS, GossipDomain, GossipMsgIn, GossipMsgOut, GossipTopic,
-    LOCAL_GOSSIP_STREAM_ID, MessageId, Nanos, NewGossipMsg, P2pStreamId, PeerControl, PeerEvent,
-    SelfBuiltGossip, SilverSpine, StreamProtocol, TCacheError, TCacheId, TCacheProducer,
-    TCacheRead, TCacheReader, TCacheTable, TProducer, TReadMode, TileId,
+    GossipTraffic, GossipTrafficBytes, LOCAL_GOSSIP_STREAM_ID, MessageId, Nanos, NewGossipMsg,
+    P2pStreamId, PeerControl, PeerEvent, SelfBuiltGossip, SilverSpine, StreamProtocol, TCacheError,
+    TCacheId, TCacheProducer, TCacheRead, TCacheReader, TCacheTable, TProducer, TReadMode, TileId,
     cell_store::PartialColumnsMode, msg_id_valid_snappy,
 };
 
@@ -340,6 +340,7 @@ impl GossipHandler {
                     emit(GossipHandlerEvent::SendGossip(GossipMsgOut {
                         peer_id: p2p_connection,
                         tcache,
+                        traffic: GossipTraffic::CONTROL,
                     }));
                 }
             }
@@ -357,6 +358,7 @@ impl GossipHandler {
                         emit(GossipHandlerEvent::SendGossip(GossipMsgOut {
                             peer_id: p2p_connection,
                             tcache,
+                            traffic: GossipTraffic::CONTROL,
                         }));
                     }
                     Err(e) => silver_log::warn!(p2p_connection, ?e, "subscriptions frame not sent"),
@@ -373,6 +375,7 @@ impl GossipHandler {
                     emit(GossipHandlerEvent::SendGossip(GossipMsgOut {
                         peer_id: p2p_connection,
                         tcache,
+                        traffic: GossipTraffic::CONTROL,
                     }));
                 }
             }
@@ -385,6 +388,7 @@ impl GossipHandler {
                     emit(GossipHandlerEvent::SendGossip(GossipMsgOut {
                         peer_id: p2p_connection,
                         tcache,
+                        traffic: GossipTraffic::CONTROL,
                     }));
                 }
             }
@@ -405,6 +409,7 @@ impl GossipHandler {
                     emit(GossipHandlerEvent::SendGossip(GossipMsgOut {
                         peer_id: p2p_connection,
                         tcache,
+                        traffic: GossipTraffic::CONTROL,
                     }));
                 }
             }
@@ -456,6 +461,9 @@ impl GossipHandler {
             silver_log::trace!(?stream_id, len = buffer.len(), "gossip protobuf recv");
 
             buffer = &buffer[size_of::<P2pStreamId>()..];
+            // Published payloads count toward their topic; the rest of the frame
+            // is control.
+            let mut topic_bytes = 0;
 
             let gossip_proto = match RPCView::decode_view(buffer) {
                 Ok(p) => Some(p),
@@ -480,6 +488,16 @@ impl GossipHandler {
                     }));
                 }
                 handle_subscriptions(stream_id, gossip_proto.subscriptions, &self.domains, emit);
+
+                if let Some(partial) = gossip_proto.partial.as_option() &&
+                    let Some(message) = partial.partial_message &&
+                    let Some(topic_id) = partial.topic_id &&
+                    let Ok(wire) = str::from_utf8(topic_id) &&
+                    let Ok((topic, _)) = self.domains.parse(wire)
+                {
+                    GossipTrafficBytes::Recv.add(GossipTraffic::of(topic), message.len());
+                    topic_bytes += message.len();
+                }
 
                 if self.partial_columns.supports_sending() &&
                     let Some(partial) = gossip_proto.partial.as_option() &&
@@ -529,11 +547,17 @@ impl GossipHandler {
                         continue;
                     }
                     if let Some(snappy_data) = gossip_msg.data {
+                        let parsed = self.domains.parse(gossip_msg.topic);
+                        if let Ok((topic, _)) = parsed {
+                            GossipTrafficBytes::Recv
+                                .add(GossipTraffic::of(topic), snappy_data.len());
+                            topic_bytes += snappy_data.len();
+                        }
                         if let Err(e) = handle_incoming(
                             gossip_msg.topic,
+                            parsed,
                             snappy_data,
                             stream_id,
-                            &self.domains,
                             recv_ts,
                             &mut self.dedup_cache,
                             &mut self.incoming_gossip_publish,
@@ -551,6 +575,7 @@ impl GossipHandler {
                     }
                 }
             }
+            GossipTrafficBytes::Recv.add(GossipTraffic::CONTROL, buffer.len() - topic_bytes);
         });
 
         // Free read data.
@@ -735,7 +760,7 @@ mod tests {
         ]);
 
         handler.handle_peer_control(announce);
-        let Some(GossipHandlerEvent::SendGossip(GossipMsgOut { peer_id: 7, tcache })) =
+        let Some(GossipHandlerEvent::SendGossip(GossipMsgOut { peer_id: 7, tcache, .. })) =
             handler.pop_event()
         else {
             panic!("one frame to connection 7")

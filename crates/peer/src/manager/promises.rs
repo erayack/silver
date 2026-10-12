@@ -7,8 +7,8 @@ use std::{collections::HashMap, time::Instant};
 
 use flux_profiler::timed;
 use silver_common::{
-    GossipMsgOut, GossipTopic, LOCAL_GOSSIP_STREAM_ID, MessageId, Nanos, P2pSend, PeerControl,
-    PeerId, SelfBuiltGossip, TCacheRead,
+    GossipMsgOut, GossipTopic, GossipTraffic, LOCAL_GOSSIP_STREAM_ID, MessageId, Nanos, P2pSend,
+    PeerControl, PeerId, SelfBuiltGossip, TCacheRead,
 };
 
 use super::PeerManager;
@@ -101,6 +101,7 @@ impl PeerManager {
         conn: usize,
         hash: MessageId,
         tcache: TCacheRead,
+        traffic: GossipTraffic,
         emit: &mut impl FnMut(PeerControl),
     ) {
         let Some(peer) = self.peers.get_mut(&conn) else {
@@ -113,7 +114,11 @@ impl PeerManager {
         if peer.gossip_gate_score() < self.params.gossip_threshold {
             return;
         }
-        emit(PeerControl::P2pSend(P2pSend::Gossip(GossipMsgOut { peer_id: conn, tcache })));
+        emit(PeerControl::P2pSend(P2pSend::Gossip(GossipMsgOut {
+            peer_id: conn,
+            tcache,
+            traffic,
+        })));
     }
 
     /// Peer sent us an IDONTWANT - store the message id in the peer message
@@ -251,6 +256,7 @@ impl PeerManager {
             emit(PeerControl::P2pSend(P2pSend::Gossip(GossipMsgOut {
                 peer_id: *conn,
                 tcache: idontwant,
+                traffic: GossipTraffic::CONTROL,
             })));
         }
     }
@@ -302,6 +308,7 @@ impl PeerManager {
             emit(PeerControl::P2pSend(P2pSend::Gossip(GossipMsgOut {
                 peer_id: *conn,
                 tcache: protobuf,
+                traffic: GossipTraffic::CONTROL,
             })));
             emitted += 1;
         }
@@ -326,7 +333,11 @@ impl PeerManager {
         if peer.gossip_gate_score() < self.params.gossip_threshold {
             return;
         }
-        emit(PeerControl::P2pSend(P2pSend::Gossip(GossipMsgOut { peer_id: conn, tcache })));
+        emit(PeerControl::P2pSend(P2pSend::Gossip(GossipMsgOut {
+            peer_id: conn,
+            tcache,
+            traffic: GossipTraffic::CONTROL,
+        })));
     }
 
     #[timed]
@@ -366,7 +377,11 @@ impl PeerManager {
             }
             peer_state.topic_stats.entry(topic).or_default().fanout_sent += 1;
             crate::counters::GossipTopicCounters::sent(topic);
-            emit(PeerControl::P2pSend(P2pSend::Gossip(GossipMsgOut { peer_id: *peer, tcache })));
+            emit(PeerControl::P2pSend(P2pSend::Gossip(GossipMsgOut {
+                peer_id: *peer,
+                tcache,
+                traffic: GossipTraffic::of(topic),
+            })));
         }
 
         let d = self.params.d as usize;
@@ -396,7 +411,11 @@ impl PeerManager {
         });
         for &peer_id in subscribers.take(count) {
             crate::counters::GossipTopicCounters::sent(topic);
-            emit(PeerControl::P2pSend(P2pSend::Gossip(GossipMsgOut { peer_id, tcache })));
+            emit(PeerControl::P2pSend(P2pSend::Gossip(GossipMsgOut {
+                peer_id,
+                tcache,
+                traffic: GossipTraffic::of(topic),
+            })));
         }
     }
 
@@ -485,9 +504,11 @@ mod tests {
                 .0
                 .iter()
                 .filter_map(|event| match event {
-                    PeerControl::P2pSend(P2pSend::Gossip(GossipMsgOut { peer_id: 1, tcache })) => {
-                        Some(producer.read_buffer(*tcache).unwrap())
-                    }
+                    PeerControl::P2pSend(P2pSend::Gossip(GossipMsgOut {
+                        peer_id: 1,
+                        tcache,
+                        ..
+                    })) => Some(producer.read_buffer(*tcache).unwrap()),
                     _ => None,
                 })
                 .collect();
@@ -955,9 +976,11 @@ mod tests {
 
         cap.0.clear();
         let hash = silver_common::MessageId { id: [3u8; 20] };
-        mgr.handle_event(PeerEvent::P2pGossipWant { p2p_peer: 1, hash, tcache }, now, &mut |c| {
-            cap.0.push(c)
-        });
+        mgr.handle_event(
+            PeerEvent::P2pGossipWant { p2p_peer: 1, hash, tcache, traffic: GossipTraffic::CONTROL },
+            now,
+            &mut |c| cap.0.push(c),
+        );
 
         assert!(
             cap.0.iter().any(|e| matches!(
@@ -996,7 +1019,7 @@ mod tests {
         cap.0.clear();
         let hash = silver_common::MessageId { id: [4u8; 20] };
         mgr.handle_event(
-            PeerEvent::P2pGossipWant { p2p_peer: 1, hash, tcache },
+            PeerEvent::P2pGossipWant { p2p_peer: 1, hash, tcache, traffic: GossipTraffic::CONTROL },
             now + Duration::from_millis(20),
             &mut |c| cap.0.push(c),
         );

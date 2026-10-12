@@ -119,11 +119,12 @@ pub(super) fn handle_iwants<'a>(
                 continue;
             };
 
-            if let Some(tcache) = mcache.get(&hash) {
+            if let Some((tcache, traffic)) = mcache.get(&hash) {
                 emit(GossipHandlerEvent::PeerEvent(PeerEvent::P2pGossipWant {
                     p2p_peer: stream_id.peer(),
                     hash,
                     tcache,
+                    traffic,
                 }));
             } else {
                 match mcache.history(&hash) {
