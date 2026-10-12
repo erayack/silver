@@ -95,7 +95,7 @@ export function render(inst, ui, nowS, specs) {
   const layers = [
     { label: CONTROL, counters: [CONTROL], colour: 0 },
     ...picked.map((k, i) => ({ label: k, counters: entries.get(k).topics, colour: i + 1 })),
-    { label: OTHER, counters: rest.flatMap((k) => entries.get(k).topics), colour: OTHER_COLOUR },
+    ...(ui.hideOther ? [] : [{ label: OTHER, counters: rest.flatMap((k) => entries.get(k).topics), colour: OTHER_COLOUR }]),
   ].map((layer) => {
     const { ys, blockX } = binnedSeries(inst, { source, counters: layer.counters }, w.slot, w.startS, w.bins);
     return { ...layer, ys, blockX };
@@ -124,7 +124,7 @@ export function render(inst, ui, nowS, specs) {
   const listed = [...new Set([...picked, ...ranked])];
   const rows = [
     listRow(CONTROL, totals.get(CONTROL) ?? 0, 0, null),
-    listRow(OTHER, rest.reduce((t, k) => t + bytesOf(k), 0), OTHER_COLOUR, null),
+    listRow(OTHER, rest.reduce((t, k) => t + bytesOf(k), 0), ui.hideOther ? null : OTHER_COLOUR, !ui.hideOther),
     ...listed.map((k) => listRow(k, bytesOf(k), colourOf.get(k) ?? null, colourOf.has(k))),
   ].join('');
   const title = w.slot === null ? 'bytes per 100 ms' : `bytes per 100 ms, slot ${w.slot}`;
@@ -147,6 +147,10 @@ export function click(target, ui) {
   }
   const topic = target.closest('[data-traffic-topic]')?.dataset.trafficTopic;
   if (!topic) return false;
+  if (topic === OTHER) {
+    ui.hideOther = !ui.hideOther;
+    return true;
+  }
   const picked = ui.picked ?? [...(ui.autoPicked ?? [])];
   const at = picked.indexOf(topic);
   if (at >= 0) picked.splice(at, 1);
