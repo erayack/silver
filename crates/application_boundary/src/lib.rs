@@ -18,11 +18,12 @@ use silver_pbs::{PbsClient, SidecarEvent};
 
 /// A tenant added here takes the next share of a raised `TENANTS`, which keeps
 /// every share disjoint without a base to compute.
-const TENANTS: usize = 4;
+const TENANTS: usize = 5;
 const BEACON_TOKENS: TokenRange = TokenRange::share(0, TENANTS);
 const ENGINE_TOKENS: TokenRange = TokenRange::share(1, TENANTS);
 const PBS_TOKENS: TokenRange = TokenRange::share(2, TENANTS);
 const PBS_HEADER_TOKENS: TokenRange = TokenRange::share(3, TENANTS);
+const PBS_SUBMISSION_TOKENS: TokenRange = TokenRange::share(4, TENANTS);
 
 pub struct ApplicationBoundaryTile {
     readiness: Readiness,
@@ -80,10 +81,10 @@ impl Tile<SilverSpine> for ApplicationBoundaryTile {
             readiness.events(),
             processing,
             &mut |request| adapter.produce(request),
-            &mut |request_id, path, body| {
+            &mut |request_id, call_path, body| {
                 pbs.as_mut()
                     .expect("a sidecar request needs a pbs.endpoint")
-                    .send(request_id, path, body)
+                    .send(request_id, call_path, body)
             },
         );
         if did_work {
@@ -122,6 +123,7 @@ impl ApplicationBoundaryTile {
                 readiness.registry(),
                 PBS_TOKENS,
                 PBS_HEADER_TOKENS,
+                PBS_SUBMISSION_TOKENS,
                 pbs,
                 spec,
                 state.read(|view| view.imm.genesis_time).expect("the anchor state is published"),
@@ -164,8 +166,13 @@ impl ApplicationBoundaryTile {
         adapter.consume(|event: PeerEvent, _| beacon.handle_peer_event(event));
         adapter.consume(|event: DataColumnsEvent, _| beacon.handle_data_columns_event(event));
         adapter.consume(|update: SyncUpdate, _| beacon.handle_sync_update(update));
-        adapter
-            .consume(|response: BeaconApiResponse, _| beacon.handle_response(response, processing));
+        adapter.consume(|response: BeaconApiResponse, _| {
+            beacon.handle_response(response, processing, &mut |request_id, call_path, body| {
+                pbs.as_mut()
+                    .expect("a sidecar request needs a pbs.endpoint")
+                    .send(request_id, call_path, body)
+            })
+        });
 
         beacon.set_el_sync_status(engine.sync_status());
     }

@@ -28,7 +28,7 @@ use silver_peer::{PeerManager, SweepOutput};
 use self::{
     gossip_schedule::GossipSchedule,
     local_gossip::{LocalGossipHandler, LocalMessage, produce_response},
-    slashing_protection::{PendingAttestation, SlashingProtectionHandler},
+    slashing_protection::{PendingAttestation, SlashingProtectionHandler, SubmittedBlock},
     subnet_duties::{SubnetDuties, Subnets},
 };
 use crate::{
@@ -235,6 +235,7 @@ impl Controller {
             GossipTopic::BeaconBlock => self.slashing_protection.on_local_block(
                 request_id,
                 acquired,
+                SubmittedBlock::Full,
                 now,
                 &mut self.local_gossip,
                 &mut self.gossip_handler,
@@ -574,6 +575,17 @@ impl Tile<SilverSpine> for Controller {
         adapter.consume(|request: BeaconApiRequest, producers| match request {
             BeaconApiRequest::LocalGossip { request_id, topic, ssz } => {
                 self.on_local_gossip(request_id, topic, ssz, now, producers)
+            }
+            BeaconApiRequest::LockBlindedBlock { request_id, ssz } => {
+                self.slashing_protection.on_local_block(
+                    request_id,
+                    self.reader.acquire(ssz),
+                    SubmittedBlock::Blinded,
+                    now,
+                    &mut self.local_gossip,
+                    &mut self.gossip_handler,
+                    producers,
+                )
             }
             BeaconApiRequest::BeaconCommitteeSubscriptions { subscriptions } => {
                 if let Some(wall_slot) = wall_slot {
