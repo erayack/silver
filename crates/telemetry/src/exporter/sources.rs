@@ -422,7 +422,7 @@ mod tests {
         let [fast] = &sources.fast[..] else { panic!("one fast source") };
         assert_eq!(fast.name, format!("fast:{}", GossipTrafficBytes::RECV_FILE));
         assert_eq!(fast.slots.len(), GossipTraffic::SLOTS);
-        assert_eq!(fast.slot_names.last().map(String::as_str), Some("control"));
+        assert!(fast.slot_names.ends_with(&["control", "ihave", "iwant"].map(String::from)));
     }
 
     #[test]

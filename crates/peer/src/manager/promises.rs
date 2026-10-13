@@ -308,7 +308,7 @@ impl PeerManager {
             emit(PeerControl::P2pSend(P2pSend::Gossip(GossipMsgOut {
                 peer_id: *conn,
                 tcache: protobuf,
-                traffic: GossipTraffic::CONTROL,
+                traffic: GossipTraffic::IHAVE,
             })));
             emitted += 1;
         }
@@ -336,7 +336,7 @@ impl PeerManager {
         emit(PeerControl::P2pSend(P2pSend::Gossip(GossipMsgOut {
             peer_id: conn,
             tcache,
-            traffic: GossipTraffic::CONTROL,
+            traffic: GossipTraffic::IWANT,
         })));
     }
 
@@ -897,7 +897,13 @@ mod tests {
             .0
             .iter()
             .filter_map(|e| {
-                if let PeerControl::P2pSend(P2pSend::Gossip(GossipMsgOut { peer_id, .. })) = e {
+                if let PeerControl::P2pSend(P2pSend::Gossip(GossipMsgOut {
+                    peer_id,
+                    traffic,
+                    ..
+                })) = e
+                {
+                    assert_eq!(*traffic, GossipTraffic::IHAVE);
                     Some(*peer_id)
                 } else {
                     None
@@ -959,6 +965,23 @@ mod tests {
             "below-threshold peer should not receive IHAVE, got {:?}",
             cap.0
         );
+    }
+
+    /// The IWANT we send in reply to an IHAVE is counted as IWANT traffic.
+    #[test]
+    fn outbound_iwant_is_tagged_iwant() {
+        let now = Instant::now();
+        let (mut mgr, mut cap) = fixture(vec![GossipTopic::BeaconBlock], ScoreParams::default());
+        connect(&mut mgr, &mut cap, 1, 1, now);
+        cap.0.clear();
+        mgr.handle_event(
+            PeerEvent::OutboundIWant { p2p_peer: 1, iwant: mk_tcache_read() },
+            now,
+            &mut |c| cap.0.push(c),
+        );
+        assert!(matches!(cap.0.as_slice(), [PeerControl::P2pSend(P2pSend::Gossip(
+            GossipMsgOut { peer_id: 1, traffic: GossipTraffic::IWANT, .. }
+        ))]));
     }
 
     #[test]

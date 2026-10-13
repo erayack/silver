@@ -14,7 +14,7 @@ use crate::{
     ColumnIngress, GossipHandlerEvent, PartialInbound, PartialMetadataReceived,
     control::{
         self, copy_ihaves_to_protobuf_output, handle_grafts, handle_idontwants, handle_ihaves,
-        handle_iwants, handle_prunes, handle_subscriptions,
+        handle_iwants, handle_prunes, handle_subscriptions, ihave_entries_len, iwant_entries_len,
     },
     dedup::DedupCache,
     generated::RPCView,
@@ -461,9 +461,9 @@ impl GossipHandler {
             silver_log::trace!(?stream_id, len = buffer.len(), "gossip protobuf recv");
 
             buffer = &buffer[size_of::<P2pStreamId>()..];
-            // Published payloads count toward their topic; the rest of the frame
-            // is control.
-            let mut topic_bytes = 0;
+            // Published payloads count toward their topic, IHAVE and IWANT
+            // entries toward their own; the rest of the frame is control.
+            let mut counted = 0;
 
             let gossip_proto = match RPCView::decode_view(buffer) {
                 Ok(p) => Some(p),
@@ -496,7 +496,7 @@ impl GossipHandler {
                     let Ok((topic, _)) = self.domains.parse(wire)
                 {
                     GossipTrafficBytes::Recv.add(GossipTraffic::of(topic), message.len());
-                    topic_bytes += message.len();
+                    counted += message.len();
                 }
 
                 if self.partial_columns.supports_sending() &&
@@ -518,6 +518,11 @@ impl GossipHandler {
                 }
 
                 if let Some(control) = gossip_proto.control.as_option() {
+                    let ihave = ihave_entries_len(&control.ihave);
+                    let iwant = iwant_entries_len(&control.iwant);
+                    GossipTrafficBytes::Recv.add(GossipTraffic::IHAVE, ihave);
+                    GossipTrafficBytes::Recv.add(GossipTraffic::IWANT, iwant);
+                    counted += ihave + iwant;
                     handle_grafts(stream_id, &control.graft, &self.domains, emit);
                     handle_prunes(stream_id, &control.prune, &self.domains, emit);
                     handle_iwants(stream_id, &control.iwant, &mut self.mcache, emit);
@@ -551,7 +556,7 @@ impl GossipHandler {
                         if let Ok((topic, _)) = parsed {
                             GossipTrafficBytes::Recv
                                 .add(GossipTraffic::of(topic), snappy_data.len());
-                            topic_bytes += snappy_data.len();
+                            counted += snappy_data.len();
                         }
                         if let Err(e) = handle_incoming(
                             gossip_msg.topic,
@@ -575,7 +580,7 @@ impl GossipHandler {
                     }
                 }
             }
-            GossipTrafficBytes::Recv.add(GossipTraffic::CONTROL, buffer.len() - topic_bytes);
+            GossipTrafficBytes::Recv.add(GossipTraffic::CONTROL, buffer.len() - counted);
         });
 
         // Free read data.
