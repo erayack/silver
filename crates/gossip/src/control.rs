@@ -35,6 +35,12 @@ pub(super) fn iwant_entries_len<'a>(wants: &RepeatedView<'a, ControlIWantView<'a
     wants.into_iter().map(|iwant| entry_len(message_ids_len(&iwant.message_ids))).sum()
 }
 
+pub(super) fn idontwant_entries_len<'a>(
+    dontwants: &RepeatedView<'a, ControlIDontWantView<'a>>,
+) -> usize {
+    dontwants.into_iter().map(|idontwant| entry_len(message_ids_len(&idontwant.message_ids))).sum()
+}
+
 fn message_ids_len(ids: &RepeatedView<'_, &[u8]>) -> usize {
     ids.into_iter().map(|id| 1 + bytes_encoded_len(id)).sum()
 }

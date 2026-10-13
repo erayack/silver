@@ -6,7 +6,8 @@ use super::{GOSSIP_TOPIC_COUNTER_SLOTS, GossipTopic, gossip_topic_for_counter_sl
 use crate::metrics::map_counters;
 
 /// Where a gossip frame's bytes are counted: the counter slot of the topic
-/// whose payload it carries, IHAVE or IWANT, or control for the rest.
+/// whose payload it carries, IHAVE, IWANT or IDONTWANT, or control for the
+/// rest.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct GossipTraffic(u16);
 
@@ -14,7 +15,8 @@ impl GossipTraffic {
     pub const CONTROL: Self = Self(GOSSIP_TOPIC_COUNTER_SLOTS as u16);
     pub const IHAVE: Self = Self(GOSSIP_TOPIC_COUNTER_SLOTS as u16 + 1);
     pub const IWANT: Self = Self(GOSSIP_TOPIC_COUNTER_SLOTS as u16 + 2);
-    pub const SLOTS: usize = GOSSIP_TOPIC_COUNTER_SLOTS + 3;
+    pub const IDONTWANT: Self = Self(GOSSIP_TOPIC_COUNTER_SLOTS as u16 + 3);
+    pub const SLOTS: usize = GOSSIP_TOPIC_COUNTER_SLOTS + 4;
 
     pub fn of(topic: GossipTopic) -> Self {
         Self(topic.counter_slot() as u16)
@@ -26,6 +28,7 @@ impl GossipTraffic {
             s if s == Self::CONTROL.0 as usize => return "control".to_string(),
             s if s == Self::IHAVE.0 as usize => return "ihave".to_string(),
             s if s == Self::IWANT.0 as usize => return "iwant".to_string(),
+            s if s == Self::IDONTWANT.0 as usize => return "idontwant".to_string(),
             _ => {}
         }
         gossip_topic_for_counter_slot(slot)
@@ -39,8 +42,8 @@ impl GossipTraffic {
 pub enum GossipTrafficBytes {
     /// Frame bytes as the network tile writes them.
     Sent,
-    /// Compressed payload per published message, and the encoded IHAVE and
-    /// IWANT entries; the rest of each frame goes to control.
+    /// Compressed payload per published message, and the encoded IHAVE,
+    /// IWANT and IDONTWANT entries; the rest of each frame goes to control.
     Recv,
 }
 
@@ -97,7 +100,8 @@ mod tests {
         assert_eq!(GossipTraffic::label(GossipTraffic::CONTROL.0 as usize), "control");
         assert_eq!(GossipTraffic::label(GossipTraffic::IHAVE.0 as usize), "ihave");
         assert_eq!(GossipTraffic::label(GossipTraffic::IWANT.0 as usize), "iwant");
-        assert_eq!(GossipTraffic::IWANT.0 as usize, GossipTraffic::SLOTS - 1);
+        assert_eq!(GossipTraffic::label(GossipTraffic::IDONTWANT.0 as usize), "idontwant");
+        assert_eq!(GossipTraffic::IDONTWANT.0 as usize, GossipTraffic::SLOTS - 1);
         let topic = GossipTopic::DataColumnSidecar(127);
         assert!(GossipTraffic::of(topic).0 < GossipTraffic::CONTROL.0);
         assert_eq!(GossipTraffic::label(GossipTraffic::of(topic).0 as usize), topic.to_string());

@@ -256,7 +256,7 @@ impl PeerManager {
             emit(PeerControl::P2pSend(P2pSend::Gossip(GossipMsgOut {
                 peer_id: *conn,
                 tcache: idontwant,
-                traffic: GossipTraffic::CONTROL,
+                traffic: GossipTraffic::IDONTWANT,
             })));
         }
     }
@@ -982,6 +982,43 @@ mod tests {
         assert!(matches!(cap.0.as_slice(), [PeerControl::P2pSend(P2pSend::Gossip(
             GossipMsgOut { peer_id: 1, traffic: GossipTraffic::IWANT, .. }
         ))]));
+    }
+
+    /// The IDONTWANT fanned out for a received message is counted as
+    /// IDONTWANT traffic, to every mesh peer but the sender.
+    #[test]
+    fn idontwant_fan_out_is_tagged_idontwant() {
+        let now = Instant::now();
+        let topic = GossipTopic::BeaconBlock;
+        let (mut mgr, mut cap) = fixture(vec![topic], ScoreParams::default());
+        for conn in 1..=3 {
+            connect(&mut mgr, &mut cap, conn, conn as u8, now);
+        }
+        mgr.test_mesh_extend(topic, [1, 2, 3]);
+        cap.0.clear();
+        mgr.handle_event(
+            PeerEvent::NewGossip {
+                p2p_peer: 1,
+                topic,
+                msg_hash: MessageId { id: [11u8; 20] },
+                recv_ts: Nanos::from_secs(10),
+                idontwant: Some(mk_tcache_read()),
+            },
+            now,
+            &mut |c| cap.0.push(c),
+        );
+        let mut tagged: Vec<_> = cap
+            .0
+            .iter()
+            .filter_map(|c| match c {
+                PeerControl::P2pSend(P2pSend::Gossip(GossipMsgOut {
+                    peer_id, traffic, ..
+                })) => Some((*peer_id, *traffic)),
+                _ => None,
+            })
+            .collect();
+        tagged.sort_by_key(|(peer_id, _)| *peer_id);
+        assert_eq!(tagged, [(2, GossipTraffic::IDONTWANT), (3, GossipTraffic::IDONTWANT)]);
     }
 
     #[test]

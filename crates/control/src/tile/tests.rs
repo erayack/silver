@@ -189,12 +189,12 @@ fn write_bytes(producer: &mut TProducer, bytes: &[u8]) -> TCacheRead {
     reservation.read()
 }
 
-/// A published payload counts toward its topic, IHAVE and IWANT entries
-/// toward their own slots, and the rest of the frame toward control, whether
-/// or not any of it then decodes. IHAVE, IWANT and control are shared with
+/// A published payload counts toward its topic, IHAVE, IWANT and IDONTWANT
+/// entries toward their own slots, and the rest of the frame toward control,
+/// whether or not any of it then decodes. All but the topic are shared with
 /// concurrently running tests, so only their lower bounds are checked.
 #[test]
-fn received_gossip_bytes_split_by_topic_ihave_iwant_and_control() {
+fn received_gossip_bytes_split_by_topic_control_kinds_and_control() {
     let mut capture = GossipPublications::new(GossipTopic::BeaconBlock, &[]);
     let topic = GossipTopic::SyncCommittee(3);
     let data = [0x5a; 40];
@@ -204,17 +204,19 @@ fn received_gossip_bytes_split_by_topic_ihave_iwant_and_control() {
     // RPC.publish → Message { data = 2, topic = 4 }.
     let message = [field(0x12, &data), field(0x22, wire.as_bytes())].concat();
     // ControlMessage { ihave = 1 { topic_id = 1, message_ids = 2 }, iwant = 2 {
-    // message_ids = 1 } }.
+    // message_ids = 1 }, idontwant = 5 { message_ids = 1 } }.
     let ihave = field(0x0a, &[field(0x0a, wire.as_bytes()), field(0x12, &id)].concat());
     let iwant = field(0x12, &field(0x0a, &id));
-    let rpc =
-        [field(0x12, &message), field(0x1a, &[ihave.clone(), iwant.clone()].concat())].concat();
+    let idontwant = field(0x2a, &field(0x0a, &id));
+    let control = [ihave.clone(), iwant.clone(), idontwant.clone()].concat();
+    let rpc = [field(0x12, &message), field(0x1a, &control)].concat();
 
     let read = |traffic| GossipTrafficBytes::Recv.get(traffic);
     let slots = [
         GossipTraffic::of(topic),
         GossipTraffic::IHAVE,
         GossipTraffic::IWANT,
+        GossipTraffic::IDONTWANT,
         GossipTraffic::CONTROL,
     ];
     let before = slots.map(read);
@@ -225,13 +227,14 @@ fn received_gossip_bytes_split_by_topic_ihave_iwant_and_control() {
     capture.observer.produce(GossipMsgIn { p2p_id: stream, tcache });
     capture.crank();
 
-    let [payload, ihave_bytes, iwant_bytes, control] =
-        [0, 1, 2, 3].map(|i| read(slots[i]) - before[i]);
+    let [payload, ihave_bytes, iwant_bytes, idontwant_bytes, control_bytes] =
+        [0, 1, 2, 3, 4].map(|i| read(slots[i]) - before[i]);
     assert_eq!(payload, data.len() as u64);
     assert!(ihave_bytes >= ihave.len() as u64, "{ihave_bytes}");
     assert!(iwant_bytes >= iwant.len() as u64, "{iwant_bytes}");
-    let rest = rpc.len() - data.len() - ihave.len() - iwant.len();
-    assert!(control >= rest as u64, "{control}");
+    assert!(idontwant_bytes >= idontwant.len() as u64, "{idontwant_bytes}");
+    let rest = rpc.len() - data.len() - control.len();
+    assert!(control_bytes >= rest as u64, "{control_bytes}");
 }
 
 /// Beacon state publishes its first status as soon as its thread runs, which

@@ -14,7 +14,8 @@ use crate::{
     ColumnIngress, GossipHandlerEvent, PartialInbound, PartialMetadataReceived,
     control::{
         self, copy_ihaves_to_protobuf_output, handle_grafts, handle_idontwants, handle_ihaves,
-        handle_iwants, handle_prunes, handle_subscriptions, ihave_entries_len, iwant_entries_len,
+        handle_iwants, handle_prunes, handle_subscriptions, idontwant_entries_len,
+        ihave_entries_len, iwant_entries_len,
     },
     dedup::DedupCache,
     generated::RPCView,
@@ -520,9 +521,11 @@ impl GossipHandler {
                 if let Some(control) = gossip_proto.control.as_option() {
                     let ihave = ihave_entries_len(&control.ihave);
                     let iwant = iwant_entries_len(&control.iwant);
+                    let idontwant = idontwant_entries_len(&control.idontwant);
                     GossipTrafficBytes::Recv.add(GossipTraffic::IHAVE, ihave);
                     GossipTrafficBytes::Recv.add(GossipTraffic::IWANT, iwant);
-                    counted += ihave + iwant;
+                    GossipTrafficBytes::Recv.add(GossipTraffic::IDONTWANT, idontwant);
+                    counted += ihave + iwant + idontwant;
                     handle_grafts(stream_id, &control.graft, &self.domains, emit);
                     handle_prunes(stream_id, &control.prune, &self.domains, emit);
                     handle_iwants(stream_id, &control.iwant, &mut self.mcache, emit);
