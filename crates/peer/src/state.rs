@@ -8,17 +8,18 @@
 use std::{
     collections::HashMap,
     hash::BuildHasherDefault,
-    net::{IpAddr, SocketAddr},
+    net::{IpAddr, Ipv4Addr, SocketAddr},
     time::Instant,
 };
 
 use fxhash::FxHashMap;
 use silver_common::{
-    AgentString, CountingWitherFilter, GossipTopic, MessageId, MessageIdHasher, PeerId,
-    rpc_rate_limit::{N_STREAM_PROTOCOLS, RpcRateLimitSet},
+    AgentString, CountingWitherFilter, GossipTopic, MessageId, MessageIdHasher, PeerId, PeerScores,
+    PeerTopicScores, StreamProtocol,
+    rpc_rate_limit::{N_STREAM_PROTOCOLS, RpcRateLimit, RpcRateLimitSet},
 };
 
-use crate::scoring::ScoreBreakdown;
+use crate::scoring::{self, ScoreBreakdown};
 
 /// Initial capacity hint; peers with larger custody sets may grow beyond it.
 pub(crate) const TOPICS_PER_PEER_CAP: usize = 96;
@@ -101,10 +102,12 @@ pub(crate) struct PeerState {
     pub is_trusted: bool,
 }
 
-impl PeerState {
-    pub fn new(peer_id: PeerId, addr: SocketAddr, now: Instant) -> Self {
+impl Default for PeerState {
+    fn default() -> Self {
+        let now = Instant::now();
+        let addr = SocketAddr::new(IpAddr::V4(Ipv4Addr::UNSPECIFIED), 0);
         Self {
-            peer_id,
+            peer_id: PeerId::default(),
             addr,
             ip_prefix: IpPrefix::from(addr.ip()),
             connected_at: now,
@@ -136,13 +139,123 @@ impl PeerState {
             is_trusted: false,
         }
     }
+}
+
+impl PeerState {
+    /// Readies a recycled slot for a new connection.
+    pub fn connect(&mut self, peer_id: PeerId, addr: SocketAddr, now: Instant) {
+        self.clear();
+        self.peer_id = peer_id;
+        self.addr = addr;
+        self.ip_prefix = IpPrefix::from(addr.ip());
+        self.connected_at = now;
+        self.score_valid_at = now;
+    }
+
+    /// Defaults every field, keeping map capacity. `msg_cache` is kept as is:
+    /// a previous connection's ids age out like any other.
+    fn clear(&mut self) {
+        self.peer_id = PeerId::default();
+        self.addr = SocketAddr::new(IpAddr::V4(Ipv4Addr::UNSPECIFIED), 0);
+        self.ip_prefix = IpPrefix::from(self.addr.ip());
+        self.local_dialler = false;
+        self.user_agent = AgentString::default();
+        self.subscriptions.clear();
+        self.partial_extensions = false;
+        self.topic_stats.clear();
+        self.application_score = 0.0;
+        self.behaviour_penalty = 0.0;
+        self.ihaves_received = 0;
+        self.iwant_ids_sent = 0;
+        self.outbound_rpc_limits = RpcRateLimitSet::default();
+        self.outbound_in_flight = [0; N_STREAM_PROTOCOLS];
+        self.backoffs.clear();
+        self.advertised_backoffs.clear();
+        self.cached_score = 0.0;
+        self.last_breakdown = ScoreBreakdown::default();
+        self.goodbye_sent = false;
+        self.evict_spared = false;
+        self.is_trusted = false;
+    }
+
+    pub(crate) fn scores(&self, mesh_count: u32) -> PeerScores {
+        let b = self.last_breakdown;
+        PeerScores {
+            id: self.peer_id,
+            user_agent: self.user_agent,
+            mesh_count,
+            p1_time_in_mesh: b.p1_time_in_mesh,
+            p2_first_deliveries: b.p2_first_deliveries,
+            p3_mesh_deficit: b.p3_mesh_deficit,
+            p3b_mesh_failure: b.p3b_mesh_failure,
+            p4_invalid: b.p4_invalid,
+            p5_application: b.p5_application,
+            p6_ip_colocation: b.p6_ip_colocation,
+            p7_behaviour: b.p7_behaviour,
+            total: b.total,
+        }
+    }
+
+    pub(crate) fn outbound_has_capacity(
+        &self,
+        conn: usize,
+        protocol: StreamProtocol,
+        tokens: u64,
+        now: Instant,
+        max_in_flight: u32,
+    ) -> bool {
+        if self.outbound_in_flight[protocol.ordinal() as usize] >= max_in_flight {
+            return false;
+        }
+        match self.outbound_rpc_limits.peek_outbound(protocol, tokens, now) {
+            RpcRateLimit::Allowed => true,
+            denied => {
+                silver_log::debug!(
+                    peer = conn,
+                    ?protocol,
+                    tokens,
+                    ?denied,
+                    "outbound rpc request rate limited"
+                );
+                false
+            }
+        }
+    }
+
+    pub(crate) fn try_admit_outbound(
+        &mut self,
+        conn: usize,
+        protocol: StreamProtocol,
+        tokens: u64,
+        now: Instant,
+        claim_in_flight: bool,
+    ) -> bool {
+        match self.outbound_rpc_limits.admit_outbound(protocol, tokens, now) {
+            RpcRateLimit::Allowed => {
+                if claim_in_flight {
+                    self.outbound_in_flight[protocol.ordinal() as usize] += 1;
+                }
+                true
+            }
+            denied => {
+                silver_log::debug!(
+                    peer = conn,
+                    ?protocol,
+                    tokens,
+                    ?denied,
+                    "outbound rpc rate limited"
+                );
+                false
+            }
+        }
+    }
 
     /// Restore counters from a previously-archived entry. Identity/address
     /// fields are NOT touched — they come from the fresh connection.
     pub fn restore_from_archive(&mut self, archive: ArchivedState) {
         self.application_score = archive.application_score;
         self.behaviour_penalty = archive.behaviour_penalty;
-        self.topic_stats = archive.topic_stats;
+        self.topic_stats.extend(archive.topic_stats);
         for t in self.topic_stats.values_mut() {
             t.fanout_total = 0;
             t.fanout_sent = 0;
@@ -200,6 +313,27 @@ pub(crate) struct TopicScore {
     // Not decayed; zeroed on reconnect so the ratio is per-connection.
     pub fanout_total: u64,
     pub fanout_sent: u64,
+}
+
+impl TopicScore {
+    pub(crate) fn report(&self, id: PeerId, topic: GossipTopic, now: Instant) -> PeerTopicScores {
+        PeerTopicScores {
+            id,
+            topic,
+            meshed_secs: self
+                .meshed_since
+                .map(|s| now.saturating_duration_since(s).as_secs())
+                .unwrap_or(0),
+            first_deliveries: self.first_deliveries,
+            mesh_deliveries: self.mesh_deliveries,
+            p3_scored: scoring::p3_scored(&topic),
+            mesh_active: self.mesh_active,
+            fanout_total: self.fanout_total,
+            fanout_sent: self.fanout_sent,
+            mesh_failure_penalty: self.mesh_failure_penalty,
+            invalid_deliveries: self.invalid_deliveries,
+        }
+    }
 }
 
 /// Archived counters kept for `archived_ttl` after a peer disconnects. Lets
