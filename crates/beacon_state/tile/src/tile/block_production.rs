@@ -1,4 +1,8 @@
-use std::{io::Write, mem};
+use std::{
+    io::Write,
+    mem,
+    time::{Duration, Instant},
+};
 
 use flux::spine::SpineProducers;
 use flux_profiler::timed;
@@ -9,9 +13,14 @@ use silver_beacon_state_data::{
 use silver_common::{
     BeaconApiResponse, BidPolicy, EngineGetPayloadReq, EngineGetPayloadResp,
     EnginePreparePayloadReq, EnginePreparePayloadResp, EngineReq, PayloadFrame,
-    ProduceBlockFailure, ProducedBlock, TCacheProducer, TCacheRead, TRead,
+    ProduceBlockFailure, ProducedBlock, SidecarBidRequest, SidecarBidResponse, TCacheProducer,
+    TCacheRead, TRead,
     ssz_hash_gloas::EMPTY_EXECUTION_REQUESTS,
-    ssz_view::{BEACON_BLOCK_BODY_FIXED, BLOCK_SYNC_AGGREGATE_SIZE},
+    ssz_view::{
+        BEACON_BLOCK_BODY_FIXED, BLOCK_SYNC_AGGREGATE_SIZE, BuilderBidFuluView,
+        SignedBuilderBidFuluView,
+    },
+    wei_saturating,
 };
 use silver_slashing::Selection;
 use silver_ssz::block_body::{BeaconBlockBodyFulu, BeaconBlockBodyGloas, EMPTY_SYNC_AGGREGATE};
@@ -49,24 +58,50 @@ impl Proposal {
 
 #[derive(Clone, Copy, PartialEq, Eq)]
 enum PayloadStage {
+    /// Not asked of the EL, or refused by it.
+    Idle,
     Preparing,
-    Prepared { payload_id: [u8; 8] },
-    Fetching { payload_id: [u8; 8] },
+    Prepared {
+        payload_id: [u8; 8],
+    },
+    Fetching {
+        payload_id: [u8; 8],
+    },
 }
 
-/// The EL building a payload for `slot` on `parent_root`. `id` tags both
-/// engine requests, so any fetch answer carries this payload.
-struct Payload {
-    id: u64,
+/// The one block being built, for `slot` on `parent_root`: the EL's payload
+/// and the sidecar's bid. `engine_id` tags the EL's requests, so a stale
+/// answer finds nothing.
+struct BlockBuild {
     slot: Slot,
     parent_root: B256,
+    engine_id: u64,
     stage: PayloadStage,
+    local: Option<Result<TRead, ProduceBlockFailure>>,
+    payload_deadline: Option<Instant>,
+    parent_hash: B256,
+    bid: SidecarBid,
 }
 
-impl Payload {
+enum SidecarBid {
+    NotAsked,
+    Awaiting,
+    Answered(Option<TRead>),
+}
+
+impl BlockBuild {
+    fn builds_on(&self, slot: Slot, parent_root: B256) -> bool {
+        self.slot == slot && self.parent_root == parent_root
+    }
+
     fn fetch(&mut self, payload_id: [u8; 8], producers: &mut Producers) {
-        producers.produce(EngineReq::GetPayload(EngineGetPayloadReq { id: self.id, payload_id }));
+        let id = self.engine_id;
+        producers.produce(EngineReq::GetPayload(EngineGetPayloadReq { id, payload_id }));
         self.stage = PayloadStage::Fetching { payload_id };
+    }
+
+    fn is_complete(&self) -> bool {
+        self.local.is_some() && !matches!(self.bid, SidecarBid::Awaiting)
     }
 }
 
@@ -162,35 +197,93 @@ struct BuiltBlock {
     post_state: Option<AppliedBlock>,
 }
 
-#[derive(Default)]
 pub(super) struct BlockProduction {
-    payloads: Vec<Payload>,
+    building: Option<BlockBuild>,
     pending: Vec<(u64, Proposal)>,
     built: Option<BuiltBlock>,
-    next_payload_id: u64,
+    next_engine_id: u64,
     packed: PackedOperations,
+    payload_timeout: Duration,
+}
+
+/// What the EL said of the payload it built.
+#[derive(Clone, Copy)]
+struct LocalPayload {
+    value: [u8; 32],
+    should_override_builder: bool,
 }
 
 impl BlockProduction {
-    fn payload(&mut self, slot: Slot, parent_root: B256) -> Option<&mut Payload> {
-        self.payloads.iter_mut().find(|p| p.slot == slot && p.parent_root == parent_root)
+    pub(super) fn new(payload_timeout: Duration) -> Self {
+        Self {
+            building: None,
+            pending: Vec::new(),
+            built: None,
+            next_engine_id: 0,
+            packed: PackedOperations::default(),
+            payload_timeout,
+        }
+    }
+
+    fn building_on(&mut self, slot: Slot, parent_root: B256) -> Option<&mut BlockBuild> {
+        self.building.as_mut().filter(|build| build.builds_on(slot, parent_root))
     }
 
     #[cfg(test)]
     pub(super) fn payload_id(&mut self, slot: Slot, parent_root: B256) -> Option<[u8; 8]> {
-        match self.payload(slot, parent_root)?.stage {
+        match self.building_on(slot, parent_root)?.stage {
             PayloadStage::Prepared { payload_id } | PayloadStage::Fetching { payload_id } => {
                 Some(payload_id)
             }
-            PayloadStage::Preparing => None,
+            PayloadStage::Idle | PayloadStage::Preparing => None,
         }
     }
 
-    fn begin_preparation(&mut self, slot: Slot, parent_root: B256) -> u64 {
-        debug_assert!(self.payload(slot, parent_root).is_none(), "one payload per parent");
-        let id = self.next_payload_id;
-        self.next_payload_id += 1;
-        self.payloads.push(Payload { id, slot, parent_root, stage: PayloadStage::Preparing });
+    #[cfg(test)]
+    pub(super) fn awaits_local_payload(&mut self, slot: Slot, parent_root: B256) -> bool {
+        self.building_on(slot, parent_root).is_some_and(|build| build.local.is_none())
+    }
+
+    /// The build for `slot` on `parent_root`, replacing another one. Requests
+    /// still waiting on the replaced build fail: its parent has been
+    /// overtaken.
+    fn build(
+        &mut self,
+        slot: Slot,
+        parent_root: B256,
+        producers: &mut Producers,
+    ) -> &mut BlockBuild {
+        if self.building_on(slot, parent_root).is_none() {
+            for (request_id, _) in
+                self.pending.extract_if(.., |(_, proposal)| !proposal.builds_on(slot, parent_root))
+            {
+                answer(producers, request_id, Err(ProduceBlockFailure::PayloadUnavailable));
+            }
+            self.building = Some(BlockBuild {
+                slot,
+                parent_root,
+                engine_id: 0,
+                stage: PayloadStage::Idle,
+                local: None,
+                payload_deadline: None,
+                parent_hash: [0; 32],
+                bid: SidecarBid::NotAsked,
+            });
+        }
+        self.building.as_mut().expect("built above")
+    }
+
+    fn begin_preparation(
+        &mut self,
+        slot: Slot,
+        parent_root: B256,
+        producers: &mut Producers,
+    ) -> u64 {
+        let id = self.next_engine_id;
+        self.next_engine_id += 1;
+        let build = self.build(slot, parent_root, producers);
+        build.engine_id = id;
+        build.stage = PayloadStage::Preparing;
         id
     }
 
@@ -202,12 +295,12 @@ impl BlockProduction {
         self.built.as_ref().filter(|built| built.proposal == *proposal).map(|built| built.block)
     }
 
-    fn latest_prepared_slot(&self) -> Option<Slot> {
-        self.payloads.iter().map(|payload| payload.slot).max()
+    fn prepared_slot(&self) -> Option<Slot> {
+        self.building.as_ref().filter(|build| build.stage != PayloadStage::Idle).map(|b| b.slot)
     }
 
     pub(super) fn prune_before(&mut self, slot: Slot, producers: &mut Producers) {
-        self.payloads.retain(|payload| payload.slot >= slot);
+        self.building.take_if(|build| build.slot < slot);
         if let Some(built) = self.built.as_mut().filter(|built| built.proposal.slot < slot) {
             built.payload = None;
         }
@@ -261,7 +354,11 @@ impl BeaconStateTile {
             silver_log::warn!(slot, "head state does not follow fork choice; payload not prepared");
             return Err(ProduceBlockFailure::Internal);
         }
-        if self.block_production.payload(slot, head_root).is_some() {
+        if self
+            .block_production
+            .building_on(slot, head_root)
+            .is_some_and(|build| build.stage != PayloadStage::Idle)
+        {
             return Ok(());
         }
 
@@ -279,7 +376,7 @@ impl BeaconStateTile {
         let prev_randao = fork.view.randao_mixes.at_epoch(slot / SLOTS_PER_EPOCH);
         let ExpectedWithdrawals { withdrawals, .. } = get_expected_withdrawals(&fork.view);
 
-        let id = self.block_production.begin_preparation(slot, head_root);
+        let id = self.block_production.begin_preparation(slot, head_root, producers);
         producers.produce(EngineReq::PreparePayload(EnginePreparePayloadReq {
             id,
             head_block_hash,
@@ -297,7 +394,7 @@ impl BeaconStateTile {
     }
 
     pub(super) fn prepare_payload_on_new_head(&mut self, producers: &mut Producers) {
-        let Some(slot) = self.block_production.latest_prepared_slot() else {
+        let Some(slot) = self.block_production.prepared_slot() else {
             return;
         };
         if slot > self.ticker.current_slot() {
@@ -319,36 +416,80 @@ impl BeaconStateTile {
             let block = self.produce_gloas_block(proposal);
             return answer(producers, request_id, block);
         }
-        match self.start_proposal(&proposal, producers) {
-            Ok(()) => self.block_production.pending.push((request_id, proposal)),
-            Err(failure) => answer(producers, request_id, Err(failure)),
+        if let Err(failure) = self.check_slot_proposable(proposal.slot) {
+            return answer(producers, request_id, Err(failure));
         }
+        let local = self.start_local_payload(&proposal, producers);
+
+        // Checked after the EL is asked, so it builds in the meantime.
+        let (parent, proposer) = match self.verified_parent(&proposal) {
+            Ok(verified) => verified,
+            Err(failure) => return answer(producers, request_id, Err(failure)),
+        };
+        let asked = self.ask_sidecar_bid(&proposal, parent, proposer, producers);
+        let payload_deadline = Instant::now() + self.block_production.payload_timeout;
+        let build = self.block_production.build(proposal.slot, proposal.parent_root, producers);
+        match local {
+            Ok(()) => {
+                build.local = None;
+                build.payload_deadline = Some(payload_deadline);
+            }
+            Err(failure) if asked => build.local = Some(Err(failure)),
+            Err(failure) => return answer(producers, request_id, Err(failure)),
+        }
+        self.block_production.pending.push((request_id, proposal));
+        self.serve_complete(producers);
     }
 
-    /// The reveal is checked after the EL is asked, so it builds meanwhile.
-    fn start_proposal(
+    /// Asks the PBS client for a bid on the proposal's parent payload, unless
+    /// the request weights the bid at zero. Returns whether a bid is coming.
+    fn ask_sidecar_bid(
+        &mut self,
+        proposal: &Proposal,
+        parent: StateId,
+        proposer: u64,
+        producers: &mut Producers,
+    ) -> bool {
+        if proposal.bid_policy.builder_boost_factor == 0 {
+            return false;
+        }
+        let build = self.block_production.build(proposal.slot, proposal.parent_root, producers);
+        if !matches!(build.bid, SidecarBid::NotAsked) {
+            return true;
+        }
+        // Never committed, as in `prepare_payload`.
+        let fork = self.state.apply_block_view(parent);
+        let parent_header = &fork.view.slot.state().latest_execution_payload_header;
+        let request = SidecarBidRequest {
+            slot: proposal.slot,
+            parent_hash: parent_header.block_hash,
+            prev_randao: fork.view.randao_mixes.at_epoch(proposal.slot / SLOTS_PER_EPOCH),
+            withdrawals_root: get_expected_withdrawals(&fork.view).root(),
+            block_number: parent_header.block_number + 1,
+            parent_gas_limit: parent_header.gas_limit,
+            proposer_pubkey: *fork.view.validators.pubkey(proposer as usize),
+        };
+        let build = self.block_production.build(proposal.slot, proposal.parent_root, producers);
+        build.parent_hash = request.parent_hash;
+        build.bid = SidecarBid::Awaiting;
+        producers.produce(request);
+        true
+    }
+
+    fn start_local_payload(
         &mut self,
         proposal: &Proposal,
         producers: &mut Producers,
     ) -> Result<(), ProduceBlockFailure> {
-        let slot = proposal.slot;
-        if slot <= self.last_applied_block_slot() || slot > self.ticker.current_slot() + 1 {
-            return Err(ProduceBlockFailure::SlotNotProposable);
-        }
-        match self.block_production.payload(slot, proposal.parent_root) {
-            Some(payload) => {
-                if let PayloadStage::Prepared { payload_id } = payload.stage {
-                    payload.fetch(payload_id, producers);
+        match self.block_production.building_on(proposal.slot, proposal.parent_root) {
+            Some(build) if build.stage != PayloadStage::Idle => {
+                if let PayloadStage::Prepared { payload_id } = build.stage {
+                    build.fetch(payload_id, producers);
                 }
+                Ok(())
             }
-            None => self.prepare_payload(slot, self.default_fee_recipient, producers)?,
+            _ => self.prepare_payload(proposal.slot, self.default_fee_recipient, producers),
         }
-
-        let (parent, proposer) = self.proposal_parent(proposal)?;
-        if !self.randao_reveal_verifies(parent, proposer, proposal) {
-            return Err(ProduceBlockFailure::InvalidRandaoReveal);
-        }
-        Ok(())
     }
 
     /// Resolved on every use: a finalization while the EL builds re-bases
@@ -400,56 +541,164 @@ impl BeaconStateTile {
         producers: &mut Producers,
     ) {
         let production = &mut self.block_production;
-        let Some(at) = production
-            .payloads
-            .iter()
-            .position(|p| p.id == response.id && p.stage == PayloadStage::Preparing)
-        else {
+        let Some(build) = production.building.as_mut().filter(|build| {
+            build.engine_id == response.id && build.stage == PayloadStage::Preparing
+        }) else {
             return;
         };
-        let payload = &mut production.payloads[at];
-        let (slot, parent_root) = (payload.slot, payload.parent_root);
         // Refused: the next request prepares again.
         let Some(payload_id) = response.payload_id else {
-            production.payloads.swap_remove(at);
-            for (request_id, _) in production.take_pending(slot, parent_root) {
-                answer(producers, request_id, Err(ProduceBlockFailure::PayloadUnavailable));
-            }
+            build.stage = PayloadStage::Idle;
+            build.local = Some(Err(ProduceBlockFailure::PayloadUnavailable));
+            self.serve_complete(producers);
             return;
         };
-        if production.pending.iter().any(|(_, proposal)| proposal.builds_on(slot, parent_root)) {
-            payload.fetch(payload_id, producers);
+        if production.pending.is_empty() {
+            build.stage = PayloadStage::Prepared { payload_id };
         } else {
-            payload.stage = PayloadStage::Prepared { payload_id };
+            build.fetch(payload_id, producers);
         }
     }
 
-    /// Serves every request waiting on the payload. The payload goes back to
-    /// prepared, so a later request fetches the EL's latest build.
+    /// The payload goes back to prepared, so a later request fetches the
+    /// EL's latest build.
     #[timed]
     pub(super) fn on_payload(&mut self, response: EngineGetPayloadResp, producers: &mut Producers) {
-        let Some(payload) = self.block_production.payloads.iter_mut().find(|p| p.id == response.id)
+        let Some(build) =
+            self.block_production.building.as_mut().filter(|b| b.engine_id == response.id)
         else {
             return;
         };
-        let PayloadStage::Fetching { payload_id } = payload.stage else {
+        let PayloadStage::Fetching { payload_id } = build.stage else {
             return;
         };
-        payload.stage = PayloadStage::Prepared { payload_id };
-        let (slot, parent_root) = (payload.slot, payload.parent_root);
+        build.stage = PayloadStage::Prepared { payload_id };
+        build.local = Some(
+            response
+                .data
+                .map(|data| self.reader.acquire(data))
+                .ok_or(ProduceBlockFailure::PayloadUnavailable),
+        );
+        self.serve_complete(producers);
+    }
 
-        let mut packed = mem::take(&mut self.block_production.packed);
-        for (request_id, proposal) in self.block_production.take_pending(slot, parent_root) {
-            let block = match response.data {
-                Some(data) => {
-                    self.pack_operations(&proposal, false, &mut packed);
-                    self.block_for(proposal, data, packed.operations())
-                }
-                None => Err(ProduceBlockFailure::PayloadUnavailable),
-            };
+    /// Builds without the EL's payload once it is later than the timeout.
+    pub(super) fn expire_payload_waits(&mut self, producers: &mut Producers) {
+        let Some(build) = self.block_production.building.as_mut().filter(|build| {
+            build.local.is_none() &&
+                build.payload_deadline.is_some_and(|deadline| deadline <= Instant::now())
+        }) else {
+            return;
+        };
+        silver_log::warn!(slot = build.slot, "the EL's payload is late; built without it");
+        build.local = Some(Err(ProduceBlockFailure::PayloadUnavailable));
+        self.serve_complete(producers);
+    }
+
+    pub(super) fn on_sidecar_bid(&mut self, answer: SidecarBidResponse, producers: &mut Producers) {
+        let Some(build) = self.block_production.building.as_mut().filter(|build| {
+            build.slot == answer.slot &&
+                build.parent_hash == answer.parent_hash &&
+                matches!(build.bid, SidecarBid::Awaiting)
+        }) else {
+            return;
+        };
+        build.bid = SidecarBid::Answered(answer.signed_bid.map(|bid| self.reader.acquire(bid)));
+        self.serve_complete(producers);
+    }
+
+    fn serve_complete(&mut self, producers: &mut Producers) {
+        let Some(mut build) = self.block_production.building.take_if(|build| build.is_complete())
+        else {
+            return;
+        };
+        for (request_id, proposal) in
+            self.block_production.take_pending(build.slot, build.parent_root)
+        {
+            let block = self.build_from(proposal, &mut build);
             answer(producers, request_id, block);
         }
-        self.block_production.packed = packed;
+        self.block_production.building = Some(build);
+    }
+
+    /// The bid when it wins and passes the state transition, else the local
+    /// payload. A bid the transition refuses is dropped.
+    fn build_from(
+        &mut self,
+        proposal: Proposal,
+        build: &mut BlockBuild,
+    ) -> Result<ProducedBlock, ProduceBlockFailure> {
+        let local = build.local.as_ref().expect("served once complete");
+        let local_terms = local.as_ref().ok().and_then(local_payload);
+        let signed_bid = match &build.bid {
+            SidecarBid::Answered(Some(read)) => read.buffer().ok().map(|(bytes, _)| bytes),
+            SidecarBid::NotAsked | SidecarBid::Awaiting | SidecarBid::Answered(None) => None,
+        };
+        let on_bid = signed_bid
+            .filter(|signed_bid| self.sidecar_bid_wins(&proposal, signed_bid, local_terms))
+            .map(|signed_bid| self.produce_on_sidecar_bid(proposal, signed_bid));
+        let refused = match on_bid {
+            Some(Ok(block)) => return Ok(block),
+            Some(Err(failure)) => Some(failure),
+            None => None,
+        };
+        if refused == Some(ProduceBlockFailure::Invalid) {
+            silver_log::warn!(slot = proposal.slot, "sidecar bid fails the block; dropped");
+            build.bid = SidecarBid::Answered(None);
+        }
+
+        let local = build.local.as_ref().expect("served once complete");
+        match (local, refused) {
+            (Ok(payload), _) => {
+                let mut packed = mem::take(&mut self.block_production.packed);
+                self.pack_operations(&proposal, false, &mut packed);
+                let block = self.block_for(proposal, payload.to_read(), packed.operations());
+                self.block_production.packed = packed;
+                block
+            }
+            (Err(_), Some(failure)) => Err(failure),
+            (Err(failure), None) => Err(*failure),
+        }
+    }
+
+    fn sidecar_bid_wins(
+        &self,
+        proposal: &Proposal,
+        signed_bid: &[u8],
+        local: Option<LocalPayload>,
+    ) -> bool {
+        let bid = SignedBuilderBidFuluView::message(signed_bid);
+        let bid_wei = wei_saturating(BuilderBidFuluView::value(bid));
+        let bid_gwei = u64::try_from(bid_wei / 1_000_000_000).unwrap_or(u64::MAX);
+        let wins = proposal.bid_policy.admits(bid_gwei) &&
+            match local {
+                None => true,
+                Some(local) if local.should_override_builder => false,
+                Some(local) => {
+                    let boost = u128::from(proposal.bid_policy.builder_boost_factor);
+                    bid_wei.saturating_mul(boost) / 100 > wei_saturating(&local.value)
+                }
+            };
+        silver_log::info!(
+            slot = proposal.slot,
+            bid_wei,
+            local_wei = local.map(|local| wei_saturating(&local.value)),
+            should_override_builder = local.is_some_and(|local| local.should_override_builder),
+            boost = proposal.bid_policy.builder_boost_factor,
+            wins,
+            "sidecar bid against the local payload"
+        );
+        wins
+    }
+
+    pub(super) fn produce_on_sidecar_bid(
+        &mut self,
+        proposal: Proposal,
+        signed_bid: &[u8],
+    ) -> Result<ProducedBlock, ProduceBlockFailure> {
+        self.build_packed(proposal, false, |tile, operations| {
+            tile.build_blinded_block(proposal, signed_bid, operations)
+        })
     }
 
     #[timed]
@@ -543,8 +792,9 @@ impl BeaconStateTile {
         })
     }
 
-    /// Retries without the exits a parent payload's requests can invalidate,
-    /// then without any packed operation.
+    /// On Gloas, retries without exits first: the parent payload's withdrawal
+    /// requests apply before the body and can fail an exit the pool checked
+    /// on the parent state. Then retries without any packed operation.
     fn build_with_fallbacks(
         &mut self,
         proposal: Proposal,
@@ -556,9 +806,12 @@ impl BeaconStateTile {
         }
 
         let without_exits = Operations { voluntary_exits: &[], ..operations };
+        let retry_without_exits =
+            self.spec.is_gloas_at_slot(proposal.slot) && without_exits != operations;
+        let last_tried = if retry_without_exits { without_exits } else { operations };
         let built = build(self, operations)
             .or_else(|failure| match failure {
-                ProduceBlockFailure::Invalid if without_exits != operations => {
+                ProduceBlockFailure::Invalid if retry_without_exits => {
                     silver_log::warn!(
                         slot = proposal.slot,
                         "packed exits fail the block; built without them"
@@ -568,7 +821,7 @@ impl BeaconStateTile {
                 failure => Err(failure),
             })
             .or_else(|failure| match failure {
-                ProduceBlockFailure::Invalid if without_exits != Operations::NONE => {
+                ProduceBlockFailure::Invalid if last_tried != Operations::NONE => {
                     silver_log::warn!(
                         slot = proposal.slot,
                         "packed operations fail the block; built without them"
@@ -590,21 +843,41 @@ impl BeaconStateTile {
         &mut self,
         proposal: Proposal,
     ) -> Result<ProducedBlock, ProduceBlockFailure> {
-        let slot = proposal.slot;
+        self.check_slot_proposable(proposal.slot)?;
+        let (parent, _) = self.verified_parent(&proposal)?;
+        let commitment = self.bid_commitment(&proposal, parent)?;
+        self.build_packed(proposal, commitment.builds_on_full_parent, |tile, operations| {
+            tile.build_gloas_block(proposal, &commitment, operations)
+        })
+    }
+
+    fn check_slot_proposable(&self, slot: Slot) -> Result<(), ProduceBlockFailure> {
         if slot <= self.last_applied_block_slot() || slot > self.ticker.current_slot() + 1 {
             return Err(ProduceBlockFailure::SlotNotProposable);
         }
-        let (parent, proposer) = self.proposal_parent(&proposal)?;
-        if !self.randao_reveal_verifies(parent, proposer, &proposal) {
+        Ok(())
+    }
+
+    fn verified_parent(
+        &mut self,
+        proposal: &Proposal,
+    ) -> Result<(StateId, u64), ProduceBlockFailure> {
+        let (parent, proposer) = self.proposal_parent(proposal)?;
+        if !self.randao_reveal_verifies(parent, proposer, proposal) {
             return Err(ProduceBlockFailure::InvalidRandaoReveal);
         }
-        let commitment = self.bid_commitment(&proposal, parent)?;
+        Ok((parent, proposer))
+    }
 
+    fn build_packed(
+        &mut self,
+        proposal: Proposal,
+        builds_on_full_parent: bool,
+        build: impl FnMut(&mut Self, Operations<'_>) -> Result<BuiltBlock, ProduceBlockFailure>,
+    ) -> Result<ProducedBlock, ProduceBlockFailure> {
         let mut packed = mem::take(&mut self.block_production.packed);
-        self.pack_operations(&proposal, commitment.builds_on_full_parent, &mut packed);
-        let block = self.build_with_fallbacks(proposal, packed.operations(), |tile, operations| {
-            tile.build_gloas_block(proposal, &commitment, operations)
-        });
+        self.pack_operations(&proposal, builds_on_full_parent, &mut packed);
+        let block = self.build_with_fallbacks(proposal, packed.operations(), build);
         self.block_production.packed = packed;
         block
     }
@@ -789,7 +1062,7 @@ impl BeaconStateTile {
             body_root,
         };
         let (block_root, post_state) = self.seal(&mut header, parent, offsets, block_fork)?;
-        let block = self.write_block(&header, &encoded)?;
+        let block = self.write_block(&header, &[&encoded])?;
 
         silver_log::info!(slot, bid_value = commitment.value, "block assembled on a p2p bid");
         Ok(BuiltBlock {
@@ -809,13 +1082,80 @@ impl BeaconStateTile {
         })
     }
 
-    /// SSZ `BeaconBlock`.
+    #[timed]
+    fn build_blinded_block(
+        &mut self,
+        proposal: Proposal,
+        signed_bid: &[u8],
+        operations: Operations<'_>,
+    ) -> Result<BuiltBlock, ProduceBlockFailure> {
+        let slot = proposal.slot;
+        let bid = SignedBuilderBidFuluView::message(signed_bid);
+        let (parent, proposer_index) = self.proposal_parent(&proposal)?;
+        let eth1_data = self.state.read_view(parent).slot.state().eth1_data.to_ssz();
+        let body = BeaconBlockBodyFulu {
+            randao_reveal: &proposal.randao_reveal,
+            eth1_data: &eth1_data,
+            graffiti: &proposal.graffiti,
+            proposer_slashings: operations.proposer_slashings,
+            attester_slashings: operations.attester_slashings,
+            attestations: operations.attestations,
+            deposits: &[],
+            voluntary_exits: operations.voluntary_exits,
+            sync_aggregate: operations.sync_aggregate,
+            execution_payload: BuilderBidFuluView::header(bid),
+            bls_to_execution_changes: operations.bls_to_execution_changes,
+            blob_kzg_commitments: BuilderBidFuluView::blob_kzg_commitments(bid),
+            execution_requests: BuilderBidFuluView::execution_requests(bid),
+        };
+        let mut body_fixed = [0; BEACON_BLOCK_BODY_FIXED];
+        let offsets = body.write_fixed_blinded(&mut body_fixed).map_err(|e| {
+            silver_log::warn!(?e, slot, "assembled blinded body is not canonical");
+            ProduceBlockFailure::Invalid
+        })?;
+        offsets.validate().map_err(|e| {
+            silver_log::warn!(?e, slot, "assembled blinded body is over its limits");
+            ProduceBlockFailure::Invalid
+        })?;
+        let (body_root, block_fork) = stf::hash_body(&offsets);
+        let mut header = BeaconBlockHeader {
+            slot,
+            proposer_index,
+            parent_root: proposal.parent_root,
+            state_root: [0; 32],
+            body_root,
+        };
+        let (block_root, post_state) = self.seal(&mut header, parent, offsets, block_fork)?;
+        let mut body_parts: [&[u8]; 10] = [&[]; 10];
+        body_parts[0] = offsets.fixed();
+        body_parts[1..].copy_from_slice(&body.variable_fields());
+        let block = self.write_block(&header, &body_parts)?;
+
+        silver_log::info!(slot, "blinded block assembled on a sidecar bid");
+        Ok(BuiltBlock {
+            proposal,
+            block: ProducedBlock {
+                header: block,
+                payload_at: (BEACON_BLOCK_FIXED + body.ssz_len()) as u32,
+                payload: None,
+                execution_payload_value: *BuilderBidFuluView::value(bid),
+                consensus_block_value: wei_from_gwei(post_state.proposer_reward()),
+            },
+            payload: None,
+            body_root,
+            block_fork,
+            block_root,
+            post_state: Some(post_state),
+        })
+    }
+
+    /// SSZ `BeaconBlock` with its body in `body` parts.
     fn write_block(
         &mut self,
         header: &BeaconBlockHeader,
-        body: &[u8],
+        body: &[&[u8]],
     ) -> Result<TCacheRead, ProduceBlockFailure> {
-        let len = BEACON_BLOCK_FIXED + body.len();
+        let len = BEACON_BLOCK_FIXED + body.iter().map(|part| part.len()).sum::<usize>();
         let block = self.events_producer.write_with(len, |mut out| {
             for part in [
                 &header.slot.to_le_bytes()[..],
@@ -823,8 +1163,10 @@ impl BeaconStateTile {
                 &header.parent_root,
                 &header.state_root,
                 &(BEACON_BLOCK_FIXED as u32).to_le_bytes(),
-                body,
-            ] {
+            ]
+            .into_iter()
+            .chain(body.iter().copied())
+            {
                 out.write_all(part).expect("sized to its parts");
             }
         });
@@ -949,6 +1291,14 @@ impl BeaconStateTile {
         };
         Ok((contents, payload_at as u32))
     }
+}
+
+fn local_payload(payload: &TRead) -> Option<LocalPayload> {
+    let frame = PayloadFrame::parse(payload.buffer().ok()?.0)?;
+    Some(LocalPayload {
+        value: frame.block_value,
+        should_override_builder: frame.should_override_builder,
+    })
 }
 
 fn wei_from_gwei(gwei: u64) -> [u8; 32] {

@@ -1,8 +1,8 @@
 use core::cmp::min;
 
 use silver_beacon_state_data::{
-    ExecutionPayloadHeader, FAR_FUTURE_EPOCH, Payload, PayloadWithdrawals, SLOTS_PER_EPOCH, Slot,
-    SpecConfig, StateWriterView, Withdrawal,
+    B256, ExecutionPayloadHeader, FAR_FUTURE_EPOCH, Payload, PayloadWithdrawals, SLOTS_PER_EPOCH,
+    Slot, SpecConfig, StateWriterView, Withdrawal,
 };
 use silver_common::ssz_view::{
     BYTES_PER_KZG_COMMITMENT, ExecutionPayloadView, WITHDRAWAL_SIZE, WithdrawalView,
@@ -10,7 +10,9 @@ use silver_common::ssz_view::{
 
 use crate::{
     error::{ExecutionPayloadError, Result, WithdrawalRecord, WithdrawalsError},
+    merkle::{MerkleStack, hash_list},
     ssz_hash::PayloadRoots,
+    ssz_hash_gloas::hash_withdrawal,
     stf::MIN_ACTIVATION_BALANCE,
     validate,
 };
@@ -218,6 +220,15 @@ pub(crate) struct ExpectedWithdrawals {
     pub(crate) processed_partials: usize,
 }
 
+impl ExpectedWithdrawals {
+    pub(crate) fn root(&self) -> B256 {
+        hash_list(
+            MerkleStack::new(MAX_WITHDRAWALS_PER_PAYLOAD),
+            self.withdrawals.iter().map(hash_withdrawal),
+        )
+    }
+}
+
 pub(crate) fn get_expected_withdrawals(view: &StateWriterView) -> ExpectedWithdrawals {
     let current_epoch = view.slot.state().slot / SLOTS_PER_EPOCH;
     let mut withdrawals = PayloadWithdrawals::new();
@@ -273,14 +284,31 @@ pub fn process_withdrawals_fulu(
         }
     }
 
-    for w in expected.iter() {
+    apply_withdrawals(view, &expected, processed_partials);
+    Ok(())
+}
+
+/// Withdrawals and header caching without the spec's header checks: a
+/// blinded body is only sealed on a bid already verified against this state.
+pub fn process_blinded_payload(view: &mut StateWriterView, header: &[u8]) {
+    let ExpectedWithdrawals { withdrawals, processed_partials } = get_expected_withdrawals(view);
+    apply_withdrawals(view, &withdrawals, processed_partials);
+    view.slot.state_mut().latest_execution_payload_header =
+        ExecutionPayloadHeader::from_ssz(header).expect("checked by the body's offsets");
+}
+
+fn apply_withdrawals(
+    view: &mut StateWriterView,
+    expected: &[Withdrawal],
+    processed_partials: usize,
+) {
+    for w in expected {
         let balance = view.balances.get(w.validator_index as usize);
         view.balances.set(w.validator_index as u32, balance.saturating_sub(w.amount));
     }
-    update_next_withdrawal_index(view, &expected);
+    update_next_withdrawal_index(view, expected);
     if processed_partials > 0 {
         view.pending.partial_withdrawals.drain(processed_partials);
     }
-    update_next_withdrawal_validator_index(view, &expected);
-    Ok(())
+    update_next_withdrawal_validator_index(view, expected);
 }

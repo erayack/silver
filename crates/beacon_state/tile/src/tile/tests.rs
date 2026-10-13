@@ -10,8 +10,6 @@ use silver_beacon_state_data::{
     SLOTS_PER_HISTORICAL_ROOT, SYNC_COMMITTEE_SIZE, SYNC_SUBCOMMITTEE_SIZE, ShufflingId,
     StateReadView, SyncCommittee, ValSeed, Withdrawals,
 };
-#[cfg(feature = "ef_tests")]
-use silver_common::ProducedBlock;
 use silver_common::{
     BeaconApiResponse, BidPolicy, BlockStage, EngineGetPayloadResp, EngineNewPayloadResp,
     EnginePreparePayloadResp, EngineReq, GossipTopic, HeadChange, LOCAL_GOSSIP_STREAM_ID,
@@ -29,6 +27,9 @@ use silver_common::{
     },
     test_util::ShmemDir,
 };
+#[cfg(feature = "ef_tests")]
+use silver_common::{ProducedBlock, SidecarBidRequest, SidecarBidResponse};
+use silver_config::EngineConfig;
 use silver_slashing::{Admission, Selection};
 use silver_ssz::ssz_view::{EXECUTION_PAYLOAD_ENVELOPE_MIN, SyncCommitteeContributionView};
 
@@ -134,6 +135,7 @@ fn make_tile_at_wall_slot_ws(wall_slot: u64, verify_weak_subjectivity: bool) -> 
         verify_weak_subjectivity,
         CheckpointState::Trusted(BeaconState::empty_test(0)),
         None,
+        EngineConfig::default().get_payload_timeout(),
     );
     tile.open_tcaches().unwrap();
     tile
@@ -176,6 +178,7 @@ fn make_tile_with_producers(
         true,
         CheckpointState::Trusted(state),
         None,
+        EngineConfig::default().get_payload_timeout(),
     );
     tile.open_tcaches().unwrap();
     (tile, gossip_p, event_p, delivery_p)
@@ -5451,6 +5454,7 @@ fn unregistered_proposer_gets_no_payload_prepared() {
 }
 
 /// Validator 0, the seeded proposer, signs with test key 0.
+/// Local only, so no sidecar bid is asked.
 fn proposal(tile: &BeaconStateTile, slot: Slot) -> Proposal {
     let randao_reveal = test_signing::sign_randao_reveal(0, slot, &Immutable::default());
     Proposal {
@@ -5458,7 +5462,7 @@ fn proposal(tile: &BeaconStateTile, slot: Slot) -> Proposal {
         parent_root: tile.head_block_root(),
         randao_reveal,
         graffiti: [0; 32],
-        bid_policy: BidPolicy::default(),
+        bid_policy: BidPolicy { builder_boost_factor: 0, ..BidPolicy::default() },
     }
 }
 
@@ -5614,6 +5618,60 @@ fn request_the_el_never_answers_expires_with_its_slot() {
     assert_eq!(produced_blocks(&mut sink), [(5, Some(ProduceBlockFailure::PayloadUnavailable))]);
 }
 
+#[test]
+fn request_waits_for_the_el_until_the_payload_deadline() {
+    for (timeout, expected) in [
+        (Duration::from_secs(60), vec![]),
+        (Duration::ZERO, vec![(5, Some(ProduceBlockFailure::PayloadUnavailable))]),
+    ] {
+        let (mut tile, _spine, mut adapter, mut sink) = production_rig();
+        tile.block_production = BlockProduction::new(timeout);
+        register_proposer(&mut tile, 0, [7; 20]);
+        tile.produce_block(5, proposal(&tile, 11), &mut adapter.producers);
+
+        tile.expire_payload_waits(&mut adapter.producers);
+        assert_eq!(produced_blocks(&mut sink), expected, "{timeout:?}");
+    }
+}
+
+/// A request the EL cannot build for still has its reveal checked before a
+/// bid is asked: the bid is built on that reveal.
+#[test]
+fn reveal_is_checked_when_the_el_builds_nothing() {
+    let (mut tile, _spine, mut adapter, mut sink) = production_rig();
+    let bid_policy = BidPolicy::default();
+    let proposal = Proposal { randao_reveal: [0; 96], bid_policy, ..proposal(&tile, 11) };
+    tile.produce_block(5, proposal, &mut adapter.producers);
+    assert_eq!(produced_blocks(&mut sink), [(5, Some(ProduceBlockFailure::InvalidRandaoReveal))]);
+}
+
+/// Only a waiting request starts the payload deadline, so a payload prepared
+/// ahead of its slot never expires.
+#[test]
+fn prepared_payload_without_a_request_never_expires() {
+    let (mut tile, _spine, mut adapter, _sink) = production_rig();
+    tile.block_production = BlockProduction::new(Duration::ZERO);
+    register_proposer(&mut tile, 0, [7; 20]);
+    tile.prepare_payload(11, None, &mut adapter.producers).unwrap();
+
+    tile.expire_payload_waits(&mut adapter.producers);
+    let head = tile.head_block_root();
+    assert!(tile.block_production.awaits_local_payload(11, head));
+}
+
+#[test]
+fn preparing_another_slot_fails_the_requests_on_the_replaced_build() {
+    let (mut tile, _spine, mut adapter, mut sink) = production_rig();
+    register_proposer(&mut tile, 0, [7; 20]);
+    tile.produce_block(5, proposal(&tile, 11), &mut adapter.producers);
+    assert_eq!(produced_blocks(&mut sink), [], "waits on the EL");
+
+    tile.prepare_payload(12, Some([1; 20]), &mut adapter.producers).unwrap();
+    assert_eq!(produced_blocks(&mut sink), [(5, Some(ProduceBlockFailure::PayloadUnavailable))]);
+    let head = tile.head_block_root();
+    assert_eq!(tile.block_production.payload_id(11, head), None);
+}
+
 /// A retry for the block being built waits on the same build, and one
 /// answer settles both.
 #[test]
@@ -5692,7 +5750,7 @@ fn import_produced_fixture_block(reuse_produced_state: bool) {
     let frame = fixture_payload_frame(&block_ssz);
     let (block, read) =
         produce_fixture_block(&mut tile, &mut gp, &mut spine, &mut adapter, &block_ssz);
-    assert_eq!(block.execution_payload_value, [3; 32]);
+    assert_eq!(block.execution_payload_value, wei_le(FIXTURE_BLOCK_VALUE));
     assert_eq!(block.payload, Some(read), "the engine's bytes stay in the payload frame");
     let header = tile.events_producer.read_buffer(block.header).unwrap();
     let (before_payload, bls_changes) = header.split_at(block.payload_at as usize);
@@ -5748,13 +5806,49 @@ fn produce_fixture_block(
     adapter: &mut SpineAdapter<SilverSpine>,
     block_ssz: &[u8],
 ) -> (ProducedBlock, TCacheRead) {
+    let proposal = fixture_proposal(tile, block_ssz);
+    let frame = fixture_payload_frame(block_ssz);
+    let answers = Answers { frame: Some(&frame), signed_bid: None, bid_first: false };
+    let (block, read) = produce_on_frame(tile, gp, spine, adapter, block_ssz, proposal, answers);
+    (block, read.expect("the EL answered a payload"))
+}
+
+/// What the EL and the PBS client answer a proposal with, and in which order.
+#[cfg(feature = "ef_tests")]
+struct Answers<'a> {
+    frame: Option<&'a [u8]>,
+    signed_bid: Option<&'a [u8]>,
+    bid_first: bool,
+}
+
+/// Serves `proposal` through the engine and sidecar round trips. A request
+/// weighting the bid at zero asks for none.
+#[cfg(feature = "ef_tests")]
+fn produce_on_frame(
+    tile: &mut BeaconStateTile,
+    gp: &mut TProducer,
+    spine: &mut TestSpine,
+    adapter: &mut SpineAdapter<SilverSpine>,
+    block_ssz: &[u8],
+    proposal: Proposal,
+    answers: Answers<'_>,
+) -> (ProducedBlock, Option<TCacheRead>) {
     let mut sink = SpineAdapter::connect_tile(&Sink, &mut spine.spine);
     engine_requests(&mut sink);
     produced_blocks(&mut sink);
+    sidecar_bid_requests(&mut sink);
     register_proposer(tile, SignedBeaconBlockView::proposer_index(block_ssz), [7; 20]);
 
-    let proposal = fixture_proposal(tile, block_ssz);
     tile.produce_block(5, proposal, &mut adapter.producers);
+    let bid_request = match sidecar_bid_requests(&mut sink)[..] {
+        [request] => Some(request),
+        [] => None,
+        ref requests => panic!("one bid request at most: {requests:?}"),
+    };
+    assert_eq!(bid_request.is_some(), proposal.bid_policy.builder_boost_factor != 0);
+    if answers.bid_first {
+        answer_bid(tile, gp, adapter, bid_request, answers.signed_bid);
+    }
     let [EngineReq::PreparePayload(prepare)] = engine_requests(&mut sink)[..] else {
         panic!("expected a payload preparation");
     };
@@ -5762,9 +5856,17 @@ fn produce_fixture_block(
     let [EngineReq::GetPayload(fetch)] = engine_requests(&mut sink)[..] else {
         panic!("expected a payload fetch");
     };
-    let (_, read) = publish_block_bytes(gp, &fixture_payload_frame(block_ssz));
-    let response = EngineGetPayloadResp { id: fetch.id, data: Some(read) };
+    let read = answers.frame.map(|frame| {
+        if let Some(request) = bid_request {
+            assert_bid_request_matches(&request, frame);
+        }
+        publish_block_bytes(gp, frame).1
+    });
+    let response = EngineGetPayloadResp { id: fetch.id, data: read };
     tile.handle_engine_response(EngineResp::GetPayload(response), &mut adapter.producers);
+    if !answers.bid_first {
+        answer_bid(tile, gp, adapter, bid_request, answers.signed_bid);
+    }
 
     let mut produced = Vec::new();
     sink.consume(|response: BeaconApiResponse, _| {
@@ -5774,6 +5876,42 @@ fn produce_fixture_block(
     });
     let [Ok(block)] = produced[..] else { panic!("expected one produced block: {produced:?}") };
     (block, read)
+}
+
+/// The fixture's payload is valid on the parent, so its header carries
+/// everything the request asks of a bid's header.
+#[cfg(feature = "ef_tests")]
+fn assert_bid_request_matches(request: &SidecarBidRequest, frame: &[u8]) {
+    use silver_beacon_state_data::Payload;
+    use silver_common::ssz_view::ExecutionPayloadView;
+
+    let payload = silver_common::PayloadFrame::parse(frame).unwrap().execution_payload;
+    assert_eq!(&request.parent_hash, ExecutionPayloadView::parent_hash(payload));
+    assert_eq!(&request.prev_randao, ExecutionPayloadView::prev_randao(payload));
+    assert_eq!(request.block_number, ExecutionPayloadView::block_number(payload));
+    let roots = ssz_hash::PayloadRoots::of(Payload::new(payload).unwrap());
+    assert_eq!(request.withdrawals_root, roots.withdrawals);
+}
+
+#[cfg(feature = "ef_tests")]
+fn sidecar_bid_requests(sink: &mut SpineAdapter<SilverSpine>) -> Vec<SidecarBidRequest> {
+    let mut requests = Vec::new();
+    sink.consume(|request: SidecarBidRequest, _| requests.push(request));
+    requests
+}
+
+#[cfg(feature = "ef_tests")]
+fn answer_bid(
+    tile: &mut BeaconStateTile,
+    gp: &mut TProducer,
+    adapter: &mut SpineAdapter<SilverSpine>,
+    request: Option<SidecarBidRequest>,
+    signed_bid: Option<&[u8]>,
+) {
+    let Some(SidecarBidRequest { slot, parent_hash, .. }) = request else { return };
+    let signed_bid = signed_bid.map(|signed_bid| publish_block_bytes(gp, signed_bid).1);
+    let answer = SidecarBidResponse { slot, parent_hash, signed_bid };
+    tile.on_sidecar_bid(answer, &mut adapter.producers);
 }
 
 /// A Gloas block commits to the pool's best bid on the branch fork choice
@@ -5831,6 +5969,231 @@ fn a_gloas_block_commits_to_the_pooled_bid() {
     assert_eq!(refused, Some(ProduceBlockFailure::NoAcceptableBid));
 }
 
+/// A blinded block on a bid carrying the fixture payload's header is the full
+/// block with the payload swapped for its header: same body root, same state
+/// root, so the same block root and signature.
+#[cfg(feature = "ef_tests")]
+#[test]
+fn blinded_block_on_a_bid_matches_the_full_block() {
+    use silver_beacon_state_data::{BodyFork, BodyOffsets};
+    use silver_common::PayloadFrame;
+
+    let (pre_ssz, block_ssz, _) = sanity_fixture("one_blob");
+    let state = BeaconState::from_checkpoint(&pre_ssz, &SpecConfig::mainnet(), &[]).unwrap();
+    let slot = SignedBeaconBlockView::slot(&block_ssz);
+    let (mut tile, mut gp, _rp, mut spine, mut adapter) =
+        tile_with_producers_on(slot, state, SpecConfig::mainnet());
+
+    let (full, _) = produce_fixture_block(&mut tile, &mut gp, &mut spine, &mut adapter, &block_ssz);
+    let frame_bytes = fixture_payload_frame(&block_ssz);
+    let frame = PayloadFrame::parse(&frame_bytes).unwrap();
+    let contents = tile.events_producer.read_buffer(full.header).unwrap();
+    let (before_payload, bls_changes) = contents.split_at(full.payload_at as usize);
+    let requests_end = frame.commitments.len() + frame.execution_requests.len();
+    let full_message = [
+        &before_payload[12..],
+        frame.execution_payload,
+        bls_changes,
+        &frame.after_payload[..requests_end],
+    ]
+    .concat();
+    tile.block_production.drop_outdated(|_| false);
+
+    let header = payload_header_of(frame.execution_payload);
+    let signed_bid =
+        signed_builder_bid(&header, frame.commitments, frame.execution_requests, [5; 32]);
+    let proposal = fixture_proposal(&tile, &block_ssz);
+    let blinded = tile.produce_on_sidecar_bid(proposal, &signed_bid).expect("built on the bid");
+    assert!(blinded.payload.is_none());
+    assert_eq!(blinded.execution_payload_value, [5; 32]);
+
+    let message = tile.events_producer.read_buffer(blinded.header).unwrap();
+    assert_eq!(&message[..80], &full_message[..80], "slot, proposer, parent and state root");
+    let offsets = BodyOffsets::validated(&message[84..], BodyFork::FuluBlinded).unwrap();
+    assert_eq!(offsets.payload_header(), &header[..]);
+    assert_eq!(offsets.blob_commitments_fulu(), frame.commitments);
+    let (body_root, _) = stf::hash_body(&offsets);
+    assert_eq!(body_root, ssz_hash::hash_tree_root_body_fulu(&full_message[84..]));
+}
+
+/// The EL's payload is worth `FIXTURE_BLOCK_VALUE`; the sidecar bid carries
+/// the same payload at `bid_wei`.
+#[cfg(feature = "ef_tests")]
+fn bid_against_local(
+    bid_wei: u128,
+    should_override_builder: bool,
+    builder_boost_factor: u64,
+    bid_first: bool,
+) -> ProducedBlock {
+    use silver_common::PayloadFrame;
+
+    let (pre_ssz, block_ssz, _) = sanity_fixture("one_blob");
+    let state = BeaconState::from_checkpoint(&pre_ssz, &SpecConfig::mainnet(), &[]).unwrap();
+    let slot = SignedBeaconBlockView::slot(&block_ssz);
+    let (mut tile, mut gp, _rp, mut spine, mut adapter) =
+        tile_with_producers_on(slot, state, SpecConfig::mainnet());
+
+    let mut frame_bytes = fixture_payload_frame(&block_ssz);
+    let frame = PayloadFrame::parse(&frame_bytes).unwrap();
+    let header = payload_header_of(frame.execution_payload);
+    let signed_bid =
+        signed_builder_bid(&header, frame.commitments, frame.execution_requests, wei_le(bid_wei));
+
+    frame_bytes[9] = should_override_builder as u8;
+    let proposal = Proposal {
+        bid_policy: BidPolicy { builder_boost_factor, ..BidPolicy::default() },
+        ..fixture_proposal(&tile, &block_ssz)
+    };
+    let answers = Answers { frame: Some(&frame_bytes), signed_bid: Some(&signed_bid), bid_first };
+    produce_on_frame(&mut tile, &mut gp, &mut spine, &mut adapter, &block_ssz, proposal, answers).0
+}
+
+#[cfg(feature = "ef_tests")]
+#[test]
+fn sidecar_bid_worth_more_than_the_local_payload_is_built_blinded() {
+    for bid_first in [false, true] {
+        let block = bid_against_local(2 * FIXTURE_BLOCK_VALUE, false, 100, bid_first);
+        assert!(block.payload.is_none(), "bid first: {bid_first}");
+        assert_eq!(block.execution_payload_value, wei_le(2 * FIXTURE_BLOCK_VALUE));
+    }
+}
+
+#[cfg(feature = "ef_tests")]
+#[test]
+fn local_payload_is_built_when_the_sidecar_bid_does_not_win() {
+    for (bid_wei, should_override_builder, boost) in [
+        (FIXTURE_BLOCK_VALUE, false, 100),
+        (2 * FIXTURE_BLOCK_VALUE, true, 100),
+        (2 * FIXTURE_BLOCK_VALUE, false, 0),
+        (2 * FIXTURE_BLOCK_VALUE, false, 40),
+    ] {
+        let block = bid_against_local(bid_wei, should_override_builder, boost, false);
+        assert!(block.payload.is_some(), "{bid_wei} {should_override_builder} {boost}");
+        assert_eq!(block.execution_payload_value, wei_le(FIXTURE_BLOCK_VALUE));
+    }
+}
+
+/// The EL builds nothing, so the bid is what the slot gets.
+#[cfg(feature = "ef_tests")]
+#[test]
+fn sidecar_bid_is_built_when_the_el_has_no_payload() {
+    use silver_common::PayloadFrame;
+
+    let (pre_ssz, block_ssz, _) = sanity_fixture("one_blob");
+    let state = BeaconState::from_checkpoint(&pre_ssz, &SpecConfig::mainnet(), &[]).unwrap();
+    let slot = SignedBeaconBlockView::slot(&block_ssz);
+    let (mut tile, mut gp, _rp, mut spine, mut adapter) =
+        tile_with_producers_on(slot, state, SpecConfig::mainnet());
+
+    let frame_bytes = fixture_payload_frame(&block_ssz);
+    let frame = PayloadFrame::parse(&frame_bytes).unwrap();
+    let header = payload_header_of(frame.execution_payload);
+    let signed_bid =
+        signed_builder_bid(&header, frame.commitments, frame.execution_requests, wei_le(1));
+    let proposal = fixture_proposal(&tile, &block_ssz);
+    let answers = Answers { frame: None, signed_bid: Some(&signed_bid), bid_first: false };
+    let (block, _) = produce_on_frame(
+        &mut tile,
+        &mut gp,
+        &mut spine,
+        &mut adapter,
+        &block_ssz,
+        proposal,
+        answers,
+    );
+    assert!(block.payload.is_none(), "built on the bid");
+}
+
+/// The EL never answers; at the payload deadline the bid is what the slot
+/// gets.
+#[cfg(feature = "ef_tests")]
+#[test]
+fn late_el_payload_leaves_the_bid_at_the_payload_deadline() {
+    use silver_common::PayloadFrame;
+
+    let (pre_ssz, block_ssz, _) = sanity_fixture("one_blob");
+    let state = BeaconState::from_checkpoint(&pre_ssz, &SpecConfig::mainnet(), &[]).unwrap();
+    let slot = SignedBeaconBlockView::slot(&block_ssz);
+    let (mut tile, mut gp, _rp, mut spine, mut adapter) =
+        tile_with_producers_on(slot, state, SpecConfig::mainnet());
+    tile.block_production = BlockProduction::new(Duration::ZERO);
+    let mut sink = SpineAdapter::connect_tile(&Sink, &mut spine.spine);
+    engine_requests(&mut sink);
+    produced_blocks(&mut sink);
+    sidecar_bid_requests(&mut sink);
+    register_proposer(&mut tile, SignedBeaconBlockView::proposer_index(&block_ssz), [7; 20]);
+
+    let frame_bytes = fixture_payload_frame(&block_ssz);
+    let frame = PayloadFrame::parse(&frame_bytes).unwrap();
+    let header = payload_header_of(frame.execution_payload);
+    let signed_bid =
+        signed_builder_bid(&header, frame.commitments, frame.execution_requests, wei_le(1));
+    tile.produce_block(5, fixture_proposal(&tile, &block_ssz), &mut adapter.producers);
+    let [request] = sidecar_bid_requests(&mut sink)[..] else { panic!("one bid request") };
+    answer_bid(&mut tile, &mut gp, &mut adapter, Some(request), Some(&signed_bid));
+    assert!(produced_blocks(&mut sink).is_empty(), "waits for the EL");
+
+    tile.expire_payload_waits(&mut adapter.producers);
+    let mut produced = Vec::new();
+    sink.consume(|response: BeaconApiResponse, _| {
+        if let BeaconApiResponse::ProducedBlock { block, .. } = response {
+            produced.push(block);
+        }
+    });
+    let [Ok(block)] = produced[..] else { panic!("expected one produced block: {produced:?}") };
+    assert!(block.payload.is_none(), "built on the bid");
+}
+
+#[cfg(feature = "ef_tests")]
+const FIXTURE_BLOCK_VALUE: u128 = 1_000_000_000;
+
+#[cfg(feature = "ef_tests")]
+fn wei_le(wei: u128) -> [u8; 32] {
+    let mut value = [0; 32];
+    value[..16].copy_from_slice(&wei.to_le_bytes());
+    value
+}
+
+#[cfg(feature = "ef_tests")]
+fn payload_header_of(payload: &[u8]) -> Vec<u8> {
+    use silver_beacon_state_data::Payload;
+    use silver_common::ssz_view::{EXECUTION_PAYLOAD_HEADER_FIXED, ExecutionPayloadView};
+
+    let roots = ssz_hash::PayloadRoots::of(Payload::new(payload).unwrap());
+    let mut header = payload[..504].to_vec();
+    header[436..440].copy_from_slice(&(EXECUTION_PAYLOAD_HEADER_FIXED as u32).to_le_bytes());
+    header.extend_from_slice(&roots.transactions);
+    header.extend_from_slice(&roots.withdrawals);
+    header.extend_from_slice(&payload[512..528]);
+    header.extend_from_slice(ExecutionPayloadView::extra_data(payload));
+    header
+}
+
+/// The tile does not check the signature.
+#[cfg(feature = "ef_tests")]
+fn signed_builder_bid(
+    header: &[u8],
+    commitments: &[u8],
+    requests: &[u8],
+    value: [u8; 32],
+) -> Vec<u8> {
+    use silver_common::ssz_view::BUILDER_BID_FULU_FIXED;
+
+    let commitments_at = BUILDER_BID_FULU_FIXED + header.len();
+    let requests_at = commitments_at + commitments.len();
+    let mut signed = 100u32.to_le_bytes().to_vec();
+    signed.extend_from_slice(&[0; 96]);
+    for offset in [BUILDER_BID_FULU_FIXED, commitments_at, requests_at] {
+        signed.extend_from_slice(&(offset as u32).to_le_bytes());
+    }
+    signed.extend_from_slice(&value);
+    signed.extend_from_slice(&[0; 48]);
+    for part in [header, commitments, requests] {
+        signed.extend_from_slice(part);
+    }
+    signed
+}
+
 /// The `PayloadFrame` the EL would answer with for `block_ssz`'s payload,
 /// with placeholder cell proofs and blobs.
 #[cfg(feature = "ef_tests")]
@@ -5861,7 +6224,7 @@ fn fixture_payload_frame(block_ssz: &[u8]) -> Vec<u8> {
         requests.len(),
         blob_count as u8,
         false,
-        &[3; 32],
+        &wei_le(FIXTURE_BLOCK_VALUE),
     );
     frame.extend_from_slice(execution_payload);
     frame.extend_from_slice(commitments);
@@ -6254,10 +6617,11 @@ fn pooled_exits_and_bls_changes_land_in_the_produced_block() {
     assert_eq!(validators.credentials(changer as usize).0[0], 0x01);
 }
 
-/// An exit the block rejects is dropped alone; the rest of the packing stays.
+/// Fulu applies no parent payload before the body, so an exit the block
+/// rejects is not retried alone: the block is rebuilt without any operation.
 #[cfg(feature = "ef_tests")]
 #[test]
-fn a_rejected_exit_keeps_the_other_operations() {
+fn fulu_block_rejecting_an_exit_drops_every_operation() {
     use silver_common::ssz_view::{
         BeaconBlockBodyFuluView, PROPOSER_SLASHING_SIZE, SIGNED_VOLUNTARY_EXIT_SIZE,
     };
@@ -6301,7 +6665,7 @@ fn a_rejected_exit_keeps_the_other_operations() {
     let body = &header[12 + 84..];
     let slashings = BeaconBlockBodyFuluView::proposer_slashings_offset(body)..
         BeaconBlockBodyFuluView::attester_slashings_offset(body);
-    assert_eq!(slashings.len(), PROPOSER_SLASHING_SIZE, "the slashing stays");
+    assert!(slashings.is_empty(), "the valid slashing goes too");
     assert_eq!(
         BeaconBlockBodyFuluView::voluntary_exits_offset(body),
         BeaconBlockBodyFuluView::execution_payload_offset(body),
