@@ -118,6 +118,7 @@ impl Peer {
         &self.id
     }
 
+    #[timed]
     pub(crate) fn event(&mut self, event: ConnectionEvent) {
         self.dirty = true;
         self.connection.handle_event(event);
@@ -160,6 +161,7 @@ impl Peer {
         .min();
     }
 
+    #[timed]
     pub(crate) fn send_gossip(
         &mut self,
         msg: TRead,
@@ -427,6 +429,7 @@ impl Peer {
     /// the connection isn't ready (e.g. stream limit not yet negotiated).
     /// Multistream-select negotiation runs internally; `NetEvent::StreamReady`
     /// is emitted once it completes.
+    #[timed]
     fn open_stream(&mut self, protocol: StreamProtocol) -> Option<StreamId> {
         // All streams are Bi — multistream-select requires bidirectional I/O
         // even for request-response protocols.
@@ -459,6 +462,7 @@ impl Peer {
         Some(id)
     }
 
+    #[timed]
     pub(crate) fn transmit(
         &mut self,
         now: Instant,
@@ -468,6 +472,7 @@ impl Peer {
         self.connection.poll_transmit(now, max_datagrams, buf)
     }
 
+    #[timed]
     pub(crate) fn spin<F, E>(
         &mut self,
         now: Instant,
@@ -820,6 +825,7 @@ impl Peer {
 }
 
 #[allow(clippy::too_many_arguments)]
+#[timed]
 fn spin_streams<E>(
     now: Instant,
     connection: &mut Connection,
@@ -956,6 +962,7 @@ enum SpinResult {
 }
 
 impl Stream {
+    #[timed]
     fn spin<E>(
         &mut self,
         connection: &mut Connection,

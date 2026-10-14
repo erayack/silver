@@ -407,6 +407,7 @@ where
         &mut self.context
     }
 
+    #[timed]
     pub fn enqueue_gossip(&mut self, msg: GossipMsgOut) -> SendResult {
         self.p2p_endpoint.enqueue_gossip(msg, &mut self.context)
     }
@@ -423,6 +424,7 @@ where
         self.p2p_endpoint.goodbye_all(&mut self.context);
     }
 
+    #[timed]
     fn poll(&mut self) -> Result<(), Error> {
         let timeout =
             self.p2p_endpoint.timeout().map(|d| d.min(POLL_TIMEOUT)).or(Some(POLL_TIMEOUT));

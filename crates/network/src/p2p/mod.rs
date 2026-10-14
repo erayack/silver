@@ -11,6 +11,7 @@ use std::{
 
 use buffa::{Message, MessageView};
 pub use context::{ClusterNodes, Context};
+use flux_profiler::timed;
 use fxhash::{FxHashMap, FxHashSet};
 use mio::{Poll, net::UdpSocket};
 use quic::SegmentedGossipLimits;
@@ -30,6 +31,7 @@ use crate::{
 };
 
 /// Function to spin the P2p stack - invoked from tile main loop.
+#[timed]
 pub fn p2p_spin<F: FnMut(NetEvent)>(
     poll: &Poll,
     p2p_endpoint: &mut P2p,
@@ -226,6 +228,7 @@ impl P2p {
         self.banned.remove(&peer_id);
     }
 
+    #[timed]
     pub(crate) fn recv(
         &mut self,
         now: Instant,
@@ -285,6 +288,7 @@ impl P2p {
 
     /// Drive the network. `data` handles byte movement for streams;
     /// `on_event` is called inline for lifecycle events.
+    #[timed]
     pub fn poll<E>(
         &mut self,
         now: Instant,
@@ -509,6 +513,7 @@ impl P2p {
 
 /// Drain the peer's pending quinn transmits onto the socket until it has
 /// nothing to send, the pacer defers, or the socket blocks.
+#[timed]
 fn drain_transmits(peer: &mut Peer, socket: &mut Socket, poll: &Poll, now: Instant) -> bool {
     let mut did_work = false;
     while !socket.is_blocked() &&

@@ -1,5 +1,7 @@
 use std::sync::atomic::Ordering;
 
+use flux_profiler::timed;
+
 use super::{AcquiredRead, Error, RandomAccessConsumer, TCacheId, TCacheRead, TCacheRef, TileId};
 
 #[derive(Copy, Clone, Default)]
@@ -138,6 +140,7 @@ impl TCacheReader {
         self.consumer(read.id).acquire(read)
     }
 
+    #[timed]
     #[inline]
     pub fn acquire_strict(&mut self, read: TCacheRead) -> Option<AcquiredRead> {
         self.consumer(read.id).acquire_strict(read)
