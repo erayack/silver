@@ -65,6 +65,7 @@ impl RxBatch {
     }
 
     /// Batch-receive datagrams via recvmmsg. Returns number received.
+    #[timed]
     pub(crate) fn recv(&mut self, socket: &UdpSocket) -> usize {
         // Re-arm slots used in the previous round: try to reclaim backing
         // storage from splits quinn has since dropped. Slots beyond
