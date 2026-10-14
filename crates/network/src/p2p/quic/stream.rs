@@ -51,6 +51,7 @@ impl StreamIoImpl<'_> {
 }
 
 impl<'a> StreamIo for StreamIoImpl<'a> {
+    #[timed]
     fn write_to_stream(&mut self, id: StreamId, data: &[u8]) -> Result<usize, StreamError> {
         let mut stream = self.connection.send_stream(id);
         match stream.write(data) {
