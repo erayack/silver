@@ -458,6 +458,7 @@ where
                     NetworkCounters::P2pBytesRecv.add(data.len() as u64);
                     self.p2p_endpoint.recv(now, data, remote, scratch, socket)
                 });
+                break;
             }
         }
 
