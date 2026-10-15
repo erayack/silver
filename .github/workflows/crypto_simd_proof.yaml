@@ -1,0 +1,148 @@
+name: crypto_simd proof
+
+# Required checks must report on every pull request, so the workflow always runs
+# and `changes` decides whether the proof jobs do work. A skipped job counts as
+# passed; a workflow filtered out by `paths` never reports and blocks the merge.
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+env:
+  CARGO_TERM_COLOR: always
+  PROOF_DIR: crates/crypto_simd/proof/lean
+
+jobs:
+  changes:
+    runs-on: ubuntu-latest
+    outputs:
+      crypto_simd: ${{ steps.diff.outputs.crypto_simd }}
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - id: diff
+        env:
+          BASE: ${{ github.event_name == 'pull_request' && github.event.pull_request.base.sha || github.event.before }}
+        run: |
+          if git diff --name-only "$BASE" HEAD -- \
+              crates/crypto_simd Cargo.lock .github/workflows/crypto_simd_proof.yaml |
+              grep -q .; then
+            echo "crypto_simd=true" >>"$GITHUB_OUTPUT"
+          else
+            echo "crypto_simd=false" >>"$GITHUB_OUTPUT"
+          fi
+
+  extraction:
+    needs: changes
+    if: needs.changes.outputs.crypto_simd == 'true'
+    runs-on: ubuntu-latest
+    timeout-minutes: 90
+    steps:
+      - uses: actions/checkout@v4
+
+      - id: pins
+        run: |
+          aeneas=$(python3 -I -c 'import json, sys
+          print(next(p["rev"] for p in json.load(open(sys.argv[1]))["packages"] if p["name"] == "aeneas"))' \
+            "$PROOF_DIR/lake-manifest.json")
+          echo "aeneas=$aeneas" >>"$GITHUB_OUTPUT"
+
+      # Charon's driver links the nightly's librustc_driver, so the toolchain is
+      # cached with the binaries.
+      - id: cache
+        uses: actions/cache@v4
+        with:
+          path: |
+            ~/aeneas
+            ~/.rustup/toolchains/nightly-*-x86_64-unknown-linux-gnu
+          key: aeneas-${{ steps.pins.outputs.aeneas }}-v1
+
+      - if: steps.cache.outputs.cache-hit != 'true'
+        uses: ocaml/setup-ocaml@v3
+        with:
+          ocaml-compiler: "5.3"
+
+      - name: Build the pinned Aeneas and Charon
+        if: steps.cache.outputs.cache-hit != 'true'
+        run: |
+          opam install -y ppx_deriving visitors easy_logging zarith yojson core_unix \
+            ocamlgraph menhir unionFind progress domainslib
+          git clone https://github.com/AeneasVerif/aeneas ~/aeneas
+          cd ~/aeneas
+          git checkout "${{ steps.pins.outputs.aeneas }}"
+          git clone https://github.com/AeneasVerif/charon charon
+          git -C charon checkout "$(tail -n 1 charon-pin)"
+          opam exec -- make -C charon build
+          opam exec -- make build-bin-dir
+
+      - name: Check the extraction for drift
+        working-directory: ${{ env.PROOF_DIR }}
+        run: AENEAS_DIR="$HOME/aeneas" ./extract.sh --check
+
+  lean:
+    needs: changes
+    if: needs.changes.outputs.crypto_simd == 'true'
+    runs-on: ubuntu-latest
+    timeout-minutes: 120
+    steps:
+      - uses: actions/checkout@v4
+
+      # Runs `lake exe cache get` and `lake build`, whose axiom guard fails the
+      # build on any axiom beyond propext, Classical.choice and Quot.sound.
+      - uses: leanprover/lean-action@v1
+        with:
+          lake-package-directory: ${{ env.PROOF_DIR }}
+
+      - name: Negative and concrete controls
+        working-directory: ${{ env.PROOF_DIR }}
+        run: |
+          for f in controls/*.lean; do
+            echo "::group::$f"
+            lake env lean -DautoImplicit=false -DrelaxedAutoImplicit=false "$f"
+            echo "::endgroup::"
+          done
+
+      - name: Downstream package
+        working-directory: ${{ env.PROOF_DIR }}/controls/downstream
+        run: lake update && lake build
+
+      - name: Differential vector test
+        working-directory: ${{ env.PROOF_DIR }}
+        run: |
+          lake build differential
+          lake exe differential ../decompress_g2_vectors.txt --g1 ../decompress_g1_vectors.txt
+          python3 -I Test/check_g1_controls.py
+
+  ifma:
+    needs: changes
+    if: needs.changes.outputs.crypto_simd == 'true'
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@v4
+
+      - id: cpu
+        run: |
+          if grep -qw avx512ifma /proc/cpuinfo && grep -qw avx512f /proc/cpuinfo; then
+            echo "ifma=true" >>"$GITHUB_OUTPUT"
+          else
+            echo "ifma=false" >>"$GITHUB_OUTPUT"
+            echo "::notice::No AVX-512 IFMA on this runner; the kernel replay was skipped."
+          fi
+
+      - if: steps.cpu.outputs.ifma == 'true'
+        uses: dtolnay/rust-toolchain@master
+        with:
+          toolchain: nightly-2026-06-21
+
+      # With SILVER_REQUIRE_IFMA set, the tests fail rather than fall back to
+      # blst when the kernel is unavailable.
+      - name: Replay the recorded vectors through the kernel
+        if: steps.cpu.outputs.ifma == 'true'
+        run: SILVER_REQUIRE_IFMA=1 cargo test --locked -p silver_crypto_simd
