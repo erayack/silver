@@ -15,6 +15,7 @@ pub struct Args {
     pub listen: SocketAddr,
     pub peer: Option<SocketAddr>,
     pub connections: usize,
+    pub batch: u64,
     pub rate_hz: u64,
     pub payload_size: usize,
     #[serde(with = "seconds")]
@@ -30,10 +31,10 @@ pub struct Args {
 const USAGE: &str = "\
 usage: net_bench --role sender|echo --listen ADDR [--peer ADDR]
                  [--backend mio|io-uring] [--sqpoll-cpu N] [--zc-min BYTES]
-                 [--connections N] [--rate HZ] [--payload-size BYTES]
+                 [--connections N] [--batch B] [--rate HZ] [--payload-size BYTES]
                  [--warmup S] [--duration S] [--idle-exit S] [--json PATH]
 The discovery socket binds the --listen port + 1. --rate is the total across
---connections; the sender sends probe n on connection n % N.";
+--connections; the sender sends probe n on connection (n / B) % N.";
 
 impl Args {
     pub fn parse() -> Self {
@@ -41,6 +42,7 @@ impl Args {
         let mut listen = None;
         let mut peer = None;
         let mut connections = 1;
+        let mut batch = 1;
         let mut rate_hz = 1000;
         let mut payload_size = 1024;
         let mut warmup = Duration::from_secs(2);
@@ -63,6 +65,7 @@ impl Args {
                 "--listen" => listen = Some(parse(flag, value)),
                 "--peer" => peer = Some(parse(flag, value)),
                 "--connections" => connections = parse(flag, value),
+                "--batch" => batch = parse(flag, value),
                 "--rate" => rate_hz = parse(flag, value),
                 "--payload-size" => payload_size = parse(flag, value),
                 "--warmup" => warmup = Duration::from_secs_f64(parse(flag, value)),
@@ -78,8 +81,8 @@ impl Args {
         if role == Role::Sender && peer.is_none() {
             fail("--role sender needs --peer");
         }
-        if rate_hz == 0 || connections == 0 {
-            fail("--rate and --connections must be nonzero");
+        if rate_hz == 0 || connections == 0 || batch == 0 {
+            fail("--rate, --connections and --batch must be nonzero");
         }
 
         Self {
@@ -87,6 +90,7 @@ impl Args {
             listen,
             peer,
             connections,
+            batch,
             rate_hz,
             payload_size,
             warmup,

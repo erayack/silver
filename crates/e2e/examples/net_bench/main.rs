@@ -108,6 +108,7 @@ struct Sender {
     warmup_probes: u64,
     total_probes: u64,
     payload_size: usize,
+    batch: u64,
     sent: u64,
     publish_failures: u64,
     received: u64,
@@ -129,6 +130,7 @@ impl Sender {
             warmup_probes: probes(args.warmup),
             total_probes: probes(args.warmup + args.duration),
             payload_size: args.payload_size,
+            batch: args.batch,
             sent: 0,
             publish_failures: 0,
             received: 0,
@@ -148,7 +150,7 @@ impl Sender {
             node.network.p2p_mut().connect(peer_id, peer, now).expect("connect");
         }
         node.wait_for_connections(count, Some(CONNECT_TIMEOUT));
-        // Fixed for the run: probe n always uses connection n % count.
+        // Fixed for the run: probe n always uses `connection_index(n)`.
         let connections = node.connections.clone();
 
         let start = Nanos::now().0;
@@ -170,7 +172,7 @@ impl Sender {
                     self.publish_failures += 1;
                     break;
                 };
-                node.send(connections[(seq % count as u64) as usize], tcache);
+                node.send(connections[self.connection_index(seq)], tcache);
                 if seq >= self.warmup_probes {
                     self.sent += 1;
                     self.send_lag.record(now - scheduled);
@@ -211,14 +213,18 @@ impl Sender {
         }
     }
 
+    fn connection_index(&self, seq: u64) -> usize {
+        ((seq / self.batch) % self.received_per_connection.len() as u64) as usize
+    }
+
     fn record(&mut self, probe: Probe, committed_ns: u64) {
         if probe.seq < self.warmup_probes {
             return;
         }
         let round_trip = committed_ns.saturating_sub(probe.scheduled_ns);
-        let connection = probe.seq % self.received_per_connection.len() as u64;
+        let connection = self.connection_index(probe.seq);
         self.received += 1;
-        self.received_per_connection[connection as usize] += 1;
+        self.received_per_connection[connection] += 1;
         self.rtt.record(round_trip.saturating_sub(probe.turnaround_ns));
         self.rtt_with_turnaround.record(round_trip);
         self.echo_turnaround.record(probe.turnaround_ns);

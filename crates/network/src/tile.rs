@@ -446,14 +446,14 @@ where
 
         for evt in &self.events {
             if evt.token() == DISC_SOCKET_TOKEN && evt.is_readable() {
-                self.disc_socket.recv(|data, remote, _scratch, _socket| { 
+                self.disc_socket.recv(|data, remote, _scratch, _socket| {
                     did_work = true;
                     NetworkCounters::DiscBytesRecv.add(data.len() as u64);
                     self.discovery.handle(remote, &data[..], now);
                     true
                 });
             } else if evt.token() == P2P_SOCKET_TOKEN && evt.is_readable() {
-                self.p2p_socket.recv(|data, remote, scratch, socket| {             
+                self.p2p_socket.recv(|data, remote, scratch, socket| {
                     did_work = true;
                     NetworkCounters::P2pBytesRecv.add(data.len() as u64);
                     self.p2p_endpoint.recv(now, data, remote, scratch, socket)
