@@ -1,8 +1,7 @@
-use std::{io::Error, sync::Arc};
+use std::{io::Error, sync::Arc, time::Duration};
 
 use quinn_proto::{
-    ClientConfig, Endpoint, EndpointConfig, ServerConfig,
-    crypto::rustls::{QuicClientConfig, QuicServerConfig},
+    crypto::rustls::{QuicClientConfig, QuicServerConfig}, AckFrequencyConfig, ClientConfig, Endpoint, EndpointConfig, ServerConfig, VarInt
 };
 use silver_common::{Keypair, P2pSend, PeerId};
 
@@ -36,6 +35,16 @@ fn transport_config() -> Arc<quinn_proto::TransportConfig> {
     let mut tc = quinn_proto::TransportConfig::default();
     tc.max_idle_timeout(Some(quinn_proto::IdleTimeout::try_from(IDLE_TIMEOUT).unwrap()));
     tc.keep_alive_interval(Some(KEEP_ALIVE_INTERVAL));
+
+    let mut ack_config = AckFrequencyConfig::default();
+    // Tell the peer: "Only ACK once every 32 packets instead of every 2"
+    ack_config.ack_eliciting_threshold(VarInt::from_u32(32));
+    // Allow the peer to wait up to 15ms if the 32-packet threshold isn't met
+    ack_config.max_ack_delay(Some(Duration::from_millis(15)));
+    // Tolerates up to 2 out-of-order packets before triggering an immediate ACK
+    ack_config.reordering_threshold(VarInt::from_u32(4));
+    tc.ack_frequency_config(Some(ack_config));
+
     Arc::new(tc)
 }
 
