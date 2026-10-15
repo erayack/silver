@@ -26,17 +26,46 @@ jobs:
         with:
           fetch-depth: 0
 
+      # Cargo.lock counts only when an entry in silver_crypto_simd's dependency
+      # closure changes. The lockfile does not mark dev-dependencies, so they
+      # count too.
       - id: diff
         env:
           BASE: ${{ github.event_name == 'pull_request' && github.event.pull_request.base.sha || github.event.before }}
         run: |
           if git diff --name-only "$BASE" HEAD -- \
-              crates/crypto_simd Cargo.lock .github/workflows/crypto_simd_proof.yaml |
+              crates/crypto_simd .github/workflows/crypto_simd_proof.yaml |
               grep -q .; then
-            echo "crypto_simd=true" >>"$GITHUB_OUTPUT"
+            changed=true
           else
-            echo "crypto_simd=false" >>"$GITHUB_OUTPUT"
+            git show "$BASE:Cargo.lock" >"$RUNNER_TEMP/base.lock"
+            changed=$(python3 -I - "$RUNNER_TEMP/base.lock" Cargo.lock <<'PY'
+          import sys, tomllib
+
+          def closure(path):
+              packages = tomllib.load(open(path, "rb"))["package"]
+              by_name = {}
+              for p in packages:
+                  by_name.setdefault(p["name"], []).append(p)
+              seen, todo = {}, ["silver_crypto_simd"]
+              while todo:
+                  # A dependency is "name" or "name version" when several versions are locked.
+                  name, _, version = todo.pop().partition(" ")
+                  for p in by_name.get(name, []):
+                      if version and p["version"] != version:
+                          continue
+                      key = (p["name"], p["version"])
+                      if key not in seen:
+                          seen[key] = p
+                          todo.extend(p.get("dependencies", []))
+              return seen
+
+          base, head = closure(sys.argv[1]), closure(sys.argv[2])
+          print("true" if base != head else "false")
+          PY
+            )
           fi
+          echo "crypto_simd=$changed" >>"$GITHUB_OUTPUT"
 
   extraction:
     needs: changes
