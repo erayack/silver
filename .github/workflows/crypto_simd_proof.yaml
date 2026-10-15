@@ -1,12 +1,15 @@
 name: crypto_simd proof
 
-# Required checks must report on every pull request, so the workflow always runs
-# and `changes` decides whether the proof jobs do work. A skipped job counts as
-# passed; a workflow filtered out by `paths` never reports and blocks the merge.
+# Branch protection requires only the `proof` job. The workflow runs on every
+# pull request so that `proof` always reports: a workflow filtered out by `paths`
+# never reports, and a required check that never reports blocks the merge.
 on:
   push:
     branches: [main]
   pull_request:
+
+permissions:
+  contents: read
 
 concurrency:
   group: ${{ github.workflow }}-${{ github.ref }}
@@ -25,45 +28,27 @@ jobs:
       - uses: actions/checkout@v4
         with:
           fetch-depth: 0
+          persist-credentials: false
 
-      # Cargo.lock counts only when an entry in silver_crypto_simd's dependency
-      # closure changes. The lockfile does not mark dev-dependencies, so they
-      # count too.
+      - name: Test the lockfile closure
+        run: python3 -I .github/scripts/test_crypto_simd_closure.py
+
+      # A base that is missing or unreadable counts as a change: the proof runs
+      # rather than being skipped.
       - id: diff
         env:
           BASE: ${{ github.event_name == 'pull_request' && github.event.pull_request.base.sha || github.event.before }}
         run: |
-          if git diff --name-only "$BASE" HEAD -- \
-              crates/crypto_simd .github/workflows/crypto_simd_proof.yaml |
+          if ! git cat-file -e "$BASE^{commit}" 2>/dev/null; then
+            changed=true
+          elif git diff --name-only "$BASE" HEAD -- \
+              crates/crypto_simd .github/workflows/crypto_simd_proof.yaml \
+              .github/scripts/crypto_simd_closure.py .github/scripts/test_crypto_simd_closure.py |
               grep -q .; then
             changed=true
           else
             git show "$BASE:Cargo.lock" >"$RUNNER_TEMP/base.lock"
-            changed=$(python3 -I - "$RUNNER_TEMP/base.lock" Cargo.lock <<'PY'
-          import sys, tomllib
-
-          def closure(path):
-              packages = tomllib.load(open(path, "rb"))["package"]
-              by_name = {}
-              for p in packages:
-                  by_name.setdefault(p["name"], []).append(p)
-              seen, todo = {}, ["silver_crypto_simd"]
-              while todo:
-                  # A dependency is "name" or "name version" when several versions are locked.
-                  name, _, version = todo.pop().partition(" ")
-                  for p in by_name.get(name, []):
-                      if version and p["version"] != version:
-                          continue
-                      key = (p["name"], p["version"])
-                      if key not in seen:
-                          seen[key] = p
-                          todo.extend(p.get("dependencies", []))
-              return seen
-
-          base, head = closure(sys.argv[1]), closure(sys.argv[2])
-          print("true" if base != head else "false")
-          PY
-            )
+            changed=$(python3 -I .github/scripts/crypto_simd_closure.py "$RUNNER_TEMP/base.lock" Cargo.lock)
           fi
           echo "crypto_simd=$changed" >>"$GITHUB_OUTPUT"
 
@@ -74,12 +59,15 @@ jobs:
     timeout-minutes: 90
     steps:
       - uses: actions/checkout@v4
+        with:
+          persist-credentials: false
 
       - id: pins
         run: |
           aeneas=$(python3 -I -c 'import json, sys
           print(next(p["rev"] for p in json.load(open(sys.argv[1]))["packages"] if p["name"] == "aeneas"))' \
             "$PROOF_DIR/lake-manifest.json")
+          [[ $aeneas =~ ^[0-9a-f]{40}$ ]] || { echo "unexpected Aeneas pin: $aeneas" >&2; exit 1; }
           echo "aeneas=$aeneas" >>"$GITHUB_OUTPUT"
 
       # Charon's driver links the nightly's librustc_driver, so the toolchain is
@@ -97,16 +85,22 @@ jobs:
         with:
           ocaml-compiler: "5.3"
 
+      # Charon's `make build` runs `cargo fmt` and builds charon-ml's
+      # documentation, hence rustfmt and odoc.
       - name: Build the pinned Aeneas and Charon
         if: steps.cache.outputs.cache-hit != 'true'
+        env:
+          AENEAS_REV: ${{ steps.pins.outputs.aeneas }}
         run: |
           opam install -y ppx_deriving visitors easy_logging zarith yojson core_unix \
-            ocamlgraph menhir unionFind progress domainslib
+            odoc ocamlgraph menhir unionFind progress domainslib
           git clone https://github.com/AeneasVerif/aeneas ~/aeneas
           cd ~/aeneas
-          git checkout "${{ steps.pins.outputs.aeneas }}"
+          git checkout "$AENEAS_REV"
           git clone https://github.com/AeneasVerif/charon charon
           git -C charon checkout "$(tail -n 1 charon-pin)"
+          channel=$(sed -n 's/^channel = "\(.*\)"/\1/p' charon/rust-toolchain)
+          rustup toolchain install "$channel" --profile minimal --component rustfmt
           opam exec -- make -C charon build
           opam exec -- make build-bin-dir
 
@@ -121,6 +115,8 @@ jobs:
     timeout-minutes: 120
     steps:
       - uses: actions/checkout@v4
+        with:
+          persist-credentials: false
 
       # Runs `lake exe cache get` and `lake build`, whose axiom guard fails the
       # build on any axiom beyond propext, Classical.choice and Quot.sound.
@@ -155,6 +151,8 @@ jobs:
     timeout-minutes: 30
     steps:
       - uses: actions/checkout@v4
+        with:
+          persist-credentials: false
 
       - id: cpu
         run: |
@@ -175,3 +173,23 @@ jobs:
       - name: Replay the recorded vectors through the kernel
         if: steps.cpu.outputs.ifma == 'true'
         run: SILVER_REQUIRE_IFMA=1 cargo test --locked -p silver_crypto_simd
+
+  # The one required check. Skips pass only when `changes` ran and decided the
+  # proof is irrelevant; a failed or cancelled `changes` fails here.
+  proof:
+    needs: [changes, extraction, lean, ifma]
+    if: always()
+    runs-on: ubuntu-latest
+    steps:
+      - env:
+          CHANGES: ${{ needs.changes.result }}
+          RELEVANT: ${{ needs.changes.outputs.crypto_simd }}
+          RESULTS: ${{ needs.extraction.result }} ${{ needs.lean.result }} ${{ needs.ifma.result }}
+        run: |
+          echo "changes=$CHANGES relevant=$RELEVANT results=$RESULTS"
+          [[ $CHANGES == success ]] || exit 1
+          case $RELEVANT in
+            true) [[ $RESULTS == "success success success" ]] ;;
+            false) [[ $RESULTS == "skipped skipped skipped" ]] ;;
+            *) exit 1 ;;
+          esac
