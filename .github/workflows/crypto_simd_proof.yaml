@@ -25,7 +25,7 @@ jobs:
     outputs:
       crypto_simd: ${{ steps.diff.outputs.crypto_simd }}
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
         with:
           fetch-depth: 0
           persist-credentials: false
@@ -58,7 +58,7 @@ jobs:
     runs-on: ubuntu-latest
     timeout-minutes: 90
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
         with:
           persist-credentials: false
 
@@ -73,7 +73,7 @@ jobs:
       # Charon's driver links the nightly's librustc_driver, so the toolchain is
       # cached with the binaries.
       - id: cache
-        uses: actions/cache@v4
+        uses: actions/cache@0057852bfaa89a56745cba8c7296529d2fc39830 # v4.3.0
         with:
           path: |
             ~/aeneas
@@ -81,7 +81,7 @@ jobs:
           key: aeneas-${{ steps.pins.outputs.aeneas }}-v1
 
       - if: steps.cache.outputs.cache-hit != 'true'
-        uses: ocaml/setup-ocaml@v3
+        uses: ocaml/setup-ocaml@93303b622b2522e4411e295f9e77411a24912ac7 # v3.9.0
         with:
           ocaml-compiler: "5.3"
 
@@ -114,13 +114,13 @@ jobs:
     runs-on: ubuntu-latest
     timeout-minutes: 120
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
         with:
           persist-credentials: false
 
       # Runs `lake exe cache get` and `lake build`, whose axiom guard fails the
       # build on any axiom beyond propext, Classical.choice and Quot.sound.
-      - uses: leanprover/lean-action@v1
+      - uses: leanprover/lean-action@24581d74d674803a25a81b10b059c5c0cdd344c6 # v1.6.2
         with:
           lake-package-directory: ${{ env.PROOF_DIR }}
 
@@ -150,7 +150,7 @@ jobs:
     runs-on: ubuntu-latest
     timeout-minutes: 30
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
         with:
           persist-credentials: false
 
@@ -164,7 +164,7 @@ jobs:
           fi
 
       - if: steps.cpu.outputs.ifma == 'true'
-        uses: dtolnay/rust-toolchain@master
+        uses: dtolnay/rust-toolchain@e2a55d2ffb04f378e9626c28d38b36d230d1e12f # master, 2026-10-15
         with:
           toolchain: nightly-2026-06-21
 
