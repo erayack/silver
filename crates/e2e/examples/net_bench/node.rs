@@ -9,7 +9,9 @@ use std::{
 
 use flux::{spine::SpineAdapter, tile::Tile};
 use silver_common::{
-    Enr, GossipMsgIn, GossipMsgOut, GossipTopic, GossipTraffic, Identify, Keypair, P2pSend, PeerEvent, PeerId, ProtoIdentify, SilverSpine, TCache, TCacheId, TCacheProducer, TCacheRead, TCacheReader, TCacheTable, TProducer, TReadMode
+    Enr, GossipMsgIn, GossipMsgOut, GossipTopic, GossipTraffic, Identify, Keypair, P2pSend,
+    PeerEvent, PeerId, ProtoIdentify, SilverSpine, TCache, TCacheId, TCacheProducer, TCacheRead,
+    TCacheReader, TCacheTable, TProducer, TReadMode,
 };
 use silver_config::DiscoveryConfig;
 use silver_discovery::DiscV5;
@@ -17,7 +19,7 @@ use silver_network::{Context, NetworkTile, P2p, create_endpoint, create_server_c
 
 use crate::probe::InboundFrame;
 
-const GOSSIP_CACHE_SIZE: usize = 1 << 25;
+const GOSSIP_CACHE_SIZE: usize = 1 << 27;
 
 /// Spine identity for the bench's own adapter.
 struct Bench;
@@ -83,9 +85,8 @@ impl Node {
         let server_config = create_server_config(&keypair)?;
         let endpoint = create_endpoint(Some(Arc::new(server_config)))?;
         let p2p = P2p::new(keypair, endpoint, 1024, Default::default());
-        let mut network =
-            NetworkTile::new(discovery_addr, discovery, listen, p2p, context)
-                .map_err(io::Error::other)?;
+        let mut network = NetworkTile::new(discovery_addr, discovery, listen, p2p, context)
+            .map_err(io::Error::other)?;
         network.open_tcaches().map_err(io::Error::other)?;
 
         let mut spine = SilverSpine::new_with_base_dir(base_dir, Some("_bench"));
@@ -166,7 +167,11 @@ impl Node {
     }
 
     pub fn send(&mut self, connection: usize, tcache: TCacheRead) {
-        self.bench_adapter.produce(P2pSend::Gossip(GossipMsgOut { peer_id: connection, tcache, traffic: GossipTraffic::of(GossipTopic::BeaconBlock) }));
+        self.bench_adapter.produce(P2pSend::Gossip(GossipMsgOut {
+            peer_id: connection,
+            tcache,
+            traffic: GossipTraffic::of(GossipTopic::BeaconBlock),
+        }));
     }
 }
 

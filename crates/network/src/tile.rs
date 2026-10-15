@@ -367,6 +367,8 @@ where
     discovery: D,
     // The last send pass ran the `P2pSend` queue empty; licenses snapshots.
     send_drained: bool,
+    p2p_recv_drained: bool,
+    disc_recv_drained: bool,
 }
 
 impl<D> NetworkTileInner<D>
@@ -392,6 +394,8 @@ where
             disc_socket,
             discovery,
             send_drained: true,
+            p2p_recv_drained: false,
+            disc_recv_drained: false,
         })
     }
 
@@ -426,6 +430,9 @@ where
 
     #[timed]
     fn poll(&mut self) -> Result<(), Error> {
+        if !self.p2p_recv_drained || !self.disc_recv_drained {
+            return Ok(());
+        }
         let timeout =
             self.p2p_endpoint.timeout().map(|d| d.min(POLL_TIMEOUT)).or(Some(POLL_TIMEOUT));
         self.poll.poll(&mut self.events, timeout)
@@ -444,23 +451,43 @@ where
 
         let now = Instant::now();
 
-        for evt in &self.events {
-            if evt.token() == DISC_SOCKET_TOKEN && evt.is_readable() {
-                self.disc_socket.recv(|data, remote, _scratch, _socket| {
-                    did_work = true;
-                    NetworkCounters::DiscBytesRecv.add(data.len() as u64);
-                    self.discovery.handle(remote, &data[..], now);
-                    true
-                });
-            } else if evt.token() == P2P_SOCKET_TOKEN && evt.is_readable() {
-                self.p2p_socket.recv(|data, remote, scratch, socket| {
-                    did_work = true;
-                    NetworkCounters::P2pBytesRecv.add(data.len() as u64);
-                    self.p2p_endpoint.recv(now, data, remote, scratch, socket)
-                });
-                break;
-            }
+        if !self.disc_recv_drained ||
+            self.events.iter().any(|evt| evt.token() == DISC_SOCKET_TOKEN && evt.is_readable())
+        {
+            self.disc_recv_drained = self.disc_socket.recv(|data, remote, _scratch, _socket| {
+                did_work = true;
+                NetworkCounters::DiscBytesRecv.add(data.len() as u64);
+                self.discovery.handle(remote, &data[..], now);
+                true
+            });
         }
+
+        if !self.p2p_recv_drained ||
+            self.events.iter().any(|evt| evt.token() == P2P_SOCKET_TOKEN && evt.is_readable())
+        {
+            self.p2p_recv_drained = self.p2p_socket.recv(|data, remote, scratch, socket| {
+                did_work = true;
+                NetworkCounters::P2pBytesRecv.add(data.len() as u64);
+                self.p2p_endpoint.recv(now, data, remote, scratch, socket)
+            });
+        }
+
+        // for evt in &self.events {
+        //     if evt.token() == DISC_SOCKET_TOKEN && evt.is_readable() {
+        //         self.disc_recv_drained = self.disc_socket.recv(|data, remote,
+        // _scratch, _socket| {             did_work = true;
+        //             NetworkCounters::DiscBytesRecv.add(data.len() as u64);
+        //             self.discovery.handle(remote, &data[..], now);
+        //             true
+        //         });
+        //     } else if evt.token() == P2P_SOCKET_TOKEN && evt.is_readable() {
+        //         self.p2p_recv_drained = self.p2p_socket.recv(|data, remote, scratch,
+        // socket| {             did_work = true;
+        //             NetworkCounters::P2pBytesRecv.add(data.len() as u64);
+        //             self.p2p_endpoint.recv(now, data, remote, scratch, socket)
+        //         });
+        //     }
+        // }
 
         did_work |= p2p::p2p_spin(
             &self.poll,

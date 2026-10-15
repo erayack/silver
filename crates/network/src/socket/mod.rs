@@ -135,30 +135,24 @@ impl Socket {
         true
     }
 
+    /// Returns `true` if all pending data was received.
     #[timed]
-    pub(crate) fn recv<F>(&mut self, mut f: F)
+    pub(crate) fn recv<F>(&mut self, mut f: F) -> bool
     where
         F: FnMut(bytes::BytesMut, SocketAddr, &mut Vec<u8>, &UdpSocket) -> bool,
     {
-        loop {
-            let n = self.rx_batch.recv(&self.socket);
-            if n == 0 {
-                break;
-            }
+        let n = self.rx_batch.recv(&self.socket);
 
-            for i in 0..n {
-                let (data, remote) = self.rx_batch.take(i);
+        for i in 0..n {
+            let (data, remote) = self.rx_batch.take(i);
 
-                if !self.banned_ips.contains(&remote.ip()) {
-                    self.scratch_buffer.clear();
-                    f(data, remote, &mut self.scratch_buffer, &self.socket);
-                }
-            }
-
-            if n < RX_BATCH_MAX {
-                break;
+            if !self.banned_ips.contains(&remote.ip()) {
+                self.scratch_buffer.clear();
+                f(data, remote, &mut self.scratch_buffer, &self.socket);
             }
         }
+
+        n < RX_BATCH_MAX
     }
 
     pub(crate) fn ban(&mut self, ip: IpAddr) {
