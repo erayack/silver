@@ -30,8 +30,8 @@ jobs:
           fetch-depth: 0
           persist-credentials: false
 
-      - name: Test the lockfile closure
-        run: python3 -I .github/scripts/test_crypto_simd_closure.py
+      - name: Test the dependency change check
+        run: python3 -I -m unittest discover -s .github/scripts -p crypto_simd_deps_changed.py
 
       # A base that is missing or unreadable counts as a change: the proof runs
       # rather than being skipped.
@@ -43,12 +43,12 @@ jobs:
             changed=true
           elif git diff --name-only "$BASE" HEAD -- \
               crates/crypto_simd .github/workflows/crypto_simd_proof.yaml \
-              .github/scripts/crypto_simd_closure.py .github/scripts/test_crypto_simd_closure.py |
+              .github/scripts/crypto_simd_deps_changed.py |
               grep -q .; then
             changed=true
           else
             git show "$BASE:Cargo.lock" >"$RUNNER_TEMP/base.lock"
-            changed=$(python3 -I .github/scripts/crypto_simd_closure.py "$RUNNER_TEMP/base.lock" Cargo.lock)
+            changed=$(python3 -I .github/scripts/crypto_simd_deps_changed.py "$RUNNER_TEMP/base.lock" Cargo.lock)
           fi
           echo "crypto_simd=$changed" >>"$GITHUB_OUTPUT"
 
