@@ -86,11 +86,14 @@ jobs:
           ocaml-compiler: "5.3"
 
       # Charon's `make build` runs `cargo fmt` and builds charon-ml's
-      # documentation, hence rustfmt and odoc.
+      # documentation, hence rustfmt and odoc. setup-ocaml creates a local
+      # switch in the workspace, which opam cannot find from ~/aeneas unless
+      # OPAMSWITCH names it.
       - name: Build the pinned Aeneas and Charon
         if: steps.cache.outputs.cache-hit != 'true'
         env:
           AENEAS_REV: ${{ steps.pins.outputs.aeneas }}
+          OPAMSWITCH: ${{ github.workspace }}
         run: |
           opam install -y ppx_deriving visitors easy_logging zarith yojson core_unix \
             odoc ocamlgraph menhir unionFind progress domainslib
