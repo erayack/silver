@@ -110,7 +110,7 @@ impl ApplicationBoundaryTile {
         processing: TProducer,
     ) -> Self {
         // A batch too small for every socket the tile can register leaves the
-        // rest of a busy iteration's readiness for the next one.
+        // rest of a busy iteration's readiness for the following one.
         let sockets = binds.len() +
             max_connections +
             EngineApi::max_sockets(engine_config.max_connections) +
