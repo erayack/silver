@@ -18,6 +18,7 @@ mod cosets;
 mod domain;
 mod fft;
 #[cfg(target_arch = "x86_64")]
+#[allow(dead_code)]
 mod fr8;
 #[cfg(target_arch = "x86_64")]
 mod fr8_fft;
