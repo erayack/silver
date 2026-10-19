@@ -11,6 +11,7 @@
               adaptors, `Vec::clear` or `is_multiple_of`"
 )]
 
+mod blst_msm;
 mod blst_ops;
 mod cell_extender;
 mod challenge;
@@ -23,6 +24,12 @@ mod fixed_base;
 mod fr8;
 #[cfg(target_arch = "x86_64")]
 mod fr8_fft;
+#[cfg(target_arch = "x86_64")]
+mod fr8_interpolation;
+#[cfg(target_arch = "x86_64")]
+mod fr8_scalars;
+#[cfg(all(test, target_arch = "x86_64"))]
+mod fr8_scalars_tests;
 mod pairing_lines;
 mod setup;
 mod simd_verify;

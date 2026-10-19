@@ -2,9 +2,8 @@
 //! table precomputed once.
 
 use blst::{
-    blst_fr, blst_p1, blst_p1s_mult_wbits, blst_p1s_mult_wbits_precompute,
-    blst_p1s_mult_wbits_precompute_sizeof, blst_p1s_mult_wbits_scratch_sizeof, blst_scalar,
-    blst_scalar_from_fr, limb_t,
+    blst_p1, blst_p1s_mult_wbits, blst_p1s_mult_wbits_precompute,
+    blst_p1s_mult_wbits_precompute_sizeof, blst_p1s_mult_wbits_scratch_sizeof, limb_t,
 };
 
 use crate::{bls::blst_p1_affine, kzg::FIELD_ELEMENTS_PER_CELL};
@@ -60,21 +59,15 @@ impl FixedBase {
     }
 }
 
-/// The little-endian bytes of the value, the layout `mult` takes.
-pub fn scalar_bytes(fr: &blst_fr) -> [u8; 32] {
-    let mut scalar = blst_scalar::default();
-    // SAFETY: valid pointers to single values.
-    unsafe { blst_scalar_from_fr(&mut scalar, fr) };
-    scalar.b
-}
-
 #[cfg(test)]
 mod tests {
+    use blst::blst_fr;
     use rand::{Rng, SeedableRng};
     use rand_chacha::ChaCha8Rng;
 
     use super::*;
     use crate::kzg::{
+        blst_msm::scalar_bytes,
         blst_ops::{LincombScratch, fr_from_bytes, fr_from_u64, fr_sub, g1_lincomb, g1_to_affine},
         setup::Setup,
     };
