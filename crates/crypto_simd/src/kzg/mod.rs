@@ -22,10 +22,14 @@ mod fr8;
 #[cfg(target_arch = "x86_64")]
 mod fr8_fft;
 mod setup;
+mod simd_verify;
+#[cfg(test)]
+mod simd_verify_tests;
 mod trusted_setup;
 mod verify;
 
 pub use cell_extender::CellExtender;
+pub use simd_verify::SimdCellBatchVerifier;
 pub use verify::CellBatchVerifier;
 
 pub const BYTES_PER_FIELD_ELEMENT: usize = 32;
