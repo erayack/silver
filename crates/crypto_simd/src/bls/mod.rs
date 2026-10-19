@@ -33,6 +33,9 @@ pub mod fp2x8;
 pub mod fp8;
 #[cfg(target_arch = "x86_64")]
 #[allow(clippy::missing_safety_doc)]
+pub mod fp8_inverse;
+#[cfg(target_arch = "x86_64")]
+#[allow(clippy::missing_safety_doc)]
 pub mod g1x8;
 #[cfg(target_arch = "x86_64")]
 #[allow(clippy::missing_safety_doc)]
