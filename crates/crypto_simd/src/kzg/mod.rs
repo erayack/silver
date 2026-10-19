@@ -20,10 +20,14 @@ mod fft;
 #[cfg(target_arch = "x86_64")]
 mod fr8;
 mod setup;
+mod simd_cell_extender;
+#[cfg(test)]
+mod simd_cell_extender_tests;
 mod trusted_setup;
 mod verify;
 
 pub use cell_extender::CellExtender;
+pub use simd_cell_extender::SimdCellExtender;
 pub use verify::CellBatchVerifier;
 
 pub const BYTES_PER_FIELD_ELEMENT: usize = 32;

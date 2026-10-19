@@ -5,8 +5,6 @@
 //! and returns, and `SimdCellExtender` composes them so that no range is
 //! exceeded.
 
-#![allow(dead_code)]
-
 use std::arch::x86_64::{
     __m512i, __mmask8, _mm512_add_epi64, _mm512_and_si512, _mm512_cmpeq_epi64_mask,
     _mm512_load_si512, _mm512_madd52hi_epu64, _mm512_madd52lo_epu64, _mm512_mask_blend_epi64,
@@ -179,6 +177,26 @@ impl Fr8 {
         Self(out)
     }
 
+    /// Lane u of vector l becomes lane l of vector u, for the eight vectors
+    /// of `block`.
+    #[target_feature(enable = "avx512f,avx512ifma")]
+    #[inline]
+    pub fn transpose_block(block: &mut [Fr8Soa]) {
+        assert_eq!(block.len(), LANES);
+        for j in 0..LIMBS {
+            let mut rows = [zero(); LANES];
+            for k in 0..LANES {
+                // SAFETY: each limb row is 64 bytes and `Fr8Soa` is 64-aligned.
+                rows[k] = unsafe { _mm512_load_si512(block[k].0[j].as_ptr().cast()) };
+            }
+            transpose8(&mut rows);
+            for k in 0..LANES {
+                // SAFETY: as above.
+                unsafe { _mm512_store_si512(block[k].0[j].as_mut_ptr().cast(), rows[k]) };
+            }
+        }
+    }
+
     /// Limb-wise sum, no carries.
     #[target_feature(enable = "avx512f,avx512ifma")]
     #[inline]
@@ -246,7 +264,7 @@ impl Fr8 {
 /// Transposes the 8×8 matrix of u64 held in eight vectors.
 #[target_feature(enable = "avx512f,avx512ifma")]
 #[inline]
-pub fn transpose8(r: &mut [__m512i; 8]) {
+fn transpose8(r: &mut [__m512i; 8]) {
     let t0 = _mm512_unpacklo_epi64(r[0], r[1]);
     let t1 = _mm512_unpackhi_epi64(r[0], r[1]);
     let t2 = _mm512_unpacklo_epi64(r[2], r[3]);
