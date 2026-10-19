@@ -32,7 +32,6 @@ mod x86 {
         bls::{COMPRESSED_LEN, blst_p1_affine, simd_available, uncompress_in_g1},
         kzg::{
             BYTES_PER_CELL, CELLS_PER_EXT_BLOB,
-            blst_msm::ByteLincomb,
             blst_ops::{g1_add, g1_neg, g1_to_affine},
             challenge::Preimage,
             commitment_cache::CommitmentCache,
@@ -40,6 +39,7 @@ mod x86 {
             fixed_base::FixedBase,
             fr8_interpolation::Interpolation,
             fr8_scalars::CellScalars,
+            msm8::Msm8,
             pairing_lines::PairingLines,
             setup::Setup,
             verify::Deduplicated,
@@ -57,7 +57,7 @@ mod x86 {
         preimage: Preimage,
         cell_scalars: CellScalars,
         interpolation: Interpolation,
-        lincomb: ByteLincomb,
+        msm: Msm8,
     }
 
     impl SimdCellBatchVerifier {
@@ -79,7 +79,7 @@ mod x86 {
                 preimage: Preimage::new(),
                 cell_scalars: CellScalars::new(&cosets),
                 interpolation: Interpolation::new(&cosets),
-                lincomb: ByteLincomb::default(),
+                msm: Msm8::new()?,
             })
         }
 
@@ -135,9 +135,9 @@ mod x86 {
             let Some(rli_scalars) = rli_scalars else { return false };
             let rli = self.fixed_base.mult(rli_scalars);
 
-            let ll = self.lincomb.lincomb(&self.proof_points, self.cell_scalars.ll());
-            let rlc = self.lincomb.lincomb(&self.commitment_points, self.cell_scalars.rlc());
-            let rlp = self.lincomb.lincomb(&self.proof_points, self.cell_scalars.rlp());
+            let ll = self.msm.lincomb(&self.proof_points, self.cell_scalars.ll());
+            let rlc = self.msm.lincomb(&self.commitment_points, self.cell_scalars.rlc());
+            let rlp = self.msm.lincomb(&self.proof_points, self.cell_scalars.rlp());
             let rl = g1_add(&g1_add(&rlc, &g1_neg(&rli)), &rlp);
             self.pairing_lines.check(&g1_to_affine(&ll), &g1_to_affine(&rl))
         }
