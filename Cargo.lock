@@ -5017,6 +5017,7 @@ dependencies = [
  "shared_memory",
  "silver_beacon_state_data",
  "silver_chain_spec",
+ "silver_crypto_simd",
  "silver_log",
  "silver_metrics",
  "silver_ssz",
@@ -5071,6 +5072,7 @@ name = "silver_crypto_simd"
 version = "0.1.0-alpha.2"
 dependencies = [
  "blst",
+ "c-kzg",
  "rand 0.8.6",
  "rand_chacha 0.3.1",
 ]
@@ -5122,6 +5124,7 @@ dependencies = [
  "async-trait",
  "blst",
  "buffa",
+ "c-kzg",
  "flux",
  "futures",
  "hdrhistogram",
