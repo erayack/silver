@@ -14,6 +14,7 @@
 mod blst_ops;
 mod cell_extender;
 mod challenge;
+mod commitment_cache;
 mod cosets;
 mod domain;
 mod fft;

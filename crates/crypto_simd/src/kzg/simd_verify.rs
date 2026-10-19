@@ -37,6 +37,7 @@ mod x86 {
                 g1_neg, g1_to_affine,
             },
             challenge::Preimage,
+            commitment_cache::CommitmentCache,
             cosets::Cosets,
             domain::reverse_bits,
             fft::inverse_fft,
@@ -53,6 +54,7 @@ mod x86 {
         setup: Setup,
         cosets: Cosets,
         commitments: Deduplicated,
+        commitment_cache: CommitmentCache,
         decoded: Vec<Option<blst_p1_affine>>,
         commitment_points: Vec<blst_p1_affine>,
         proof_points: Vec<blst_p1_affine>,
@@ -85,6 +87,7 @@ mod x86 {
                 fixed_base,
                 cosets: Cosets::new(),
                 commitments: Deduplicated::default(),
+                commitment_cache: CommitmentCache::default(),
                 decoded: Vec::new(),
                 commitment_points: Vec::new(),
                 proof_points: Vec::new(),
@@ -117,11 +120,8 @@ mod x86 {
                 return false;
             }
             self.commitments.fill(commitments);
-            if !decode_points(
-                &self.commitments.unique,
-                &mut self.decoded,
-                &mut self.commitment_points,
-            ) || !self.decode_cells(cells) ||
+            if !self.commitment_cache.decode(&self.commitments.unique, &mut self.commitment_points) ||
+                !self.decode_cells(cells) ||
                 !decode_points(proofs, &mut self.decoded, &mut self.proof_points)
             {
                 return false;
