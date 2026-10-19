@@ -1,8 +1,8 @@
 //! KZG cell operations of EIP-7594 (PeerDAS) over the BLS12-381 setup of
 //! EIP-4844, following the executable Lean specification in
 //! `ethereum/cryptography-specs`. Point decoding goes
-//! through `crate::bls`; every other curve and field operation is a blst
-//! call in `blst_ops`.
+//! through `crate::bls`, and `SimdCellExtender` computes cells with AVX-512
+//! IFMA; every other curve and field operation is a blst call in `blst_ops`.
 #![allow(
     clippy::needless_range_loop,
     clippy::vec_resize_to_zero,
