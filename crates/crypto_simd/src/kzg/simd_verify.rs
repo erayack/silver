@@ -40,6 +40,7 @@ mod x86 {
             cosets::Cosets,
             domain::reverse_bits,
             fft::inverse_fft,
+            fixed_base::{FixedBase, scalar_bytes},
             setup::Setup,
             verify::Deduplicated,
         },
@@ -64,6 +65,7 @@ mod x86 {
         coefficients: Vec<blst_fr>,
         interpolation: Vec<blst_fr>,
         lincomb: LincombScratch,
+        fixed_base: FixedBase,
     }
 
     impl SimdCellBatchVerifier {
@@ -72,8 +74,11 @@ mod x86 {
             if !simd_available() {
                 return None;
             }
+            let setup = Setup::decode();
+            let fixed_base = FixedBase::new(setup.g1_monomial.as_slice().try_into().unwrap());
             Some(Self {
-                setup: Setup::decode(),
+                setup,
+                fixed_base,
                 cosets: Cosets::new(),
                 commitments: Deduplicated::default(),
                 decoded: Vec::new(),
@@ -222,7 +227,8 @@ mod x86 {
                     factor = fr_mul(&factor, &self.cosets.shift_inverse[c]);
                 }
             }
-            g1_lincomb(&self.setup.g1_monomial, &self.interpolation, &mut self.lincomb)
+            let scalars = std::array::from_fn(|i| scalar_bytes(&self.interpolation[i]));
+            self.fixed_base.mult(&scalars)
         }
     }
 

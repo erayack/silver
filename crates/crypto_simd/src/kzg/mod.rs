@@ -17,6 +17,7 @@ mod challenge;
 mod cosets;
 mod domain;
 mod fft;
+mod fixed_base;
 #[cfg(target_arch = "x86_64")]
 mod fr8;
 #[cfg(target_arch = "x86_64")]
