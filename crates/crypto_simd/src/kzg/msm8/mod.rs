@@ -88,10 +88,12 @@ impl Msm8 {
         if n < MIN_POINTS {
             return Some(self.fallback.lincomb(points, scalars));
         }
-        let window_bits = match n {
-            ..64 => 4,
-            ..512 => 6,
-            _ => 8,
+        let window_bits = if n < 64 {
+            4
+        } else if n < 512 {
+            6
+        } else {
+            8
         };
         // SAFETY: `new` checked avx512f and avx512ifma.
         unsafe { self.msm_vectors(points, scalars, window_bits) }
