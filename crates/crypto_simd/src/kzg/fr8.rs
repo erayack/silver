@@ -115,6 +115,21 @@ fn reduce_row(t: &mut [__m512i; 2 * LIMBS + 1], r: &[__m512i; LIMBS], rinv: __m5
     t[i + 1] = _mm512_add_epi64(t[i + 1], _mm512_srli_epi64::<52>(t[i]));
 }
 
+impl Fr8Soa {
+    pub const ZERO: Self = Self([[0; LANES]; LIMBS]);
+
+    /// The value in `lane`, normalised below 2^256, as the little-endian bytes
+    /// of a `blst_scalar`.
+    pub fn lane_le_bytes(&self, lane: usize) -> [u8; 32] {
+        let words = pack64(&std::array::from_fn(|j| self.0[j][lane]));
+        let mut bytes = [0u8; 32];
+        for (chunk, word) in bytes.chunks_exact_mut(8).zip(words) {
+            chunk.copy_from_slice(&word.to_le_bytes());
+        }
+        bytes
+    }
+}
+
 impl Fr8 {
     #[target_feature(enable = "avx512f,avx512ifma")]
     #[inline]
@@ -246,6 +261,13 @@ impl Fr8 {
             d[j] = _mm512_and_si512(s, mask);
         }
         (Self(d), _mm512_cmpeq_epi64_mask(borrow, splat(u64::MAX)))
+    }
+
+    /// The lanes where normalised `self` is below `c`.
+    #[target_feature(enable = "avx512f,avx512ifma")]
+    #[inline]
+    pub fn below(&self, c: &Self) -> __mmask8 {
+        self.sub_borrow(c).1
     }
 
     /// For normalised `self` below 2c: `self − c` where `self ≥ c`.
