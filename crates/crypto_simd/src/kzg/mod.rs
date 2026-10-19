@@ -22,6 +22,7 @@ mod fixed_base;
 mod fr8;
 #[cfg(target_arch = "x86_64")]
 mod fr8_fft;
+mod pairing_lines;
 mod setup;
 mod simd_verify;
 #[cfg(test)]

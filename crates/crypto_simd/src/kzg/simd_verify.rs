@@ -34,13 +34,14 @@ mod x86 {
             BYTES_PER_CELL, BYTES_PER_FIELD_ELEMENT, CELLS_PER_EXT_BLOB, FIELD_ELEMENTS_PER_CELL,
             blst_ops::{
                 LincombScratch, fr_add, fr_from_bytes, fr_from_u64, fr_mul, g1_add, g1_lincomb,
-                g1_neg, g1_to_affine, pairing_check,
+                g1_neg, g1_to_affine,
             },
             challenge::Preimage,
             cosets::Cosets,
             domain::reverse_bits,
             fft::inverse_fft,
             fixed_base::{FixedBase, scalar_bytes},
+            pairing_lines::PairingLines,
             setup::Setup,
             verify::Deduplicated,
         },
@@ -66,6 +67,7 @@ mod x86 {
         interpolation: Vec<blst_fr>,
         lincomb: LincombScratch,
         fixed_base: FixedBase,
+        pairing_lines: PairingLines,
     }
 
     impl SimdCellBatchVerifier {
@@ -76,8 +78,10 @@ mod x86 {
             }
             let setup = Setup::decode();
             let fixed_base = FixedBase::new(setup.g1_monomial.as_slice().try_into().unwrap());
+            let pairing_lines = PairingLines::new(&setup.g2_s_pow_cell, &setup.g2_neg_generator);
             Some(Self {
                 setup,
+                pairing_lines,
                 fixed_base,
                 cosets: Cosets::new(),
                 commitments: Deduplicated::default(),
@@ -175,12 +179,7 @@ mod x86 {
             let rlp = g1_lincomb(&self.proof_points, &self.scalars, &mut self.lincomb);
 
             let rl = g1_add(&g1_add(&rlc, &g1_neg(&rli)), &rlp);
-            pairing_check(
-                &g1_to_affine(&ll),
-                &self.setup.g2_s_pow_cell,
-                &g1_to_affine(&rl),
-                &self.setup.g2_neg_generator,
-            )
+            self.pairing_lines.check(&g1_to_affine(&ll), &g1_to_affine(&rl))
         }
 
         /// RLI = [Σ_k r^k·I_k(s)]. The r^k-weighted cells of each column are
