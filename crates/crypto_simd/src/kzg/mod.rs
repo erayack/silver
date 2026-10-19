@@ -25,6 +25,7 @@ mod fixed_base;
 #[cfg(target_arch = "x86_64")]
 mod fr8;
 #[cfg(target_arch = "x86_64")]
+#[allow(dead_code)]
 mod fr8_fft;
 #[cfg(target_arch = "x86_64")]
 mod fr8_interpolation;
