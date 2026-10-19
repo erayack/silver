@@ -21,7 +21,11 @@ mod fft;
 #[allow(dead_code)]
 mod fr8;
 #[cfg(target_arch = "x86_64")]
+mod fr8_bytes;
+#[cfg(target_arch = "x86_64")]
 mod fr8_fft;
+#[cfg(all(test, target_arch = "x86_64"))]
+mod fr8_test_util;
 mod setup;
 mod simd_cell_extender;
 #[cfg(test)]

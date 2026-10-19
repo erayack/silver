@@ -154,3 +154,45 @@ fn simd_rejects_invalid_blobs_and_leaves_cells() {
         );
     }
 }
+
+#[test]
+fn simd_cells_match_ckzg_and_scalar_on_structured_extremes() {
+    let Some(mut simd) = extender() else { return };
+    let mut scalar = CellExtender::new();
+    let mut rng = ChaCha8Rng::seed_from_u64(SEED ^ 3);
+    let one_bit = |i: usize| {
+        let mut element = [0; 32];
+        element[31 - i / 8 % 31] = 1 << (i % 8);
+        element
+    };
+
+    let blobs: Vec<(&str, Box<[u8; BYTES_PER_BLOB]>)> = vec![
+        ("r-1 first half, zero second", blob_of(|i| if i < 2048 { R_MINUS_ONE } else { [0; 32] })),
+        ("zero first half, r-1 second", blob_of(|i| if i < 2048 { [0; 32] } else { R_MINUS_ONE })),
+        (
+            "r-1 on lane 0 of each vector",
+            blob_of(|i| if i % 8 == 0 { R_MINUS_ONE } else { [0; 32] }),
+        ),
+        (
+            "r-1 off lane 7 of each vector",
+            blob_of(|i| if i % 8 == 7 { [0; 32] } else { R_MINUS_ONE }),
+        ),
+        (
+            "r-1 in alternating blocks of 64",
+            blob_of(|i| if i / 64 % 2 == 0 { R_MINUS_ONE } else { [0; 32] }),
+        ),
+        ("r-1 with one zero", blob_of(|i| if i == 1234 { [0; 32] } else { R_MINUS_ONE })),
+        ("single bits", blob_of(one_bit)),
+        (
+            "r-1 xor random bit below 2^248",
+            blob_of(|_| {
+                let mut element = R_MINUS_ONE;
+                element[rng.gen_range(1..32)] ^= 1 << rng.gen_range(0..8);
+                if element > R_MINUS_ONE { R_MINUS_ONE } else { element }
+            }),
+        ),
+    ];
+    for (name, blob) in &blobs {
+        assert_matches_both(&mut simd, &mut scalar, blob, name);
+    }
+}

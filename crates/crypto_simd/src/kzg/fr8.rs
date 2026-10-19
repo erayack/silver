@@ -7,10 +7,10 @@
 
 use std::arch::x86_64::{
     __m512i, __mmask8, _mm512_add_epi64, _mm512_and_si512, _mm512_cmpeq_epi64_mask,
-    _mm512_load_si512, _mm512_madd52hi_epu64, _mm512_madd52lo_epu64, _mm512_mask_blend_epi64,
-    _mm512_set1_epi64, _mm512_setzero_si512, _mm512_shuffle_i64x2, _mm512_srai_epi64,
-    _mm512_srli_epi64, _mm512_store_si512, _mm512_sub_epi64, _mm512_unpackhi_epi64,
-    _mm512_unpacklo_epi64,
+    _mm512_cmpgt_epu64_mask, _mm512_load_si512, _mm512_madd52hi_epu64, _mm512_madd52lo_epu64,
+    _mm512_mask_blend_epi64, _mm512_mask_sub_epi64, _mm512_set1_epi64, _mm512_setzero_si512,
+    _mm512_shuffle_i64x2, _mm512_srai_epi64, _mm512_srli_epi64, _mm512_store_si512,
+    _mm512_sub_epi64, _mm512_unpackhi_epi64, _mm512_unpacklo_epi64,
 };
 
 use blst::blst_fr;
@@ -25,18 +25,19 @@ pub const MASK52: u64 = (1 << LIMB_BITS) - 1;
 pub const R_U64: [u64; 4] =
     [0xffff_ffff_0000_0001, 0x53bd_a402_fffe_5bfe, 0x3339_d808_09a1_d805, 0x73ed_a753_299d_7d48];
 pub const R52: [u64; LIMBS] = unpack52(&R_U64);
-pub const TWO_R52: [u64; LIMBS] = unpack52(&double(&R_U64));
+pub const TWO_R52: [u64; LIMBS] = double52(&R52);
+pub const FOUR_R52: [u64; LIMBS] = double52(&TWO_R52);
 /// −r⁻¹ mod 2^52.
 pub const R_INV52: u64 = negated_inverse_mod_2_52(R_U64[0]);
 
-const fn double(x: &[u64; 4]) -> [u64; 4] {
-    let mut out = [0u64; 4];
+const fn double52(x: &[u64; LIMBS]) -> [u64; LIMBS] {
+    let mut out = [0u64; LIMBS];
     let mut carry = 0;
-    let mut i = 0;
-    while i < 4 {
-        out[i] = (x[i] << 1) | carry;
-        carry = x[i] >> 63;
-        i += 1;
+    let mut j = 0;
+    while j < LIMBS {
+        out[j] = ((x[j] << 1) | carry) & MASK52;
+        carry = x[j] >> (LIMB_BITS - 1);
+        j += 1;
     }
     out
 }
@@ -52,6 +53,8 @@ const fn negated_inverse_mod_2_52(x: u64) -> u64 {
     }
     inverse.wrapping_neg() & MASK52
 }
+
+pub type Product = [__m512i; 2 * LIMBS + 1];
 
 /// Limb-major: `limbs[j][lane]`.
 #[derive(Clone, Copy)]
@@ -88,7 +91,7 @@ pub fn to_r260(a: &blst_fr) -> [u64; LIMBS] {
 
 #[target_feature(enable = "avx512f,avx512ifma")]
 #[inline]
-fn splat(x: u64) -> __m512i {
+pub(super) fn splat(x: u64) -> __m512i {
     _mm512_set1_epi64(x as i64)
 }
 
@@ -100,19 +103,20 @@ fn zero() -> __m512i {
 
 #[target_feature(enable = "avx512f,avx512ifma")]
 #[inline]
-fn muladd_row(t: &mut [__m512i; 2 * LIMBS + 1], a: &[__m512i; LIMBS], b_i: __m512i, i: usize) {
+fn muladd_row(t: &mut Product, a: &[__m512i; LIMBS], b_i: __m512i, i: usize) {
     for j in 0..LIMBS {
         t[i + j] = _mm512_madd52lo_epu64(t[i + j], a[j], b_i);
         t[i + j + 1] = _mm512_madd52hi_epu64(t[i + j + 1], a[j], b_i);
     }
 }
 
+/// `(t + lo(q·r₀)) >> 52` without the product: the sum clears the low limb,
+/// so it carries exactly when `t`'s low limb is nonzero. Added to `t[i + 1]`
+/// before the q products, it stays off the q dependency chain.
 #[target_feature(enable = "avx512f,avx512ifma")]
 #[inline]
-fn reduce_row(t: &mut [__m512i; 2 * LIMBS + 1], r: &[__m512i; LIMBS], rinv: __m512i, i: usize) {
-    let q = _mm512_madd52lo_epu64(zero(), t[i], rinv);
-    muladd_row(t, r, q, i);
-    t[i + 1] = _mm512_add_epi64(t[i + 1], _mm512_srli_epi64::<52>(t[i]));
+fn carry_of_cleared(t: __m512i) -> __m512i {
+    _mm512_srli_epi64::<52>(_mm512_add_epi64(t, splat(MASK52)))
 }
 
 impl Fr8Soa {
@@ -165,31 +169,54 @@ impl Fr8 {
     /// below r the other may be any 260-bit value, and the output is
     /// normalised and below 2r: (a·b + q·r) / 2^260 < (a/2^260 + 1)·r, as
     /// b < r.
+    #[cfg(test)]
     #[target_feature(enable = "avx512f,avx512ifma")]
     #[inline]
     pub fn mul(&self, rhs: &Self) -> Self {
+        // The operands after the product are unused without `WITH_NEXT`.
+        Self::reduce_while_multiplying::<false>(self.product(rhs), self, rhs).0.normalise()
+    }
+
+    #[target_feature(enable = "avx512f,avx512ifma")]
+    #[inline]
+    pub fn product(&self, rhs: &Self) -> Product {
+        let mut t = [zero(); 2 * LIMBS + 1];
+        for i in 0..LIMBS {
+            muladd_row(&mut t, &self.0, rhs.0[i], i);
+        }
+        t
+    }
+
+    /// The Montgomery reduction of `t`, with limbs below 20·2^52, not carried.
+    /// The product of `a·b` is formed in the same instruction stream: the
+    /// serial q chain of the reduction leaves the FP scheduler idle, and the
+    /// independent product fills it. Without `WITH_NEXT`, `a` and `b` are
+    /// ignored and the returned product is zero.
+    #[target_feature(enable = "avx512f,avx512ifma")]
+    #[inline]
+    pub fn reduce_while_multiplying<const WITH_NEXT: bool>(
+        mut t: Product,
+        a: &Self,
+        b: &Self,
+    ) -> (Self, Product) {
         let r = Self::splat(&R52).0;
         let rinv = splat(R_INV52);
-        let mut t = [zero(); 2 * LIMBS + 1];
-        muladd_row(&mut t, &self.0, rhs.0[0], 0);
-        muladd_row(&mut t, &self.0, rhs.0[1], 1);
-        muladd_row(&mut t, &self.0, rhs.0[2], 2);
-        muladd_row(&mut t, &self.0, rhs.0[3], 3);
-        muladd_row(&mut t, &self.0, rhs.0[4], 4);
-        reduce_row(&mut t, &r, rinv, 0);
-        reduce_row(&mut t, &r, rinv, 1);
-        reduce_row(&mut t, &r, rinv, 2);
-        reduce_row(&mut t, &r, rinv, 3);
-        reduce_row(&mut t, &r, rinv, 4);
-
-        let mask = splat(MASK52);
-        let mut out = [zero(); LIMBS];
-        out[0] = t[LIMBS];
-        for j in 0..LIMBS - 1 {
-            out[j + 1] = _mm512_add_epi64(t[LIMBS + j + 1], _mm512_srli_epi64::<52>(out[j]));
-            out[j] = _mm512_and_si512(out[j], mask);
+        let mut next = [zero(); 2 * LIMBS + 1];
+        for i in 0..LIMBS {
+            let carry = carry_of_cleared(t[i]);
+            let q = _mm512_madd52lo_epu64(zero(), t[i], rinv);
+            t[i + 1] = _mm512_add_epi64(t[i + 1], carry);
+            if WITH_NEXT {
+                muladd_row(&mut next, &a.0, b.0[i], i);
+            }
+            for j in 1..LIMBS {
+                t[i + j] = _mm512_madd52lo_epu64(t[i + j], r[j], q);
+            }
+            for j in 0..LIMBS {
+                t[i + j + 1] = _mm512_madd52hi_epu64(t[i + j + 1], r[j], q);
+            }
         }
-        Self(out)
+        (Self(std::array::from_fn(|j| t[LIMBS + j])), next)
     }
 
     /// Lane u of vector l becomes lane l of vector u, for the eight vectors
@@ -197,6 +224,27 @@ impl Fr8 {
     #[target_feature(enable = "avx512f,avx512ifma")]
     #[inline]
     pub fn transpose_block(block: &mut [Fr8Soa]) {
+        Self::transpose_block_then(block, |_, _| {});
+    }
+
+    /// `transpose_block`, then each adjacent pair of vectors `(x, y)` becomes
+    /// `(x + y, x + c − y)` limb-wise, with no carries.
+    #[target_feature(enable = "avx512f,avx512ifma")]
+    #[inline]
+    pub fn transpose_block_then_add_sub_pairs(block: &mut [Fr8Soa], c: &[u64; LIMBS]) {
+        Self::transpose_block_then(block, |j, rows| {
+            let c = splat(c[j]);
+            for pair in rows.chunks_exact_mut(2) {
+                let (x, y) = (pair[0], pair[1]);
+                pair[0] = _mm512_add_epi64(x, y);
+                pair[1] = _mm512_sub_epi64(_mm512_add_epi64(x, c), y);
+            }
+        });
+    }
+
+    #[target_feature(enable = "avx512f,avx512ifma")]
+    #[inline]
+    fn transpose_block_then(block: &mut [Fr8Soa], then: impl Fn(usize, &mut [__m512i; LANES])) {
         assert_eq!(block.len(), LANES);
         for j in 0..LIMBS {
             let mut rows = [zero(); LANES];
@@ -205,6 +253,7 @@ impl Fr8 {
                 rows[k] = unsafe { _mm512_load_si512(block[k].0[j].as_ptr().cast()) };
             }
             transpose8(&mut rows);
+            then(j, &mut rows);
             for k in 0..LANES {
                 // SAFETY: as above.
                 unsafe { _mm512_store_si512(block[k].0[j].as_mut_ptr().cast(), rows[k]) };
@@ -270,6 +319,16 @@ impl Fr8 {
         self.sub_borrow(c).1
     }
 
+    /// For normalised `self`: `self − c` limb-wise, where its top limb exceeds
+    /// that of `c`, so `self ≥ c`. The result is not carried, and its value is
+    /// below `c` plus 2^208 when `self` is below 2c.
+    #[target_feature(enable = "avx512f,avx512ifma")]
+    #[inline]
+    pub fn sub_where_top_limb_above(&self, c: &Self) -> Self {
+        let above = _mm512_cmpgt_epu64_mask(self.0[LIMBS - 1], c.0[LIMBS - 1]);
+        Self(std::array::from_fn(|j| _mm512_mask_sub_epi64(self.0[j], above, self.0[j], c.0[j])))
+    }
+
     /// For normalised `self` below 2c: `self − c` where `self ≥ c`.
     #[target_feature(enable = "avx512f,avx512ifma")]
     #[inline]
@@ -319,55 +378,7 @@ mod tests {
     use rand_chacha::ChaCha8Rng;
 
     use super::*;
-    use crate::{bls::simd_available, kzg::blst_ops::fr_from_bytes};
-
-    fn available() -> bool {
-        let ok = simd_available();
-        assert!(
-            ok || std::env::var_os("SILVER_REQUIRE_IFMA").is_none(),
-            "SILVER_REQUIRE_IFMA is set, but the IFMA path is off: no avx512ifma, or no simd feature"
-        );
-        ok
-    }
-
-    fn random_fr(rng: &mut ChaCha8Rng) -> blst_fr {
-        let mut bytes = [0u8; 32];
-        rng.fill(&mut bytes[1..]);
-        fr_from_bytes(&bytes).expect("top byte zero is below r")
-    }
-
-    /// `x + k·r` as normalised limbs.
-    fn plus_multiple_of_r(x: &[u64; LIMBS], k: u64) -> [u64; LIMBS] {
-        let mut out = [0u64; LIMBS];
-        let mut carry = 0;
-        for j in 0..LIMBS {
-            let sum = x[j] + k * R52[j] + carry;
-            out[j] = sum & MASK52;
-            carry = sum >> 52;
-        }
-        assert_eq!(carry, 0, "fits in 260 bits");
-        out
-    }
-
-    fn soa(lanes: &[[u64; LIMBS]; LANES]) -> Fr8Soa {
-        let mut out = Fr8Soa([[0; LANES]; LIMBS]);
-        for lane in 0..LANES {
-            for j in 0..LIMBS {
-                out.0[j][lane] = lanes[lane][j];
-            }
-        }
-        out
-    }
-
-    fn lanes(soa: &Fr8Soa) -> [[u64; LIMBS]; LANES] {
-        let mut out = [[0; LIMBS]; LANES];
-        for lane in 0..LANES {
-            for j in 0..LIMBS {
-                out[lane][j] = soa.0[j][lane];
-            }
-        }
-        out
-    }
+    use crate::kzg::fr8_test_util::{available, lanes, plus_multiple_of_r, random_fr, soa};
 
     #[target_feature(enable = "avx512f,avx512ifma")]
     fn mul_canonical(x: &Fr8Soa, y: &Fr8Soa) -> Fr8Soa {
@@ -531,6 +542,54 @@ mod tests {
         let out = lanes(&unsafe { cond_sub_r(&input) });
         for l in 0..LANES {
             assert_eq!(out[l], cases[l].1, "case {l}");
+        }
+    }
+
+    #[target_feature(enable = "avx512f,avx512ifma")]
+    fn sub_where_top_limb_above_two_r(x: &Fr8Soa) -> Fr8Soa {
+        let mut out = Fr8Soa::ZERO;
+        Fr8::load(x).sub_where_top_limb_above(&Fr8::splat(&TWO_R52)).store(&mut out);
+        out
+    }
+
+    #[test]
+    fn sub_where_top_limb_above_splits_at_the_top_limb() {
+        if !available() {
+            return;
+        }
+        let top = LIMBS - 1;
+        let top_only = |limb| {
+            let mut limbs = [0; LIMBS];
+            limbs[top] = limb;
+            limbs
+        };
+        let two_r_plus_top = |extra| {
+            let mut limbs = TWO_R52;
+            limbs[top] += extra;
+            limbs
+        };
+        let mut top_equal_rest_full = [MASK52; LIMBS];
+        top_equal_rest_full[top] = TWO_R52[top];
+        // (value, Some(value - 2r) when subtracted)
+        let cases: [([u64; LIMBS], Option<[u64; LIMBS]>); LANES] = [
+            (top_equal_rest_full, None),
+            (top_only(TWO_R52[top]), None),
+            ([0; LIMBS], None),
+            (TWO_R52, None),
+            (two_r_plus_top(1), Some(top_only(1))),
+            (two_r_plus_top(2), Some(top_only(2))),
+            ([MASK52; LIMBS], Some(std::array::from_fn(|j| MASK52 - TWO_R52[j]))),
+            (two_r_plus_top(3), Some(top_only(3))),
+        ];
+        let input = soa(&std::array::from_fn(|l| cases[l].0));
+        // SAFETY: `available` checked avx512f and avx512ifma.
+        let out = unsafe { sub_where_top_limb_above_two_r(&input) };
+        let normalised = lanes(&unsafe { normalise_all(&out) });
+        for (l, (value, subtracted)) in cases.iter().enumerate() {
+            match subtracted {
+                None => assert_eq!(lanes(&out)[l], *value, "case {l}"),
+                Some(difference) => assert_eq!(normalised[l], *difference, "case {l}"),
+            }
         }
     }
 
