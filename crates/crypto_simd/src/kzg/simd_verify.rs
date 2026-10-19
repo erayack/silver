@@ -34,6 +34,7 @@ mod x86 {
             BYTES_PER_CELL, CELLS_PER_EXT_BLOB,
             blst_ops::{g1_add, g1_neg, g1_to_affine},
             challenge::Preimage,
+            column_sums::ColumnSums,
             commitment_cache::CommitmentCache,
             cosets::Cosets,
             fixed_base::FixedBase,
@@ -57,6 +58,7 @@ mod x86 {
         preimage: Preimage,
         cell_scalars: CellScalars,
         interpolation: Interpolation,
+        column_sums: ColumnSums,
         msm: Msm8,
     }
 
@@ -79,6 +81,7 @@ mod x86 {
                 preimage: Preimage::new(),
                 cell_scalars: CellScalars::new(&cosets),
                 interpolation: Interpolation::new(&cosets),
+                column_sums: ColumnSums::new(&cosets),
                 msm: Msm8::new()?,
             })
         }
@@ -135,9 +138,19 @@ mod x86 {
             let Some(rli_scalars) = rli_scalars else { return false };
             let rli = self.fixed_base.mult(rli_scalars);
 
-            let ll = self.msm.lincomb(&self.proof_points, self.cell_scalars.ll());
+            let grouped = self.column_sums.ll_and_rlp(
+                &mut self.msm,
+                cell_indices,
+                &self.proof_points,
+                self.cell_scalars.ll(),
+            );
+            let (ll, rlp) = grouped.unwrap_or_else(|| {
+                (
+                    self.msm.lincomb(&self.proof_points, self.cell_scalars.ll()),
+                    self.msm.lincomb(&self.proof_points, self.cell_scalars.rlp()),
+                )
+            });
             let rlc = self.msm.lincomb(&self.commitment_points, self.cell_scalars.rlc());
-            let rlp = self.msm.lincomb(&self.proof_points, self.cell_scalars.rlp());
             let rl = g1_add(&g1_add(&rlc, &g1_neg(&rli)), &rlp);
             self.pairing_lines.check(&g1_to_affine(&ll), &g1_to_affine(&rl))
         }

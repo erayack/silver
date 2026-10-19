@@ -39,13 +39,9 @@ impl ByteLincomb {
         if n < PIPPENGER_MIN_POINTS {
             for i in 0..n {
                 let mut base = blst_p1::default();
-                let mut term = blst_p1::default();
-                // SAFETY: valid pointers; blst reads `SCALAR_BITS` bits of the 32-byte scalar.
-                unsafe {
-                    blst_p1_from_affine(&mut base, &self.points[i]);
-                    blst_p1_mult(&mut term, &base, self.scalars[i].as_ptr(), SCALAR_BITS);
-                }
-                out = g1_add(&out, &term);
+                // SAFETY: valid pointers to single values.
+                unsafe { blst_p1_from_affine(&mut base, &self.points[i]) };
+                out = g1_add(&out, &g1_mult(&base, &self.scalars[i]));
             }
             return out;
         }
@@ -69,6 +65,14 @@ impl ByteLincomb {
         }
         out
     }
+}
+
+/// `scalar`·`point` for a little-endian scalar below 2^255.
+pub fn g1_mult(point: &blst_p1, scalar: &[u8; 32]) -> blst_p1 {
+    let mut out = blst_p1::default();
+    // SAFETY: valid pointers; blst reads `SCALAR_BITS` bits of the 32-byte scalar.
+    unsafe { blst_p1_mult(&mut out, point, scalar.as_ptr(), SCALAR_BITS) };
+    out
 }
 
 /// The little-endian bytes of the value, the layout of `blst_scalar`.

@@ -165,3 +165,28 @@ fn one_instance_serves_many_batches() {
         assert!(verifiers.verdict(&batch, &format!("size {size}")));
     }
 }
+
+#[test]
+fn few_and_many_columns_verify_alike() {
+    let Some(mut verifiers) = Verifiers::new() else { return };
+    let mut rng = ChaCha8Rng::seed_from_u64(SEED ^ 5);
+    let blobs = blobs(&mut rng, verifiers.settings, 6);
+    for count in 1..=8 {
+        let columns: Vec<usize> = (0..count).map(|i| (i * 19 + 3) % CELLS_PER_EXT_BLOB).collect();
+        let batch = da_batch(&blobs, &columns);
+        assert!(verifiers.verdict(&batch, &format!("{count} columns")), "{count} columns");
+
+        let mut corrupted = batch.clone();
+        let k = rng.gen_range(0..corrupted.cells.len());
+        corrupted.proofs[k][rng.gen_range(1..48)] ^= 1 << rng.gen_range(0..8);
+        verifiers.verdict(&corrupted, &format!("{count} columns, corrupted proof"));
+
+        let mut swapped = batch.clone();
+        let k = rng.gen_range(1..swapped.cells.len());
+        swapped.commitments.swap(0, k);
+        swapped.cell_indices.swap(0, k);
+        swapped.cells.swap(0, k);
+        swapped.proofs.swap(0, k);
+        assert!(verifiers.verdict(&swapped, &format!("{count} columns, cells reordered")));
+    }
+}

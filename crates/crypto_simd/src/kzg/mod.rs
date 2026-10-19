@@ -15,6 +15,8 @@ mod blst_msm;
 mod blst_ops;
 mod cell_extender;
 mod challenge;
+#[cfg(target_arch = "x86_64")]
+mod column_sums;
 mod commitment_cache;
 mod cosets;
 mod domain;
