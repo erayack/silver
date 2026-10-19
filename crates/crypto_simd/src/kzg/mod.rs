@@ -17,6 +17,8 @@ mod challenge;
 mod cosets;
 mod domain;
 mod fft;
+#[cfg(target_arch = "x86_64")]
+mod fr8;
 mod setup;
 mod trusted_setup;
 mod verify;
