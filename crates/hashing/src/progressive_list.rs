@@ -1,22 +1,22 @@
 use super::{
-    ColumnSpec,
+    TreeSpec,
     format::{TreeFormat, progressive_last_seg_for_chunks},
     list::ListTree,
     store::NodeStore,
     subtree::{NodeRange, build_subtree_hashes, rehash_subtree},
 };
 use crate::{
+    B256,
     merkle::ZERO_HASHES,
     progressive::{PROGRESSIVE_SEGMENT_START, progressive_segment_of_chunk},
-    types::B256,
 };
 
-pub(super) struct ProgressiveListTree<C: ColumnSpec> {
+pub struct ProgressiveListTree<C: TreeSpec> {
     pub(super) store: NodeStore<C>,
     pub(super) last_seg: u32,
 }
 
-impl<C: ColumnSpec> ProgressiveListTree<C> {
+impl<C: TreeSpec> ProgressiveListTree<C> {
     pub(super) fn from_leaves(
         cap: usize,
         count: usize,
@@ -119,7 +119,7 @@ impl<C: ColumnSpec> ProgressiveListTree<C> {
     }
 }
 
-fn build_segment<C: ColumnSpec>(
+fn build_segment<C: TreeSpec>(
     internals: &mut [B256],
     data: &[B256],
     k: usize,
@@ -134,6 +134,3 @@ fn build_segment<C: ColumnSpec>(
         non_zero,
     );
 }
-
-#[cfg(test)]
-mod tests;

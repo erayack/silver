@@ -1,24 +1,26 @@
-use super::{ColumnGroup, ColumnSpec, pool::PagePool, snapshot::PageSnapshot, tree::ColumnTree};
+use silver_hashing::{FlatTree, PagePool, PageSnapshot};
+
+use super::{TreeGroup, TreeSpec};
 use crate::ring::Id;
 
-/// A flat writable copy of one fork. `mirror` is what `tree` holds outside its
-/// uncommitted chunks, as the ring entry `mirror_of` (`None`: the base) had it.
-/// A mirror owns no pages, so an equal page id proves equal content only while
-/// the mirrored pages are live. Pages are freed only at finalize, and a mirror
-/// of a survivor or of the unchanged base names only live ids, so finalize
-/// unmirrors any other.
-pub(super) struct HashingWriter<C: ColumnSpec> {
-    tree: ColumnTree<C>,
+/// The group's flat tree, plus the committed table it last matched.
+///
+/// `mirror` is `tree` outside its uncommitted chunks, as ring entry
+/// `mirror_of` (`None`: the base) committed it. A load diffs against it, so it
+/// copies only the pages that differ.
+///
+/// The mirror owns no pages, so an equal page id proves equal content only
+/// while those pages are live. Pages are freed only at finalize, which clears
+/// any mirror that is neither a survivor nor the unchanged base.
+pub(super) struct HashingWriter<C: TreeSpec> {
+    tree: FlatTree<C>,
     mirror: PageSnapshot,
-    mirror_of: Option<Id<ColumnGroup<C>>>,
+    mirror_of: Option<Id<TreeGroup<C>>>,
 }
 
-impl<C: ColumnSpec> HashingWriter<C> {
+impl<C: TreeSpec> HashingWriter<C> {
     /// The writer, and `tree` committed as the base it mirrors.
-    pub(super) fn new(
-        mut tree: ColumnTree<C>,
-        pool: &mut PagePool<C::Page>,
-    ) -> (Self, PageSnapshot) {
+    pub(super) fn new(mut tree: FlatTree<C>, pool: &mut PagePool<C::Page>) -> (Self, PageSnapshot) {
         let base = tree.to_snapshot(pool);
         let mut mirror = PageSnapshot::default();
         mirror.mirror(&base);
@@ -26,12 +28,12 @@ impl<C: ColumnSpec> HashingWriter<C> {
     }
 
     #[inline]
-    pub(super) fn tree(&self) -> &ColumnTree<C> {
+    pub(super) fn tree(&self) -> &FlatTree<C> {
         &self.tree
     }
 
     #[inline]
-    pub(super) fn tree_mut(&mut self) -> &mut ColumnTree<C> {
+    pub(super) fn tree_mut(&mut self) -> &mut FlatTree<C> {
         &mut self.tree
     }
 
@@ -39,7 +41,7 @@ impl<C: ColumnSpec> HashingWriter<C> {
         &mut self,
         pool: &PagePool<C::Page>,
         target: &PageSnapshot,
-        of: Option<Id<ColumnGroup<C>>>,
+        of: Option<Id<TreeGroup<C>>>,
     ) {
         self.tree.load(pool, &self.mirror, target);
         self.mirror.mirror(target);
@@ -51,7 +53,7 @@ impl<C: ColumnSpec> HashingWriter<C> {
         pool: &mut PagePool<C::Page>,
         dst: &mut PageSnapshot,
         parent: &PageSnapshot,
-        id: Id<ColumnGroup<C>>,
+        id: Id<TreeGroup<C>>,
     ) {
         self.tree.commit(pool, dst, Some(parent));
         self.mirror.mirror(dst);
@@ -61,7 +63,7 @@ impl<C: ColumnSpec> HashingWriter<C> {
     pub(super) fn unmirror_dead(
         &mut self,
         base: &PageSnapshot,
-        is_survivor: impl Fn(Id<ColumnGroup<C>>) -> bool,
+        is_survivor: impl Fn(Id<TreeGroup<C>>) -> bool,
     ) {
         let live = match self.mirror_of {
             Some(id) => is_survivor(id),

@@ -4,14 +4,12 @@ use std::{
 };
 
 use flux_profiler::timed;
+use silver_hashing::{FlatTree, PagePool, PageSnapshot};
 
-use super::{
-    ColumnReader, ColumnSpec, ColumnWriteView, hashing_writer::HashingWriter, pool::PagePool,
-    snapshot::PageSnapshot, tree::ColumnTree,
-};
+use super::{TreeSpec, TreeView, TreeWriteView, hashing_writer::HashingWriter};
 use crate::{
     ring::{Id, Ring, RingGroup},
-    types::{B256, ColumnLenMismatch, HashFormat, SLOTS_RING_N},
+    types::{B256, HashFormat, SLOTS_RING_N, TreeLenMismatch},
 };
 
 fn byte_chunks(bytes: &[u8]) -> impl Iterator<Item = B256> + '_ {
@@ -22,38 +20,37 @@ fn byte_chunks(bytes: &[u8]) -> impl Iterator<Item = B256> + '_ {
     })
 }
 
-pub struct ColumnGroup<C: ColumnSpec> {
+pub struct TreeGroup<C: TreeSpec> {
     pool: PagePool<C::Page>,
     finalized: PageSnapshot,
     /// The last winner: its ring slot is freed, and its id now names
     /// `finalized`.
     finalized_id: Option<Id<Self>>,
     ring: Ring<Self>,
-    /// Flat writable head — the hot write path stays flat; committed forks are
-    /// paged.
+    /// Writes go to this flat tree; committed forks live in pages.
     writer: HashingWriter<C>,
     _marker: PhantomData<fn() -> C>,
 }
 
-impl<C: ColumnSpec> RingGroup for ColumnGroup<C> {
+impl<C: TreeSpec> RingGroup for TreeGroup<C> {
     type Entry = PageSnapshot;
 }
 
-impl<C: ColumnSpec> ColumnGroup<C> {
+impl<C: TreeSpec> TreeGroup<C> {
     pub fn new(
         cap: usize,
         count: usize,
         ssz_bytes: &[u8],
         format: HashFormat,
-    ) -> Result<Self, ColumnLenMismatch> {
+    ) -> Result<Self, TreeLenMismatch> {
         if ssz_bytes.len() != count * size_of::<C::Val>() {
-            return Err(ColumnLenMismatch { bytes: ssz_bytes.len(), expected: count });
+            return Err(TreeLenMismatch { bytes: ssz_bytes.len(), expected: count });
         }
         Ok(Self::from_leaves(cap, count, byte_chunks(ssz_bytes), format))
     }
 
-    pub fn vector(ssz_bytes: &[u8]) -> Result<Self, ColumnLenMismatch> {
-        debug_assert!(!C::IS_LIST, "vector constructor on a list column");
+    pub fn vector(ssz_bytes: &[u8]) -> Result<Self, TreeLenMismatch> {
+        debug_assert!(!C::IS_LIST, "vector constructor on a list tree");
         Self::new(C::SSZ_LIMIT, C::SSZ_LIMIT, ssz_bytes, HashFormat::Fixed)
     }
 
@@ -68,8 +65,8 @@ impl<C: ColumnSpec> ColumnGroup<C> {
         leaves: impl Iterator<Item = B256>,
         format: HashFormat,
     ) -> Self {
-        let mut pool = PagePool::new();
-        let flat = ColumnTree::from_leaves(cap, count, leaves, format);
+        let mut pool = PagePool::default();
+        let flat = FlatTree::from_leaves(cap, count, leaves, format);
         let (writer, finalized) = HashingWriter::new(flat, &mut pool);
         Self {
             writer,
@@ -82,28 +79,28 @@ impl<C: ColumnSpec> ColumnGroup<C> {
     }
 
     #[inline]
-    pub fn view(&self, id: Id<Self>) -> ColumnReader<'_, C> {
+    pub fn view(&self, id: Id<Self>) -> TreeView<'_, C> {
         let snapshot =
             if self.finalized_id == Some(id) { &self.finalized } else { self.ring.get(id) };
-        ColumnReader::paged(&self.pool, snapshot)
+        TreeView::paged(&self.pool, snapshot)
     }
 
     #[timed]
-    pub fn roll_fresh(&mut self) -> ColumnWriteView<'_, C> {
+    pub fn roll_fresh(&mut self) -> TreeWriteView<'_, C> {
         let Self { pool, finalized, writer, .. } = self;
         writer.load(pool, finalized, None);
-        ColumnWriteView::new(self, None)
+        TreeWriteView::new(self, None)
     }
 
     #[timed]
-    pub fn roll_from(&mut self, parent: Id<Self>) -> ColumnWriteView<'_, C> {
+    pub fn roll_from(&mut self, parent: Id<Self>) -> TreeWriteView<'_, C> {
         let Self { pool, finalized, finalized_id, ring, writer, .. } = self;
         if *finalized_id == Some(parent) {
             writer.load(pool, finalized, None);
         } else {
             writer.load(pool, ring.get(parent), Some(parent));
         }
-        ColumnWriteView::new(self, Some(parent))
+        TreeWriteView::new(self, Some(parent))
     }
 
     pub(super) fn commit_writer(&mut self, parent: Option<Id<Self>>) -> Id<Self> {
@@ -114,24 +111,24 @@ impl<C: ColumnSpec> ColumnGroup<C> {
         let parent_in_ring = parent.filter(|&p| Some(p) != *finalized_id);
         let (id, dst, parent_snap) = ring.roll_deriving(parent_in_ring);
 
-        debug_assert!(dst.allocated.is_empty(), "recycled slot still owns pages: not released");
+        debug_assert!(!dst.owns_pages(), "recycled slot still owns pages: not released");
         writer.commit(pool, dst, parent_snap.unwrap_or(finalized), id);
         id
     }
 
     #[inline]
-    pub(super) fn tree(&self) -> &ColumnTree<C> {
+    pub(super) fn tree(&self) -> &FlatTree<C> {
         self.writer.tree()
     }
 
     #[inline]
-    pub(super) fn tree_mut(&mut self) -> &mut ColumnTree<C> {
+    pub(super) fn tree_mut(&mut self) -> &mut FlatTree<C> {
         self.writer.tree_mut()
     }
 
     /// Promote the winner into the base and free its ring slot and everything
     /// older. The winner's id then names the base; the other survivor ids stay
-    /// valid unchanged — columns never reanchor.
+    /// valid unchanged — trees never reanchor.
     #[timed]
     pub fn finalize<S>(&mut self, winner: Id<Self>, survivors: &[S], idx: impl Fn(&S) -> Id<Self>) {
         debug_assert!(

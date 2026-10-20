@@ -1,7 +1,7 @@
 use std::marker::PhantomData;
 
 use super::{
-    ColumnSpec,
+    TreeSpec,
     chunk_writes::ChunkWrites,
     format::TreeFormat,
     page_format::{PagePos, Subtree},
@@ -9,22 +9,22 @@ use super::{
     snapshot::PageSnapshot,
     subtree::NodeRange,
 };
-use crate::{merkle::ZERO_HASHES, types::B256};
+use crate::{B256, merkle::ZERO_HASHES};
 
-pub(super) struct NodeStore<C: ColumnSpec> {
+pub(super) struct NodeStore<C: TreeSpec> {
     pub(super) nodes: Vec<B256>,
     pub(super) count: usize,
     pub(super) writes: ChunkWrites,
     _marker: PhantomData<fn() -> C>,
 }
 
-impl<C: ColumnSpec> Default for NodeStore<C> {
+impl<C: TreeSpec> Default for NodeStore<C> {
     fn default() -> Self {
         Self { nodes: Vec::new(), count: 0, writes: ChunkWrites::default(), _marker: PhantomData }
     }
 }
 
-impl<C: ColumnSpec> NodeStore<C> {
+impl<C: TreeSpec> NodeStore<C> {
     pub(super) fn with_leaves(
         format: TreeFormat,
         count: usize,
@@ -86,10 +86,10 @@ impl<C: ColumnSpec> NodeStore<C> {
         }
     }
 
-    /// Commit the flat tree into `dst`, reusing `dst`'s allocations: clean
-    /// pages are `parent`'s, dirty ones get fresh pages, except all-zero
-    /// subtrees, which share the pool's zero page of their depth. A parent in
-    /// another format, or none, shares nothing.
+    /// Commit the flat tree into `dst`, reusing its buffers. Clean pages are
+    /// `parent`'s, dirty ones are new, and all-zero subtrees share the zero
+    /// page of their depth. A parent in another format, or none, shares
+    /// nothing.
     pub(super) fn commit(
         &mut self,
         format: TreeFormat,
@@ -118,14 +118,14 @@ impl<C: ColumnSpec> NodeStore<C> {
     }
 }
 
-struct PageCommitter<'a, C: ColumnSpec> {
+struct PageCommitter<'a, C: TreeSpec> {
     writes: &'a ChunkWrites,
     nodes: &'a [B256],
     pool: &'a mut PagePool<C::Page>,
     allocated: &'a mut Vec<(u32, PageId)>,
 }
 
-impl<C: ColumnSpec> PageCommitter<'_, C> {
+impl<C: TreeSpec> PageCommitter<'_, C> {
     fn commit_page(&mut self, sub: Subtree, at: PagePos, parent: Option<PageId>) -> PageId {
         if let Some(parent) = parent &&
             !self.writes.touches(sub.chunks_under::<C>(at))
