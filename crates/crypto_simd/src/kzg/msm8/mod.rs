@@ -6,6 +6,8 @@
 //! that needs it makes `Msm8::msm` return None, and the caller then uses blst.
 
 mod buckets;
+mod fixed_base8;
+mod glv;
 mod pairs;
 mod reduce;
 mod store;
@@ -13,12 +15,19 @@ mod store;
 mod tests;
 
 use blst::{blst_p1, blst_p1_affine_is_inf};
+pub use fixed_base8::FixedBase8;
 
 use crate::{
     bls::{blst_p1_affine, simd_available},
     kzg::{
         blst_msm::ByteLincomb,
-        msm8::{buckets::Buckets, pairs::BatchedAdds, reduce::WindowSums, store::PointStore},
+        msm8::{
+            buckets::Buckets,
+            glv::{HALF_SCALAR_BITS, decompose},
+            pairs::BatchedAdds,
+            reduce::WindowSums,
+            store::PointStore,
+        },
     },
 };
 
@@ -32,6 +41,8 @@ pub struct Msm8 {
     window_sums: WindowSums,
     finite_points: Vec<blst_p1_affine>,
     finite_scalars: Vec<[u8; 32]>,
+    halves: Vec<[u8; 32]>,
+    negated: Vec<bool>,
     fallback: ByteLincomb,
 }
 
@@ -45,6 +56,8 @@ impl Msm8 {
             window_sums: WindowSums::default(),
             finite_points: Vec::new(),
             finite_scalars: Vec::new(),
+            halves: Vec::new(),
+            negated: Vec::new(),
             fallback: ByteLincomb::default(),
         })
     }
@@ -106,11 +119,23 @@ impl Msm8 {
         scalars: &[[u8; 32]],
         window_bits: usize,
     ) -> Option<blst_p1> {
-        let n = points.len();
-        let windows = Buckets::windows_for(window_bits);
+        self.halves.clear();
+        self.halves.resize(2 * scalars.len(), [0; 32]);
+        self.negated.clear();
+        self.negated.resize(2 * scalars.len(), false);
+        for (i, scalar) in scalars.iter().enumerate() {
+            let (k1, k2) = decompose(scalar);
+            self.halves[i] = k1.magnitude;
+            self.negated[i] = k1.negative;
+            self.halves[scalars.len() + i] = k2.magnitude;
+            self.negated[scalars.len() + i] = k2.negative;
+        }
+        let n = 2 * points.len();
+        let windows = Buckets::windows_for(window_bits, HALF_SCALAR_BITS);
         self.store.reset(n + windows * n.div_ceil(2));
-        self.store.push_blst(points);
-        self.buckets.fill(scalars, window_bits);
+        self.store.push_blst_signed(points, &self.negated[..points.len()], false);
+        self.store.push_blst_signed(points, &self.negated[points.len()..], true);
+        self.buckets.fill(&self.halves, window_bits, HALF_SCALAR_BITS);
         loop {
             self.adds.clear();
             self.buckets.queue_round(&mut self.adds, &mut self.store, n);

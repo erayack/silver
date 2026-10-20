@@ -3,8 +3,6 @@ use crate::kzg::msm8::{pairs::BatchedAdds, store::PointStore};
 /// Set on a reference to the negation of the point it names.
 pub const NEGATED: u32 = 1 << 31;
 
-const SCALAR_BITS: usize = 255;
-
 /// The points of each window's signed-digit buckets, as references into a
 /// `PointStore`. Window j, bucket b (1 ≤ b ≤ 2^(w−1)) is list
 /// j·2^(w−1) + b − 1.
@@ -21,8 +19,8 @@ impl Buckets {
         Self { window_bits: 0, windows: 0, refs: Vec::new(), starts: Vec::new(), lens: Vec::new() }
     }
 
-    pub fn windows_for(window_bits: usize) -> usize {
-        SCALAR_BITS.div_ceil(window_bits) + usize::from(SCALAR_BITS % window_bits == 0)
+    pub fn windows_for(window_bits: usize, scalar_bits: usize) -> usize {
+        scalar_bits.div_ceil(window_bits) + usize::from(scalar_bits % window_bits == 0)
     }
 
     pub fn windows(&self) -> usize {
@@ -34,10 +32,10 @@ impl Buckets {
     }
 
     /// Sorts point i into the bucket of each window's signed digit of
-    /// `scalars[i]`, which is below 2^255, by counting.
-    pub fn fill(&mut self, scalars: &[[u8; 32]], window_bits: usize) {
+    /// `scalars[i]`, which is below 2^scalar_bits, by counting.
+    pub fn fill(&mut self, scalars: &[[u8; 32]], window_bits: usize, scalar_bits: usize) {
         self.window_bits = window_bits;
-        self.windows = Self::windows_for(window_bits);
+        self.windows = Self::windows_for(window_bits, scalar_bits);
         let lists = self.windows * self.buckets_per_window();
         self.lens.clear();
         self.lens.resize(lists, 0);
@@ -110,20 +108,20 @@ impl Buckets {
 
 /// The signed digits of a scalar: window j holds digit d_j in
 /// [−2^(w−1), 2^(w−1)], with Σ d_j·2^(w·j) the scalar.
-struct SignedDigits<'a> {
+pub(super) struct SignedDigits<'a> {
     scalar: &'a [u8; 32],
     window_bits: usize,
     windows: usize,
 }
 
 impl<'a> SignedDigits<'a> {
-    fn new(scalar: &'a [u8; 32], window_bits: usize, windows: usize) -> Self {
+    pub(super) fn new(scalar: &'a [u8; 32], window_bits: usize, windows: usize) -> Self {
         assert!(scalar[31] < 0x80, "scalars are below 2^255");
         Self { scalar, window_bits, windows }
     }
 
     /// Calls `f(window, magnitude, negated)` for every nonzero digit.
-    fn for_each(&self, mut f: impl FnMut(usize, usize, bool)) {
+    pub(super) fn for_each(&self, mut f: impl FnMut(usize, usize, bool)) {
         let words: [u64; 4] = std::array::from_fn(|k| {
             u64::from_le_bytes(self.scalar[8 * k..8 * k + 8].try_into().unwrap())
         });

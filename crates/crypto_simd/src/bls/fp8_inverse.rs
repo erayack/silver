@@ -35,14 +35,14 @@ impl Fp8 {
         let mut table = [Self::one(); 16];
         table[1] = *self;
         for k in 2..16 {
-            table[k] = table[k - 1].mul(self);
+            table[k] = table[k - 1].mul_lazy(self);
         }
         let mut result = table[P_MINUS_2_WINDOWS[WINDOWS - 1] as usize];
         for w in (0..WINDOWS - 1).rev() {
-            result = result.square().square().square().square();
+            result = result.square_lazy().square_lazy().square_lazy().square_lazy();
             let digit = P_MINUS_2_WINDOWS[w] as usize;
             if digit != 0 {
-                result = result.mul(&table[digit]);
+                result = result.mul_lazy(&table[digit]);
             }
         }
         result

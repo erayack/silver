@@ -8,10 +8,11 @@
 //! 12r.
 
 use crate::kzg::{
-    BYTES_PER_CELL, BYTES_PER_FIELD_ELEMENT, CELLS_PER_EXT_BLOB, FIELD_ELEMENTS_PER_CELL,
+    BYTES_PER_CELL, CELLS_PER_EXT_BLOB, FIELD_ELEMENTS_PER_CELL,
     blst_ops::fr_mul,
     cosets::Cosets,
-    fr8::{Fr8, Fr8Soa, LANES, LIMBS, R52, TWO_R52, unpack52},
+    fr8::{Fr8, Fr8Soa, LANES, R52, TWO_R52},
+    fr8_bytes::BYTES_PER_VECTOR,
     fr8_fft::{
         BLOCK_VECTORS, FIRST_WIDE_STAGE, dit_first_stage, dit_stage, soa_of, transpose_blocks,
         twiddles,
@@ -64,7 +65,7 @@ impl Interpolation {
     ///
     /// # Safety
     /// avx512f and avx512ifma must be available.
-    #[target_feature(enable = "avx512f,avx512ifma")]
+    #[target_feature(enable = "avx512f,avx512ifma,avx512bw")]
     pub unsafe fn scalars(
         &mut self,
         cells: &[[u8; BYTES_PER_CELL]],
@@ -143,18 +144,12 @@ impl Interpolation {
 
 /// Into layout T, as limbs of the plain values; false if some element is not
 /// below r.
-#[target_feature(enable = "avx512f,avx512ifma")]
+#[target_feature(enable = "avx512f,avx512ifma,avx512bw")]
 fn decode_cell(cell: &[u8; BYTES_PER_CELL], elements: &mut [Fr8Soa; BLOCK_VECTORS]) -> bool {
-    for (j, element) in cell.chunks_exact(BYTES_PER_FIELD_ELEMENT).enumerate() {
-        let value: [u64; 4] = std::array::from_fn(|w| {
-            let at = BYTES_PER_FIELD_ELEMENT - 8 * (w + 1);
-            u64::from_be_bytes(element[at..at + 8].try_into().unwrap())
-        });
-        let limbs = unpack52(&value);
-        for i in 0..LIMBS {
-            elements[j % BLOCK_VECTORS].0[i][j / BLOCK_VECTORS] = limbs[i];
-        }
+    let mut below_r = true;
+    for (vector, bytes) in elements.iter_mut().zip(cell.as_chunks::<BYTES_PER_VECTOR>().0) {
+        below_r &= vector.set_from_be_bytes(bytes);
     }
-    let r = Fr8::splat(&R52);
-    elements.iter().all(|vector| Fr8::load(vector).below(&r) == u8::MAX)
+    transpose_blocks(elements);
+    below_r
 }

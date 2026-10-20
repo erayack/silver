@@ -88,7 +88,7 @@ pub fn to_r260(a: &blst_fr) -> [u64; LIMBS] {
 
 #[target_feature(enable = "avx512f,avx512ifma")]
 #[inline]
-fn splat(x: u64) -> __m512i {
+pub(crate) fn splat(x: u64) -> __m512i {
     _mm512_set1_epi64(x as i64)
 }
 
@@ -286,7 +286,7 @@ impl Fr8 {
 /// Transposes the 8×8 matrix of u64 held in eight vectors.
 #[target_feature(enable = "avx512f,avx512ifma")]
 #[inline]
-fn transpose8(r: &mut [__m512i; 8]) {
+pub(crate) fn transpose8(r: &mut [__m512i; 8]) {
     let t0 = _mm512_unpacklo_epi64(r[0], r[1]);
     let t1 = _mm512_unpackhi_epi64(r[0], r[1]);
     let t2 = _mm512_unpacklo_epi64(r[2], r[3]);

@@ -26,19 +26,19 @@ pub struct Fp8(pub [__m512i; LIMBS]);
 
 #[target_feature(enable = "avx512f,avx512ifma")]
 #[inline]
-fn splat(x: u64) -> __m512i {
+pub(crate) fn splat(x: u64) -> __m512i {
     _mm512_set1_epi64(x as i64)
 }
 
 #[target_feature(enable = "avx512f,avx512ifma")]
 #[inline]
-fn zero() -> __m512i {
+pub(crate) fn zero() -> __m512i {
     _mm512_setzero_si512()
 }
 
 #[target_feature(enable = "avx512f,avx512ifma")]
 #[inline]
-fn splat_limbs(limbs: &Limbs) -> [__m512i; LIMBS] {
+pub(crate) fn splat_limbs(limbs: &Limbs) -> [__m512i; LIMBS] {
     let mut v = [zero(); LIMBS];
     for j in 0..LIMBS {
         v[j] = splat(limbs[j]);
@@ -103,7 +103,12 @@ fn borrowed(borrow: __m512i) -> __mmask8 {
 /// `t[i..] += a * b_i` over the 2·LIMBS-wide accumulator.
 #[target_feature(enable = "avx512f,avx512ifma")]
 #[inline]
-fn muladd_row(t: &mut [__m512i; 2 * LIMBS + 1], a: &[__m512i; LIMBS], b_i: __m512i, i: usize) {
+pub(crate) fn muladd_row(
+    t: &mut [__m512i; 2 * LIMBS + 1],
+    a: &[__m512i; LIMBS],
+    b_i: __m512i,
+    i: usize,
+) {
     for j in 0..LIMBS {
         t[i + j] = _mm512_madd52lo_epu64(t[i + j], a[j], b_i);
         t[i + j + 1] = _mm512_madd52hi_epu64(t[i + j + 1], a[j], b_i);

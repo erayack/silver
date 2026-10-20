@@ -23,7 +23,11 @@ mod domain;
 mod fft;
 mod fixed_base;
 #[cfg(target_arch = "x86_64")]
+#[allow(dead_code)]
 mod fr8;
+#[cfg(target_arch = "x86_64")]
+#[allow(dead_code)]
+mod fr8_bytes;
 #[cfg(target_arch = "x86_64")]
 #[allow(dead_code)]
 mod fr8_fft;
@@ -33,6 +37,8 @@ mod fr8_interpolation;
 mod fr8_scalars;
 #[cfg(all(test, target_arch = "x86_64"))]
 mod fr8_scalars_tests;
+#[cfg(all(test, target_arch = "x86_64"))]
+mod fr8_test_util;
 #[cfg(target_arch = "x86_64")]
 mod msm8;
 mod pairing_lines;

@@ -37,10 +37,9 @@ mod x86 {
             column_sums::ColumnSums,
             commitment_cache::CommitmentCache,
             cosets::Cosets,
-            fixed_base::FixedBase,
             fr8_interpolation::Interpolation,
             fr8_scalars::CellScalars,
-            msm8::Msm8,
+            msm8::{FixedBase8, Msm8},
             pairing_lines::PairingLines,
             setup::Setup,
             verify::Deduplicated,
@@ -48,7 +47,7 @@ mod x86 {
     };
 
     pub struct SimdCellBatchVerifier {
-        fixed_base: FixedBase,
+        fixed_base: FixedBase8,
         pairing_lines: PairingLines,
         commitments: Deduplicated,
         commitment_cache: CommitmentCache,
@@ -63,15 +62,15 @@ mod x86 {
     }
 
     impl SimdCellBatchVerifier {
-        /// None without AVX-512 IFMA.
+        /// None without AVX-512 IFMA and BW.
         pub fn new() -> Option<Self> {
-            if !simd_available() {
+            if !simd_available() || !is_x86_feature_detected!("avx512bw") {
                 return None;
             }
             let setup = Setup::decode();
             let cosets = Cosets::new();
             Some(Self {
-                fixed_base: FixedBase::new(setup.g1_monomial.as_slice().try_into().unwrap()),
+                fixed_base: FixedBase8::new(setup.g1_monomial.as_slice().try_into().unwrap()),
                 pairing_lines: PairingLines::new(&setup.g2_s_pow_cell, &setup.g2_neg_generator),
                 commitments: Deduplicated::default(),
                 commitment_cache: CommitmentCache::default(),
@@ -125,7 +124,7 @@ mod x86 {
             cell_indices: &[u64],
             cells: &[[u8; BYTES_PER_CELL]],
         ) -> bool {
-            // SAFETY: `new` checked avx512f and avx512ifma.
+            // SAFETY: `new` checked avx512f, avx512ifma and avx512bw.
             let rli_scalars = unsafe {
                 self.cell_scalars.fill(
                     r,
@@ -136,7 +135,8 @@ mod x86 {
                 self.interpolation.scalars(cells, cell_indices, &self.cell_scalars)
             };
             let Some(rli_scalars) = rli_scalars else { return false };
-            let rli = self.fixed_base.mult(rli_scalars);
+            // SAFETY: `new` checked avx512f, avx512ifma and avx512bw.
+            let rli = unsafe { self.fixed_base.mult(rli_scalars) };
 
             let grouped = self.column_sums.ll_and_rlp(
                 &mut self.msm,
