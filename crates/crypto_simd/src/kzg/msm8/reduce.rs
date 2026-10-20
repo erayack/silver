@@ -122,7 +122,7 @@ fn window_group_sums<const W: usize>(
             (bx, Fp8::select(lanes[w].negated, &by, &c.neg(&by)))
         });
         let sums: [(G1x8, __mmask8); W] =
-            std::array::from_fn(|w| t[w].add_affine_lazy(&b[w].0, &b[w].1, &c));
+            std::array::from_fn(|w| t[w].add_affine(&b[w].0, &b[w].1));
         for w in 0..W {
             let present = lanes[w].present;
             if present == 0 {
@@ -145,7 +145,7 @@ fn window_group_sums<const W: usize>(
             t_infinite[w] &= !present;
         }
 
-        let sums: [(G1x8, __mmask8); W] = std::array::from_fn(|w| s[w].add_lazy(&t[w], &c));
+        let sums: [(G1x8, __mmask8); W] = std::array::from_fn(|w| s[w].add(&t[w]));
         for w in 0..W {
             let (sum, undecided) = &sums[w];
             let first = !t_infinite[w] & s_infinite[w];

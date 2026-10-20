@@ -103,7 +103,7 @@ impl FixedBase8 {
                 }
                 let (bx, by) = self.table.load_points(load_indices(&index));
                 let by = Fp8::select(negative, &by, &c.neg(&by));
-                let (sum, undecided) = acc.add_affine_lazy(&bx, &by, &c);
+                let (sum, undecided) = acc.add_affine(&bx, &by);
                 let first = present & infinite;
                 let adding = present & !infinite;
                 if undecided & adding != 0 {

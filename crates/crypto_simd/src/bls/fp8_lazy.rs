@@ -1,7 +1,6 @@
-//! Lazy-reduction kernels of `Fp8` for the multi-scalar multiplication and
-//! the fixed-base multiplication: raw (uncarried) limbs, early-carry
-//! Montgomery reduction, and squaring. The proved decoders keep the kernels
-//! of `fp8.rs`.
+//! Lazy-reduction kernels of `Fp8`: raw (uncarried) limbs, early-carry
+//! Montgomery reduction, and squaring. `Fp8::mul` and `Fp8::square` are these
+//! kernels.
 //!
 //! Ranges. A normalised operand has limbs below 2^52, so its value is below
 //! 2^416 = R. The Montgomery product (a·b + m·p)/R is below 2p whenever
@@ -23,25 +22,36 @@ use crate::bls::{
 
 pub type Accumulator = [__m512i; 2 * LIMBS + 1];
 
-/// `k·p` as normalised limbs, for k below 2^11 (a limb times k plus the carry
-/// stays below 2^64).
-const fn times_p(k: u64) -> Limbs {
-    let mut out = [0u64; LIMBS];
-    let mut carry = 0u64;
-    let mut j = 0;
-    while j < LIMBS {
-        let limb = P[j] * k + carry;
-        out[j] = limb & MASK52;
-        carry = limb >> 52;
-        j += 1;
-    }
-    assert!(carry == 0);
-    out
-}
-
-pub const TWO_P: Limbs = times_p(2);
-pub const FOUR_P: Limbs = times_p(4);
-pub const EIGHT_P: Limbs = times_p(8);
+pub const TWO_P: Limbs = [
+    0xdffffffff5556,
+    0xfd62a7ffff73f,
+    0xd61ec483d57ff,
+    0x257ece61a541e,
+    0xec8ee9709e70a,
+    0x374f6c869759a,
+    0x3d472ffcd3496,
+    0x0000000034022,
+];
+pub const FOUR_P: Limbs = [
+    0xbfffffffeaaac,
+    0xfac54ffffee7f,
+    0xac3d8907aafff,
+    0x4afd9cc34a83d,
+    0xd91dd2e13ce14,
+    0x6e9ed90d2eb35,
+    0x7a8e5ff9a692c,
+    0x0000000068044,
+];
+pub const EIGHT_P: Limbs = [
+    0x7fffffffd5558,
+    0xf58a9ffffdcff,
+    0x587b120f55fff,
+    0x95fb39869507b,
+    0xb23ba5c279c28,
+    0xdd3db21a5d66b,
+    0xf51cbff34d258,
+    0x00000000d0088,
+];
 
 /// `(t + lo(q·p₀)) >> 52` without the product: the low limb clears to zero,
 /// so the sum carries exactly when `t`'s low limb is nonzero.
@@ -106,31 +116,6 @@ impl Fp8 {
         Self(std::array::from_fn(|j| t[LIMBS + j]))
     }
 
-    /// Montgomery product with raw output limbs; see the module ranges.
-    #[target_feature(enable = "avx512f,avx512ifma")]
-    #[inline]
-    pub fn mul_raw(&self, rhs: &Self) -> Self {
-        Self::reduce(self.product(rhs))
-    }
-
-    #[target_feature(enable = "avx512f,avx512ifma")]
-    #[inline]
-    pub fn mul_lazy(&self, rhs: &Self) -> Self {
-        self.mul_raw(rhs).normalise()
-    }
-
-    #[target_feature(enable = "avx512f,avx512ifma")]
-    #[inline]
-    pub fn square_raw(&self) -> Self {
-        Self::reduce(self.square_product())
-    }
-
-    #[target_feature(enable = "avx512f,avx512ifma")]
-    #[inline]
-    pub fn square_lazy(&self) -> Self {
-        self.square_raw().normalise()
-    }
-
     /// Limb-wise sum, no carries.
     #[target_feature(enable = "avx512f,avx512ifma")]
     #[inline]
@@ -184,22 +169,13 @@ impl Fp8 {
         let (d, borrowed) = self.sub_borrow(c);
         Self(std::array::from_fn(|j| _mm512_mask_blend_epi64(borrowed, d.0[j], self.0[j])))
     }
-
-    /// Lanes where normalised `self`, below 4p, is 0 mod p.
-    #[target_feature(enable = "avx512f,avx512ifma")]
-    #[inline]
-    pub fn is_zero_mod_p_below_4p(&self) -> __mmask8 {
-        let canonical = self.cond_sub(&Self::splat_limbs(&TWO_P)).cond_sub(&Self::splat_limbs(&P));
-        let mut k: __mmask8 = 0xff;
-        for j in 0..LIMBS {
-            k &= _mm512_cmpeq_epi64_mask(canonical.0[j], zero());
-        }
-        k
-    }
 }
 
 #[cfg(test)]
 mod tests {
+    use std::arch::x86_64::_mm512_storeu_si512;
+
+    use blst::{blst_fp, blst_fp_from_uint64, blst_fp_mul, blst_uint64_from_fp};
     use rand::{Rng, SeedableRng};
     use rand_chacha::ChaCha8Rng;
 
@@ -245,17 +221,171 @@ mod tests {
             // SAFETY: checked above.
             unsafe {
                 let (a, b) = (Fp8::load(&a), Fp8::load(&b));
-                assert!(plain(&a.mul_lazy(&b)) == plain(&a.mul(&b)));
-                assert!(plain(&a.square_lazy()) == plain(&a.mul(&a)));
                 let sum = a.add_raw(&b).normalise();
                 assert!(plain(&sum.cond_sub(&Fp8::splat_limbs(&TWO_P))) == plain(&a.add(&b)));
                 let diff = a.sub_raw(&b, &Fp8::splat_limbs(&TWO_P)).normalise();
                 assert!(plain(&diff.cond_sub(&Fp8::splat_limbs(&TWO_P))) == plain(&a.sub(&b)));
-                assert_eq!(
-                    a.sub_raw(&a, &Fp8::splat_limbs(&TWO_P)).normalise().is_zero_mod_p_below_4p(),
-                    0xff
-                );
-                assert_eq!(diff.is_zero_mod_p_below_4p(), 0);
+                let zero_mod_p = a.sub_raw(&a, &Fp8::splat_limbs(&TWO_P)).normalise();
+                assert_eq!(zero_mod_p.cond_sub(&Fp8::splat_limbs(&TWO_P)).is_zero_mask(), 0xff);
+                assert_eq!(diff.cond_sub(&Fp8::splat_limbs(&TWO_P)).is_zero_mask(), 0);
+            }
+        }
+    }
+
+    const fn times_p(k: u64) -> Limbs {
+        let mut out = [0u64; LIMBS];
+        let mut carry = 0u64;
+        let mut j = 0;
+        while j < LIMBS {
+            let limb = P[j] * k + carry;
+            out[j] = limb & MASK52;
+            carry = limb >> 52;
+            j += 1;
+        }
+        assert!(carry == 0);
+        out
+    }
+
+    #[test]
+    fn times_p_matches_the_literals() {
+        assert_eq!(TWO_P, times_p(2));
+        assert_eq!(FOUR_P, times_p(4));
+        assert_eq!(EIGHT_P, times_p(8));
+    }
+
+    #[target_feature(enable = "avx512f,avx512ifma")]
+    fn limbs_of(v: &Fp8) -> [Limbs; LANES] {
+        let mut out = [[0u64; LIMBS]; LANES];
+        for j in 0..LIMBS {
+            let mut lanes = [0u64; LANES];
+            // SAFETY: `lanes` is 64 bytes, and `_mm512_storeu_si512` has no alignment
+            // requirement.
+            unsafe { _mm512_storeu_si512(lanes.as_mut_ptr().cast(), v.0[j]) };
+            for lane in 0..LANES {
+                out[lane][j] = lanes[lane];
+            }
+        }
+        out
+    }
+
+    fn below_two_p(limbs: &Limbs) -> bool {
+        limbs.iter().rev().lt(TWO_P.iter().rev())
+    }
+
+    #[test]
+    fn square_equals_mul_limb_for_limb() {
+        if !simd_available() {
+            return;
+        }
+        let mut rng = ChaCha8Rng::seed_from_u64(0x5a);
+        let all_ones = [[MASK52; LIMBS]; LANES];
+        let mut operands = vec![all_ones];
+        for _ in 0..16 {
+            operands.push(std::array::from_fn(|_| random_below(&mut rng, &two_p_words())));
+        }
+        for operand in operands {
+            // SAFETY: checked above.
+            unsafe {
+                let a = Fp8::load(&operand);
+                assert!(limbs_of(&a.square()) == limbs_of(&a.mul(&a)));
+            }
+        }
+    }
+
+    #[test]
+    fn mul_equals_the_reference_limb_for_limb() {
+        if !simd_available() {
+            return;
+        }
+        let mut rng = ChaCha8Rng::seed_from_u64(0x3c);
+        for round in 0..17 {
+            let (a, b): ([Limbs; LANES], [Limbs; LANES]) = if round == 0 {
+                ([[MASK52; LIMBS]; LANES], [[MASK52; LIMBS]; LANES])
+            } else {
+                (
+                    std::array::from_fn(|_| random_below(&mut rng, &two_p_words())),
+                    std::array::from_fn(|_| random_below(&mut rng, &two_p_words())),
+                )
+            };
+            // SAFETY: checked above.
+            unsafe {
+                let (a, b) = (Fp8::load(&a), Fp8::load(&b));
+                assert!(limbs_of(&a.mul(&b)) == limbs_of(&a.mul_reference(&b)));
+            }
+        }
+    }
+
+    fn two_p_words() -> [u64; 6] {
+        let mut two_p = [0u64; 6];
+        let mut carry = 0u64;
+        for j in 0..6 {
+            let (d, c1) = P_U64[j].overflowing_add(P_U64[j]);
+            let (s, c2) = d.overflowing_add(carry);
+            two_p[j] = s;
+            carry = u64::from(c1) + u64::from(c2);
+        }
+        two_p
+    }
+
+    /// `2^shift · p − 1`, which is −1 modulo p.
+    fn multiple_of_p_minus_one(shift: u32) -> Limbs {
+        let mut out = [0u64; LIMBS];
+        let mut carry = 0u128;
+        for j in 0..LIMBS {
+            let limb = (u128::from(P[j]) << shift) + carry;
+            out[j] = limb as u64 & MASK52;
+            carry = limb >> 52;
+        }
+        assert_eq!(carry, 0);
+        out[0] -= 1;
+        out
+    }
+
+    fn blst_product(a: &[u64; 6], b: &[u64; 6]) -> [u64; 6] {
+        let (mut x, mut y, mut product) =
+            (blst_fp::default(), blst_fp::default(), blst_fp::default());
+        let mut out = [0u64; 6];
+        // SAFETY: the pointers are to live, correctly sized values.
+        unsafe {
+            blst_fp_from_uint64(&mut x, a.as_ptr());
+            blst_fp_from_uint64(&mut y, b.as_ptr());
+            blst_fp_mul(&mut product, &x, &y);
+            blst_uint64_from_fp(out.as_mut_ptr(), &product);
+        }
+        out
+    }
+
+    #[test]
+    fn mul_accepts_operands_up_to_the_bound() {
+        if !simd_available() {
+            return;
+        }
+        let mut rng = ChaCha8Rng::seed_from_u64(0x17);
+        let below_2_17_p = multiple_of_p_minus_one(17);
+        let below_2_34_p = multiple_of_p_minus_one(34);
+        let mut partner: [Limbs; LANES] =
+            std::array::from_fn(|_| random_below(&mut rng, &two_p_words()));
+        partner[0] = multiple_of_p_minus_one(1);
+        let minus_one = multiple_of_p_minus_one(0);
+        let cases = [
+            ([below_2_17_p; LANES], [minus_one; LANES], [below_2_17_p; LANES], [minus_one; LANES]),
+            ([below_2_34_p; LANES], [minus_one; LANES], partner, partner),
+            (partner, partner, [below_2_34_p; LANES], [minus_one; LANES]),
+        ];
+        for (a, a_below_2p, b, b_below_2p) in cases {
+            // SAFETY: checked above.
+            unsafe {
+                let product = Fp8::load(&a).mul(&Fp8::load(&b));
+                for lane_limbs in limbs_of(&product) {
+                    assert!(below_two_p(&lane_limbs));
+                }
+                let got = plain(&product);
+                let a_plain = plain(&Fp8::load(&a_below_2p));
+                let b_plain = plain(&Fp8::load(&b_below_2p));
+                for lane in 0..LANES {
+                    let want = blst_product(&a_plain[lane], &b_plain[lane]);
+                    assert_eq!(got[lane], want, "lane {lane}");
+                }
             }
         }
     }

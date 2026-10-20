@@ -99,12 +99,12 @@ impl BatchedAdds {
         for g in 0..groups {
             let xa = store.load_x(self.indices(&self.a, g));
             let xb = store.load_x(self.indices(&self.b, g));
-            let dx = xb.sub_raw(&xa, &c.two_p).normalise();
-            if dx.is_zero_mod_p_below_4p() != 0 {
+            let dx = xb.sub(&xa);
+            if dx.is_zero_mask() != 0 {
                 return false;
             }
             let k = g % CHAINS;
-            product[k] = product[k].mul_lazy(&dx);
+            product[k] = product[k].mul(&dx);
             self.dx[g] = Fp8Memory::of(&dx);
             self.prefix[g] = Fp8Memory::of(&product[k]);
         }
@@ -119,9 +119,9 @@ impl BatchedAdds {
                 let dx_inverse = if gg < CHAINS {
                     inverse[k]
                 } else {
-                    inverse[k].mul_lazy(&self.prefix[gg - CHAINS].load())
+                    inverse[k].mul(&self.prefix[gg - CHAINS].load())
                 };
-                inverse[k] = inverse[k].mul_lazy(&self.dx[gg].load());
+                inverse[k] = inverse[k].mul(&self.dx[gg].load());
                 dx_inverse
             });
             self.finish_pair(g, &dx_inverse, store, &c);
@@ -146,15 +146,15 @@ impl BatchedAdds {
         let xb: [Fp8; PAIR] = std::array::from_fn(|s| b[s].0);
         let dy: [Fp8; PAIR] =
             std::array::from_fn(|s| b[s].1.sub_raw(&a[s].1, &c.two_p).normalise());
-        let slope: [Fp8; PAIR] = std::array::from_fn(|s| dy[s].mul_lazy(&dx_inverse[s])); // 4p · 2p
-        let sq: [Fp8; PAIR] = std::array::from_fn(|s| slope[s].square_lazy());
+        let slope: [Fp8; PAIR] = std::array::from_fn(|s| dy[s].mul(&dx_inverse[s])); // 4p · 2p
+        let sq: [Fp8; PAIR] = std::array::from_fn(|s| slope[s].square());
         let x3: [Fp8; PAIR] = std::array::from_fn(|s| {
             c.below_2p_from_8p(&sq[s].sub_raw(&xa[s], &c.two_p).sub_raw(&xb[s], &c.two_p))
         });
         let xax3: [Fp8; PAIR] =
             std::array::from_fn(|s| xa[s].sub_raw(&x3[s], &c.two_p).normalise()); // < 4p
         let y3: [Fp8; PAIR] = std::array::from_fn(|s| {
-            c.below_2p_from_4p(&slope[s].mul_lazy(&xax3[s]).sub_raw(&a[s].1, &c.two_p))
+            c.below_2p_from_4p(&slope[s].mul(&xax3[s]).sub_raw(&a[s].1, &c.two_p))
         });
         for s in 0..PAIR {
             store.store_points(self.indices(&self.out, g + s), &x3[s], &y3[s]);
@@ -185,13 +185,13 @@ impl BatchedAdds {
 fn batch_inverse(values: &[Fp8; CHAINS]) -> [Fp8; CHAINS] {
     let mut prefix = *values;
     for k in 1..CHAINS {
-        prefix[k] = prefix[k - 1].mul_lazy(&values[k]);
+        prefix[k] = prefix[k - 1].mul(&values[k]);
     }
     let mut inverse = prefix[CHAINS - 1].inverse();
     let mut out = [Fp8::zero(); CHAINS];
     for k in (1..CHAINS).rev() {
-        out[k] = inverse.mul_lazy(&prefix[k - 1]);
-        inverse = inverse.mul_lazy(&values[k]);
+        out[k] = inverse.mul(&prefix[k - 1]);
+        inverse = inverse.mul(&values[k]);
     }
     out[0] = inverse;
     out
