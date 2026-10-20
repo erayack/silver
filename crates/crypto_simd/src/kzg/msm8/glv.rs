@@ -134,7 +134,12 @@ mod tests {
             scalar_bytes(&fr_sub(&fr_from_u64(0), &fr_from_u64(1))),
             le([LAMBDA[0], LAMBDA[1], 0, 0]),
             le([Z2[0], Z2[1], 0, 0]),
-            le([HALF_R_UP[0] * 2 - 1, HALF_R_UP[1] * 2 + 1, HALF_R_UP[2] * 2, HALF_R_UP[3] * 2]),
+            le([
+                0xffff_ffff_0000_0001,
+                0x53bd_a402_fffe_5bfe,
+                0x3339_d808_09a1_d805,
+                0x73ed_a753_299d_7d48,
+            ]),
             le([u64::MAX, u64::MAX, u64::MAX, u64::MAX >> 1]),
         ];
         for _ in 0..1000 {
