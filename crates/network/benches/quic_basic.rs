@@ -173,8 +173,13 @@ pub fn broadcast(c: &mut Criterion) {
                             // stage msgs
                             let mut msgs = vec![];
                             for datum in &data {
+                                let mut prefix = [0u8; 10];
+                                let prefix_len =
+                                    silver_common::encode_varint(datum.len() as u64, &mut prefix)
+                                        .unwrap();
                                 let mut reservation =
-                                    go_producer.reserve(datum.len(), true).unwrap();
+                                    go_producer.reserve(prefix_len + datum.len(), true).unwrap();
+                                reservation.write_all(&prefix[..prefix_len]).unwrap();
                                 reservation.write_all(datum.as_slice()).unwrap();
 
                                 msgs.push(GossipMsgOut {
@@ -210,7 +215,7 @@ pub fn broadcast(c: &mut Criterion) {
                                     if client.p2p_mut().pending(0) < 1000 &&
                                         let Some(msg) = msgs.last()
                                     {
-                                        let result = client.enqueue_gossip(*msg);
+                                        let result = client.enqueue_gossip(*msg, Instant::now());
                                         if matches!(result, SendResult::Ok) {
                                             msgs.pop();
                                             //println!("enqueue_gossip failed:

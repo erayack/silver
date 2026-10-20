@@ -40,7 +40,7 @@ fn transport_config() -> Arc<quinn_proto::TransportConfig> {
     let mut ack_config = AckFrequencyConfig::default();
     ack_config.ack_eliciting_threshold(VarInt::from_u32(16));
     ack_config.max_ack_delay(Some(Duration::from_millis(4)));
-    ack_config.reordering_threshold(VarInt::from_u32(2));
+    ack_config.reordering_threshold(VarInt::from_u32(4));
     tc.ack_frequency_config(Some(ack_config));
 
     Arc::new(tc)
