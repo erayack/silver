@@ -84,6 +84,7 @@ impl BatchedAdds {
     /// which the addition formula cannot take.
     #[target_feature(enable = "avx512f,avx512ifma")]
     pub fn run(&mut self, store: &mut PointStore) -> bool {
+        debug_assert!(!self.a.is_empty(), "`queue_round` found a pair");
         let groups = self.a.len().div_ceil(PAIR * LANES) * PAIR;
         let last = self.a.len() - 1;
         let padded = groups * LANES;

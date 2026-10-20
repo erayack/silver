@@ -23,7 +23,8 @@ use crate::bls::{
 
 pub type Accumulator = [__m512i; 2 * LIMBS + 1];
 
-/// `k·p` as normalised limbs, for k up to 2^12.
+/// `k·p` as normalised limbs, for k below 2^11 (a limb times k plus the carry
+/// stays below 2^64).
 const fn times_p(k: u64) -> Limbs {
     let mut out = [0u64; LIMBS];
     let mut carry = 0u64;

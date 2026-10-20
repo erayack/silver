@@ -42,10 +42,14 @@ pub fn decompose(scalar: &[u8; 32]) -> (Half, Half) {
         }
         product[i + 3] = carry as u64;
     }
-    let rounding = (u128::from(product[3]) + (1u128 << 63)) >> 64;
-    let c1_low = u128::from(product[4]) + rounding;
-    let c1 = [c1_low as u64, product[5] + (c1_low >> 64) as u64];
+    // k < 2^255 and Z2_OVER_R < 1.5·2^128, so k·Z2_OVER_R < 1.5·2^383: limb 6 is
+    // zero and the rounded quotient is below 2^128.
     debug_assert!(product[6] == 0);
+    let rounding = (u128::from(product[3]) + (1u128 << 63)) >> 64;
+    let c1 = ((u128::from(product[5]) << 64) | u128::from(product[4]))
+        .checked_add(rounding)
+        .expect("k·Z2_OVER_R is below 2^384 − 2^256");
+    let c1 = [c1 as u64, (c1 >> 64) as u64];
     let c2 = u64::from(k.iter().rev().ge(HALF_R_UP.iter().rev()));
 
     // k₁ = k − c₁·λ − c₂ and k₂ = c₁ − c₂·z², as signed 256-bit values.
