@@ -1,15 +1,16 @@
 use std::marker::PhantomData;
 
-use super::{
-    TreeSpec,
-    chunk_writes::ChunkWrites,
-    format::TreeFormat,
-    page_format::{PagePos, Subtree},
-    pool::{PageId, PagePool},
-    snapshot::PageSnapshot,
-    subtree::NodeRange,
+use crate::{
+    B256, TreeSpec,
+    flat_hashing::{
+        chunk_writes::ChunkWrites,
+        format::TreeFormat,
+        page_format::{PagePos, Subtree},
+        subtree::NodeRange,
+    },
+    merkle::ZERO_HASHES,
+    storage::{PageAlloc, PageId, PageStore, PageTable},
 };
-use crate::{B256, merkle::ZERO_HASHES};
 
 pub(super) struct NodeStore<C: TreeSpec> {
     pub(super) nodes: Vec<B256>,
@@ -44,30 +45,25 @@ impl<C: TreeSpec> NodeStore<C> {
     }
 
     /// Copy `target` into the flat tree, skipping what it already holds:
-    /// `loaded` is the snapshot it matches outside the written chunks.
+    /// `loaded` is the table it matches outside the written chunks.
     /// A format change copies every page.
-    pub(super) fn load(
-        &mut self,
-        pool: &PagePool<C::Page>,
-        loaded: &PageSnapshot,
-        target: &PageSnapshot,
-    ) {
-        let format = target.format;
+    pub(super) fn load(&mut self, pages: &impl PageStore, loaded: &PageTable, target: &PageTable) {
+        let format = target.format();
         self.nodes.resize(format.num_nodes::<C>(), [0u8; 32]);
-        let same_format = loaded.format == format;
+        let same_format = loaded.format() == format;
         for (s, sub) in format.subtrees::<C>().enumerate() {
-            let loaded = loaded.roots.get(s).copied().filter(|_| same_format);
-            self.load_page(pool, sub, sub.root::<C>(), loaded, target.roots[s]);
+            let loaded = loaded.roots().get(s).copied().filter(|_| same_format);
+            self.load_page(pages, sub, sub.root::<C>(), loaded, target.roots()[s]);
         }
 
-        self.count = target.count;
+        self.count = target.len();
         self.writes.clear();
         self.writes.resize(format.data_capacity());
     }
 
     fn load_page(
         &mut self,
-        pool: &PagePool<C::Page>,
+        pages: &impl PageStore,
         sub: Subtree,
         at: PagePos,
         loaded: Option<PageId>,
@@ -76,57 +72,56 @@ impl<C: TreeSpec> NodeStore<C> {
         if loaded == Some(target) && !self.writes.touches(sub.chunks_under::<C>(at)) {
             return;
         }
-        let page = pool.page(target);
+        let page = pages.page(target);
         for (node, len) in sub.rows_of::<C>(at) {
             self.nodes[node..node + len].copy_from_slice(&page[len..2 * len]);
         }
         for j in 0..sub.child_count::<C>(at) {
-            let loaded = loaded.map(|l| pool.child(l, j));
-            self.load_page(pool, sub, sub.child::<C>(at, j), loaded, pool.child(target, j));
+            let loaded = loaded.map(|l| pages.child(l, j));
+            self.load_page(pages, sub, sub.child::<C>(at, j), loaded, pages.child(target, j));
         }
     }
 
-    /// Commit the flat tree into `dst`, reusing its buffers. Clean pages are
-    /// `parent`'s, dirty ones are new, and all-zero subtrees share the zero
+    /// Commit the flat tree into `dst`, reusing its `roots` buffer. Clean pages
+    /// are `parent`'s, dirty ones are new, and all-zero subtrees share the zero
     /// page of their depth. A parent in another format, or none, shares
     /// nothing.
     pub(super) fn commit(
         &mut self,
         format: TreeFormat,
-        pool: &mut PagePool<C::Page>,
-        dst: &mut PageSnapshot,
-        parent: Option<&PageSnapshot>,
+        alloc: &mut impl PageAlloc,
+        dst: &mut PageTable,
+        parent: Option<&PageTable>,
+        allocated: Option<&mut Vec<(u32, PageId)>>,
     ) {
         debug_assert!(!self.writes.has_unhashed(), "commit before rehash");
-        let parent = parent.filter(|parent| parent.format == format);
-        dst.roots.clear();
-        dst.allocated.clear();
-        let mut committer = PageCommitter::<C> {
-            writes: &self.writes,
-            nodes: &self.nodes,
-            pool,
-            allocated: &mut dst.allocated,
-        };
-        for (s, sub) in format.subtrees::<C>().enumerate() {
-            let root =
-                committer.commit_page(sub, sub.root::<C>(), parent.map(|parent| parent.roots[s]));
-            dst.roots.push(root);
-        }
-        dst.format = format;
-        dst.count = self.count;
+        let parent = parent.filter(|parent| parent.format() == format);
+        let mut committer =
+            PageCommitter { writes: &self.writes, nodes: &self.nodes, alloc, allocated };
+        let roots = format.subtrees::<C>().enumerate().map(|(s, sub)| {
+            let parent = parent.map(|parent| parent.roots()[s]);
+            committer.commit_page::<C>(sub, sub.root::<C>(), parent)
+        });
+        dst.set(format, self.count, roots);
         self.writes.clear();
     }
 }
 
-struct PageCommitter<'a, C: TreeSpec> {
+struct PageCommitter<'a, Alloc: PageAlloc> {
     writes: &'a ChunkWrites,
     nodes: &'a [B256],
-    pool: &'a mut PagePool<C::Page>,
-    allocated: &'a mut Vec<(u32, PageId)>,
+    alloc: &'a mut Alloc,
+    /// `(flat-tree node in slot 1, page)` per page `alloc` gave.
+    allocated: Option<&'a mut Vec<(u32, PageId)>>,
 }
 
-impl<C: TreeSpec> PageCommitter<'_, C> {
-    fn commit_page(&mut self, sub: Subtree, at: PagePos, parent: Option<PageId>) -> PageId {
+impl<Alloc: PageAlloc> PageCommitter<'_, Alloc> {
+    fn commit_page<C: TreeSpec>(
+        &mut self,
+        sub: Subtree,
+        at: PagePos,
+        parent: Option<PageId>,
+    ) -> PageId {
         if let Some(parent) = parent &&
             !self.writes.touches(sub.chunks_under::<C>(at))
         {
@@ -137,18 +132,19 @@ impl<C: TreeSpec> PageCommitter<'_, C> {
         let nodes = self.nodes;
         let (top_node, depth) = (sub.top_node::<C>(at), sub.depth::<C>(at));
         if nodes[top_node] == ZERO_HASHES[depth as usize] {
-            return self.pool.zero_page(depth);
+            return self.alloc.zero_page(depth);
         }
 
         let rows = sub.rows_of::<C>(at).map(|(node, len)| &nodes[node..node + len]);
-        let id = self.pool.alloc(sub.child_count::<C>(at), rows);
-        for j in 0..sub.child_count::<C>(at) {
-            let parent = parent.map(|parent| self.pool.child(parent, j));
-            let child = self.commit_page(sub, sub.child::<C>(at, j), parent);
-            self.pool.set_child(id, j, child);
+        let id = self.alloc.alloc(sub.child_count::<C>(at), rows);
+        if let Some(allocated) = self.allocated.as_deref_mut() {
+            allocated.push((top_node as u32, id));
         }
-
-        self.allocated.push((top_node as u32, id));
+        for j in 0..sub.child_count::<C>(at) {
+            let parent = parent.map(|parent| self.alloc.child(parent, j));
+            let child = self.commit_page::<C>(sub, sub.child::<C>(at, j), parent);
+            self.alloc.set_child(id, j, child);
+        }
         id
     }
 }

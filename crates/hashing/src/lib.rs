@@ -5,30 +5,19 @@
 //! time. A commit cuts the array into copy-on-write pages, so every copy of
 //! the list shares the pages it did not write.
 
-mod chunk_bits;
-mod chunk_writes;
-mod flat;
-mod format;
-mod list;
+mod flat_hashing;
 pub mod merkle;
-mod page_format;
-mod pool;
 pub mod progressive;
-mod progressive_list;
-mod reader;
 pub mod scalar;
-mod snapshot;
-mod store;
-mod subtree;
+mod single_owner;
+mod storage;
 
-pub use flat::FlatTree;
-pub use format::TreeFormat;
-use format::{MAX_SEGS, seg_off};
+pub use flat_hashing::{FlatTree, TreeFormat, TreeReader};
+use flat_hashing::{MAX_SEGS, seg_off};
 pub use merkle::B256;
-pub use pool::{PageArray, PageId, PagePool};
-pub use reader::TreeReader;
 pub use scalar::SszScalar;
-pub use snapshot::PageSnapshot;
+pub use single_owner::{PagePool, PageSnapshot};
+pub use storage::{PageAlloc, PageArray, PageId, PageStore, PageTable};
 
 const VALIDATOR_REGISTRY_LIMIT: usize = 1 << 40;
 

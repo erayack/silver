@@ -4,21 +4,16 @@ use std::{
 };
 
 use flux_profiler::timed;
-use silver_hashing::{FlatTree, PagePool, PageSnapshot};
+use silver_hashing::{FlatTree, PagePool, PageSnapshot, merkle::byte_chunks};
 
-use super::{TreeSpec, TreeView, TreeWriteView, hashing_writer::HashingWriter};
+use super::{
+    TreeSpec, TreeView, TreeWriteView,
+    hashing_writer::{Committed, HashingWriter},
+};
 use crate::{
     ring::{Id, Ring, RingGroup},
     types::{B256, HashFormat, SLOTS_RING_N, TreeLenMismatch},
 };
-
-fn byte_chunks(bytes: &[u8]) -> impl Iterator<Item = B256> + '_ {
-    bytes.chunks(32).map(|c| {
-        let mut chunk = [0u8; 32];
-        chunk[..c.len()].copy_from_slice(c);
-        chunk
-    })
-}
 
 pub struct TreeGroup<C: TreeSpec> {
     pool: PagePool<C::Page>,
@@ -82,24 +77,22 @@ impl<C: TreeSpec> TreeGroup<C> {
     pub fn view(&self, id: Id<Self>) -> TreeView<'_, C> {
         let snapshot =
             if self.finalized_id == Some(id) { &self.finalized } else { self.ring.get(id) };
-        TreeView::paged(&self.pool, snapshot)
+        TreeView::paged(&self.pool, snapshot.table())
     }
 
     #[timed]
     pub fn roll_fresh(&mut self) -> TreeWriteView<'_, C> {
-        let Self { pool, finalized, writer, .. } = self;
-        writer.load(pool, finalized, None);
+        let Self { pool, finalized, ring, writer, .. } = self;
+        writer.load(pool, finalized, ring, Committed::Base);
         TreeWriteView::new(self, None)
     }
 
     #[timed]
     pub fn roll_from(&mut self, parent: Id<Self>) -> TreeWriteView<'_, C> {
         let Self { pool, finalized, finalized_id, ring, writer, .. } = self;
-        if *finalized_id == Some(parent) {
-            writer.load(pool, finalized, None);
-        } else {
-            writer.load(pool, ring.get(parent), Some(parent));
-        }
+        let target =
+            if *finalized_id == Some(parent) { Committed::Base } else { Committed::Entry(parent) };
+        writer.load(pool, finalized, ring, target);
         TreeWriteView::new(self, Some(parent))
     }
 
@@ -110,8 +103,6 @@ impl<C: TreeSpec> TreeGroup<C> {
         ring.grow_if_full_with(PageSnapshot::default, |src, dst| *dst = src.clone_for_grow());
         let parent_in_ring = parent.filter(|&p| Some(p) != *finalized_id);
         let (id, dst, parent_snap) = ring.roll_deriving(parent_in_ring);
-
-        debug_assert!(!dst.owns_pages(), "recycled slot still owns pages: not released");
         writer.commit(pool, dst, parent_snap.unwrap_or(finalized), id);
         id
     }
@@ -140,14 +131,15 @@ impl<C: TreeSpec> TreeGroup<C> {
         if *finalized_id == Some(winner) {
             return;
         }
+        let base_kept = finalized.table().same_pages(ring.get(winner).table());
         finalized.promote::<C>(pool, ring.get(winner));
         ring.free_through_with(winner, |snapshot| snapshot.release::<C>(pool, finalized));
         *finalized_id = Some(winner);
-        writer.unmirror_dead(finalized, |id| survivors.iter().any(|s| idx(s) == id));
+        writer.forget_dead(winner, base_kept, |id| survivors.iter().any(|s| idx(s) == id));
     }
 
     #[inline]
     pub fn write_ssz<W: Write>(&self, w: &mut W) -> io::Result<()> {
-        self.finalized.write_ssz::<C, W>(&self.pool, w)
+        self.finalized.table().write_ssz::<C, W>(&self.pool, w)
     }
 }
