@@ -78,6 +78,7 @@ fn boundary_tile_with_spec(
         BeaconStateOwner::published_empty_test(0).reader(),
         engine_config,
         None,
+        Duration::from_millis(600),
         tcaches,
         resp_p,
     );
@@ -501,6 +502,7 @@ fn status_event(head_slot: u64, wall_slot: u64, head_optimistic: bool) -> Beacon
         head_roots: None,
         head_payload: PayloadResolution::Full,
         head_ptc: Default::default(),
+        build_on_full: true,
         head_change: HeadChange::None,
         epoch_transition: false,
     }
@@ -533,6 +535,7 @@ fn head_status(
         head_roots: Some(head_roots()),
         head_payload: payload,
         head_ptc: Default::default(),
+        build_on_full: true,
         head_change,
         epoch_transition: false,
     }

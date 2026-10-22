@@ -118,6 +118,9 @@ pub enum BeaconApiRequest {
         randao_reveal: [u8; 96],
         graffiti: [u8; 32],
         bid_policy: BidPolicy,
+        /// Hash of the request's SSZ builder configuration, when it names
+        /// builders.
+        builder_config_hash: Option<B256>,
     },
     LockBlindedBlock {
         request_id: u64,
@@ -260,6 +263,8 @@ pub struct ProducedBlock {
     pub execution_payload_value: [u8; 32],
     /// Little-endian wei.
     pub consensus_block_value: [u8; 32],
+    /// The `BuilderEntry` whose bid the block commits to.
+    pub builder_entry: Option<u32>,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -1228,6 +1233,7 @@ pub enum BeaconStateEvent {
         head_roots: Option<HeadRoots>,
         head_payload: PayloadResolution,
         head_ptc: PtcObservation,
+        build_on_full: bool,
         head_change: HeadChange,
         epoch_transition: bool,
     },
@@ -1317,6 +1323,27 @@ pub struct SidecarBidRequest {
     pub block_number: u64,
     pub parent_gas_limit: u64,
     pub proposer_pubkey: BLSPubkey,
+}
+
+/// A Gloas proposal's branch, for the boundary tile to ask the request's
+/// builder entries for bids. Every request is answered.
+#[derive(Clone, Copy, Debug)]
+#[repr(C)]
+pub struct BuilderBidsRequest {
+    pub request_id: u64,
+    pub slot: u64,
+    pub parent_hash: B256,
+    pub parent_root: B256,
+    pub proposer_pubkey: BLSPubkey,
+}
+
+#[derive(Clone, Copy, Debug)]
+#[repr(C)]
+pub struct BuilderBidsResponse {
+    pub request_id: u64,
+    /// [`crate::BuilderBid`]s in the `boundary_processing` tcache; `None`
+    /// when no builder answered with one.
+    pub bids: Option<TCacheRead>,
 }
 
 /// Every [`SidecarBidRequest`] is answered; `signed_bid` is `None` when the
