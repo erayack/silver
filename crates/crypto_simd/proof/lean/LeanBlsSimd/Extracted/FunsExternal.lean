@@ -4,6 +4,14 @@ import LeanBlsSimd.Model.Intrinsics
 open Aeneas Aeneas.Std Result ControlFlow Error
 open silver_crypto_simd silver_crypto_simd.bls
 
+def Aeneas.Std.alloc.vec.Vec.clear (_Allocator : Type) {α : Type} (_ : alloc.vec.Vec α) :
+    Result (alloc.vec.Vec α) :=
+  ok ⟨[], by simp⟩
+
+def Aeneas.Std.alloc.vec.Vec.is_empty (_Allocator : Type) {α : Type}
+    (v : alloc.vec.Vec α) : Result Bool :=
+  ok v.val.isEmpty
+
 /-- External observations supplied to the generated BLS APIs. -/
 class silver_crypto_simd.bls.BlsExternals where
   simdAvailable : Bool
@@ -28,7 +36,7 @@ class silver_crypto_simd.kzg.KzgExternals extends BlsExternals where
   pairingCheck : blst.blst_p1_affine → blst.blst_p2_affine →
     blst.blst_p1_affine → blst.blst_p2_affine → Result Bool
 
-def silver_crypto_simd.bls.simd_available [BlsExternals] : Result Bool :=
+def silver_crypto_simd.simd_available [BlsExternals] : Result Bool :=
   ok BlsExternals.simdAvailable
 
 def silver_crypto_simd.bls.uncompress_in_g1_blst [BlsExternals]
@@ -97,6 +105,15 @@ def core.core_arch.x86.avx512f._mm512_srli_epi64 (IMM8 : Std.U32) (a : core.core
     Result core.core_arch.x86.__m512i :=
   ok (LeanBlsSimd._mm512_srli_epi64 IMM8.bv.toNat a)
 
+/-- [core::core_arch::x86::avx512f::_mm512_slli_epi64]:
+    Source: '/rustc/library/core/src/../../stdarch/crates/core_arch/src/x86/avx512f.rs', lines 19969:0-19969:70
+    Name pattern: [core::core_arch::x86::avx512f::_mm512_slli_epi64]
+    Visibility: public -/
+@[rust_fun "core::core_arch::x86::avx512f::_mm512_slli_epi64"]
+def core.core_arch.x86.avx512f._mm512_slli_epi64 (IMM8 : Std.U32) (a : core.core_arch.x86.__m512i) :
+    Result core.core_arch.x86.__m512i :=
+  ok (LeanBlsSimd._mm512_slli_epi64 IMM8.bv.toNat a)
+
 /-- [core::core_arch::x86::avx512f::_mm512_srai_epi64]:
     Source: '/rustc/library/core/src/../../stdarch/crates/core_arch/src/x86/avx512f.rs', lines 21375:0-21375:70
     Name pattern: [core::core_arch::x86::avx512f::_mm512_srai_epi64]
@@ -114,6 +131,15 @@ def core.core_arch.x86.avx512f._mm512_srai_epi64 (IMM8 : Std.U32) (a : core.core
 def core.core_arch.x86.avx512f._mm512_mask_blend_epi64 (k : Std.U8)
     (a b : core.core_arch.x86.__m512i) : Result core.core_arch.x86.__m512i :=
   ok (LeanBlsSimd._mm512_mask_blend_epi64 (UInt8.ofBitVec k.bv) a b)
+
+/-- [core::core_arch::x86::avx512f::_mm512_permutex2var_epi64]:
+    Source: '/rustc/library/core/src/../../stdarch/crates/core_arch/src/x86/avx512f.rs', lines 24132:0-24132:81
+    Name pattern: [core::core_arch::x86::avx512f::_mm512_permutex2var_epi64]
+    Visibility: public -/
+@[rust_fun "core::core_arch::x86::avx512f::_mm512_permutex2var_epi64"]
+def core.core_arch.x86.avx512f._mm512_permutex2var_epi64
+    (a index b : core.core_arch.x86.__m512i) : Result core.core_arch.x86.__m512i :=
+  ok (LeanBlsSimd._mm512_permutex2var_epi64 a index b)
 
 /-- [core::core_arch::x86::avx512f::_mm512_and_si512]:
     Source: '/rustc/library/core/src/../../stdarch/crates/core_arch/src/x86/avx512f.rs', lines 29551:0-29551:64

@@ -1,15 +1,22 @@
 //! Eight independent Fp elements, one per 64-bit lane, as eight 52-bit limbs in
 //! Montgomery form with R = 2^416: the shape `vpmadd52` multiplies natively.
 //!
-//! Values are kept in [0, 2p) with normalised limbs — Montgomery products of
-//! such inputs land there without a conditional subtraction, since 4p < R —
-//! and are canonicalised only where bits are compared or exported.
+//! A lane's value is Σ_j limb_j·2^(52j), each limb a signed 64-bit integer.
+//! Operations state their ranges in three classes, as `kzg::fr8` does for r:
+//! - normalised: every limb in [0, 2^52), as IFMA operands must be;
+//! - reduced: normalised and below 2p;
+//! - lazy(k, m): in [0, k·p), every limb below m·2^52 in magnitude.
+//!
+//! Montgomery products land below 2p without a conditional subtraction, and
+//! `add` and `sub` keep reduced values reduced. The `_raw` operations leave
+//! values lazy until `normalise` and `cond_sub` bring them back. Values are
+//! canonicalised only where bits are compared or exported.
 
 use std::arch::x86_64::{
     __m512i, __mmask8, _mm512_add_epi64, _mm512_and_si512, _mm512_cmpeq_epi64_mask,
-    _mm512_madd52hi_epu64, _mm512_madd52lo_epu64, _mm512_mask_blend_epi64, _mm512_set_epi64,
-    _mm512_set1_epi64, _mm512_setzero_si512, _mm512_srai_epi64, _mm512_srli_epi64,
-    _mm512_sub_epi64,
+    _mm512_madd52hi_epu64, _mm512_madd52lo_epu64, _mm512_mask_blend_epi64,
+    _mm512_permutex2var_epi64, _mm512_set_epi64, _mm512_set1_epi64, _mm512_setzero_si512,
+    _mm512_srai_epi64, _mm512_srli_epi64, _mm512_sub_epi64,
 };
 
 use crate::bls::constants::{
@@ -47,10 +54,61 @@ fn splat_limbs(limbs: &Limbs) -> [__m512i; LIMBS] {
 }
 
 #[inline]
-fn lanes(v: __m512i) -> [u64; LANES] {
+pub(crate) fn lanes(v: __m512i) -> [u64; LANES] {
     // SAFETY: __m512i is 64 bytes of plain integer data with no invalid bit
     // patterns.
     unsafe { std::mem::transmute(v) }
+}
+
+#[target_feature(enable = "avx512f,avx512ifma")]
+#[inline]
+pub(crate) fn index_vector(index: &[i64; LANES]) -> __m512i {
+    _mm512_set_epi64(index[7], index[6], index[5], index[4], index[3], index[2], index[1], index[0])
+}
+
+/// Lane l of row k becomes lane k of row l. Round d, for d = 1, 2 and 4,
+/// swaps the d bit of the row index with the d bit of the lane index: rows
+/// k and k + d, for k without the d bit, trade the lanes whose d bit
+/// differs from their row's.
+#[target_feature(enable = "avx512f,avx512ifma")]
+#[inline]
+pub(crate) fn transpose8(r: &[__m512i; LANES]) -> [__m512i; LANES] {
+    let low = index_vector(&[0, 8, 2, 10, 4, 12, 6, 14]);
+    let high = index_vector(&[1, 9, 3, 11, 5, 13, 7, 15]);
+    let a = [
+        _mm512_permutex2var_epi64(r[0], low, r[1]),
+        _mm512_permutex2var_epi64(r[0], high, r[1]),
+        _mm512_permutex2var_epi64(r[2], low, r[3]),
+        _mm512_permutex2var_epi64(r[2], high, r[3]),
+        _mm512_permutex2var_epi64(r[4], low, r[5]),
+        _mm512_permutex2var_epi64(r[4], high, r[5]),
+        _mm512_permutex2var_epi64(r[6], low, r[7]),
+        _mm512_permutex2var_epi64(r[6], high, r[7]),
+    ];
+    let low = index_vector(&[0, 1, 8, 9, 4, 5, 12, 13]);
+    let high = index_vector(&[2, 3, 10, 11, 6, 7, 14, 15]);
+    let b = [
+        _mm512_permutex2var_epi64(a[0], low, a[2]),
+        _mm512_permutex2var_epi64(a[1], low, a[3]),
+        _mm512_permutex2var_epi64(a[0], high, a[2]),
+        _mm512_permutex2var_epi64(a[1], high, a[3]),
+        _mm512_permutex2var_epi64(a[4], low, a[6]),
+        _mm512_permutex2var_epi64(a[5], low, a[7]),
+        _mm512_permutex2var_epi64(a[4], high, a[6]),
+        _mm512_permutex2var_epi64(a[5], high, a[7]),
+    ];
+    let low = index_vector(&[0, 1, 2, 3, 8, 9, 10, 11]);
+    let high = index_vector(&[4, 5, 6, 7, 12, 13, 14, 15]);
+    [
+        _mm512_permutex2var_epi64(b[0], low, b[4]),
+        _mm512_permutex2var_epi64(b[1], low, b[5]),
+        _mm512_permutex2var_epi64(b[2], low, b[6]),
+        _mm512_permutex2var_epi64(b[3], low, b[7]),
+        _mm512_permutex2var_epi64(b[0], high, b[4]),
+        _mm512_permutex2var_epi64(b[1], high, b[5]),
+        _mm512_permutex2var_epi64(b[2], high, b[6]),
+        _mm512_permutex2var_epi64(b[3], high, b[7]),
+    ]
 }
 
 /// `a - b` limb-wise with a borrow chain; the borrow is 0 or -1 per lane.
@@ -110,13 +168,43 @@ fn muladd_row(t: &mut [__m512i; 2 * LIMBS + 1], a: &[__m512i; LIMBS], b_i: __m51
     }
 }
 
-/// Clears limb `i` of the accumulator with a multiple of p and carries it up.
+/// `t[2i + 1..] += a_i · a[i + 1..]`: the products of row `i` above the
+/// diagonal.
+#[target_feature(enable = "avx512f,avx512ifma")]
+#[inline]
+fn square_row(t: &mut [__m512i; 2 * LIMBS + 1], a: &[__m512i; LIMBS], i: usize) {
+    for j in i + 1..LIMBS {
+        t[i + j] = _mm512_madd52lo_epu64(t[i + j], a[i], a[j]);
+        t[i + j + 1] = _mm512_madd52hi_epu64(t[i + j + 1], a[i], a[j]);
+    }
+}
+
+/// `(t + lo(q·m₀)) >> 52` for any q with q·m₀ ≡ −t (mod 2^52), without the
+/// product. Both are `t >> 52` plus one if the low 52 bits of `t` are
+/// nonzero, and both wrap alike, so they agree on every `t`.
+#[target_feature(enable = "avx512f,avx512ifma")]
+#[inline]
+pub(crate) fn carry_of_cleared(t: __m512i) -> __m512i {
+    _mm512_srli_epi64::<52>(_mm512_add_epi64(t, splat(MASK52)))
+}
+
+/// Clears limb `i` of the accumulator with a multiple of p and carries it up,
+/// leaving limb `i` itself stale. The next row's q waits on limb `i + 1`
+/// alone. Its carry needs no product, so it enters first, and its two products
+/// of q accumulate apart, so they run in parallel.
 #[target_feature(enable = "avx512f,avx512ifma")]
 #[inline]
 fn reduce_row(t: &mut [__m512i; 2 * LIMBS + 1], p: &[__m512i; LIMBS], pinv: __m512i, i: usize) {
     let q = _mm512_madd52lo_epu64(zero(), t[i], pinv);
-    muladd_row(t, p, q, i);
-    t[i + 1] = _mm512_add_epi64(t[i + 1], _mm512_srli_epi64::<52>(t[i]));
+    t[i + 1] = _mm512_add_epi64(t[i + 1], carry_of_cleared(t[i]));
+    let high = _mm512_madd52hi_epu64(zero(), p[0], q);
+    for j in 1..LIMBS {
+        t[i + j] = _mm512_madd52lo_epu64(t[i + j], p[j], q);
+    }
+    t[i + 1] = _mm512_add_epi64(t[i + 1], high);
+    for j in 1..LIMBS {
+        t[i + j + 1] = _mm512_madd52hi_epu64(t[i + j + 1], p[j], q);
+    }
 }
 
 /// Little-endian 64-bit limbs of a 381-bit value to 52-bit limbs.
@@ -199,7 +287,7 @@ impl Fp8 {
     }
 
     #[inline]
-    fn store(&self) -> [Limbs; LANES] {
+    pub(crate) fn store(&self) -> [Limbs; LANES] {
         let mut out = [[0u64; LIMBS]; LANES];
         for j in 0..LIMBS {
             let l = lanes(self.0[j]);
@@ -235,13 +323,12 @@ impl Fp8 {
         out
     }
 
-    /// Montgomery product: the full 16-limb product first, then eight
-    /// reduction rows, every index a constant so the accumulator stays in
-    /// registers.
+    /// Montgomery product: the full 16-limb product, then `reduce`. Every row
+    /// takes a constant index, so neither phase indexes the accumulator at run
+    /// time. For normalised operands with a·b < R·p, such as one below 2p and
+    /// the other below 2^34·p, or both below 2^17·p, the result is reduced.
     #[target_feature(enable = "avx512f,avx512ifma")]
     pub fn mul(&self, rhs: &Self) -> Self {
-        let p = splat_limbs(&P);
-        let pinv = splat(P_INV52);
         let mut t = [zero(); 2 * LIMBS + 1];
         muladd_row(&mut t, &self.0, rhs.0[0], 0);
         muladd_row(&mut t, &self.0, rhs.0[1], 1);
@@ -251,6 +338,39 @@ impl Fp8 {
         muladd_row(&mut t, &self.0, rhs.0[5], 5);
         muladd_row(&mut t, &self.0, rhs.0[6], 6);
         muladd_row(&mut t, &self.0, rhs.0[7], 7);
+        Self::reduce(t)
+    }
+
+    /// The limbs of `self.mul(self)` from 72 products instead of 128: those
+    /// above the diagonal once, doubled, then the diagonal.
+    #[target_feature(enable = "avx512f,avx512ifma")]
+    pub fn square(&self) -> Self {
+        let a = &self.0;
+        let mut t = [zero(); 2 * LIMBS + 1];
+        square_row(&mut t, a, 0);
+        square_row(&mut t, a, 1);
+        square_row(&mut t, a, 2);
+        square_row(&mut t, a, 3);
+        square_row(&mut t, a, 4);
+        square_row(&mut t, a, 5);
+        square_row(&mut t, a, 6);
+        for k in 0..2 * LIMBS + 1 {
+            t[k] = _mm512_add_epi64(t[k], t[k]);
+        }
+        for i in 0..LIMBS {
+            t[2 * i] = _mm512_madd52lo_epu64(t[2 * i], a[i], a[i]);
+            t[2 * i + 1] = _mm512_madd52hi_epu64(t[2 * i + 1], a[i], a[i]);
+        }
+        Self::reduce(t)
+    }
+
+    /// Montgomery-reduces a full product: `t · 2^-416` modulo p, with
+    /// normalised limbs.
+    #[target_feature(enable = "avx512f,avx512ifma")]
+    #[inline]
+    fn reduce(mut t: [__m512i; 2 * LIMBS + 1]) -> Self {
+        let p = splat_limbs(&P);
+        let pinv = splat(P_INV52);
         reduce_row(&mut t, &p, pinv, 0);
         reduce_row(&mut t, &p, pinv, 1);
         reduce_row(&mut t, &p, pinv, 2);
@@ -270,18 +390,75 @@ impl Fp8 {
         Self(r)
     }
 
-    #[target_feature(enable = "avx512f,avx512ifma")]
-    #[inline]
-    pub fn square(&self) -> Self {
-        self.mul(self)
-    }
-
     /// Down from [0, 2p) to [0, p).
     #[target_feature(enable = "avx512f,avx512ifma")]
     #[inline]
     pub fn canonical(self) -> Self {
-        let (d, borrow) = sub_limbs(&self.0, &splat_limbs(&P));
+        self.cond_sub(&Self::splat_limbs(&P))
+    }
+
+    /// `self − c` in the lanes where `self ≥ c`, `self` in the others, for
+    /// normalised `self` and `c`. From below 2c, the result is below c.
+    #[target_feature(enable = "avx512f,avx512ifma")]
+    #[inline]
+    pub fn cond_sub(&self, c: &Self) -> Self {
+        let (d, borrow) = sub_limbs(&self.0, &c.0);
         Self(blend(borrowed(borrow), &d, &self.0))
+    }
+
+    /// c·p in every lane, normalised.
+    #[target_feature(enable = "avx512f,avx512ifma")]
+    #[inline]
+    pub fn multiple_of_p(c: u64) -> Self {
+        assert!(c < 1 << 12, "c·p limb by limb in 64 bits");
+        let mut v = [zero(); LIMBS];
+        let mut carry = 0;
+        for j in 0..LIMBS {
+            let limb = P[j] * c + carry;
+            v[j] = splat(limb & MASK52);
+            carry = limb >> LIMB_BITS;
+        }
+        Self(v)
+    }
+
+    /// Limb-wise, without carries: lazy(k, m) and lazy(k', m') give
+    /// lazy(k + k', m + m').
+    #[target_feature(enable = "avx512f,avx512ifma")]
+    #[inline]
+    pub fn add_raw(&self, rhs: &Self) -> Self {
+        let mut s = [zero(); LIMBS];
+        for j in 0..LIMBS {
+            s[j] = _mm512_add_epi64(self.0[j], rhs.0[j]);
+        }
+        Self(s)
+    }
+
+    /// `self + offset − rhs` limb-wise, without carries; limbs may go
+    /// negative. With `offset` the normalised c·p: lazy(k, m) and lazy(k', m')
+    /// for k' ≤ c give lazy(k + c, m + m' + 1).
+    #[target_feature(enable = "avx512f,avx512ifma")]
+    #[inline]
+    pub fn sub_raw(&self, rhs: &Self, offset: &Self) -> Self {
+        let mut s = [zero(); LIMBS];
+        for j in 0..LIMBS {
+            s[j] = _mm512_sub_epi64(_mm512_add_epi64(self.0[j], offset.0[j]), rhs.0[j]);
+        }
+        Self(s)
+    }
+
+    /// The same value with limbs 0 to 6 in [0, 2^52), each limb's signed
+    /// excess carried into the next. A value in [0, 2^416) comes out
+    /// normalised. Limbs below 2^62 in magnitude do not overflow.
+    #[target_feature(enable = "avx512f,avx512ifma")]
+    #[inline]
+    pub fn normalise(&self) -> Self {
+        let mask = splat(MASK52);
+        let mut s = self.0;
+        for j in 0..LIMBS - 1 {
+            s[j + 1] = _mm512_add_epi64(s[j + 1], _mm512_srai_epi64::<52>(s[j]));
+            s[j] = _mm512_and_si512(s[j], mask);
+        }
+        Self(s)
     }
 
     /// Sum below 4p, brought back under 2p.
@@ -289,7 +466,7 @@ impl Fp8 {
     #[inline]
     pub fn add(&self, rhs: &Self) -> Self {
         let s = add_limbs(&self.0, &rhs.0);
-        let (d, borrow) = sub_limbs(&s, &two_p());
+        let (d, borrow) = sub_limbs(&s, &Self::multiple_of_p(2).0);
         Self(blend(borrowed(borrow), &d, &s))
     }
 
@@ -297,7 +474,7 @@ impl Fp8 {
     #[inline]
     pub fn sub(&self, rhs: &Self) -> Self {
         let (d, borrow) = sub_limbs(&self.0, &rhs.0);
-        let wrapped = add_limbs(&d, &two_p());
+        let wrapped = add_limbs(&d, &Self::multiple_of_p(2).0);
         Self(blend(borrowed(borrow), &d, &wrapped))
     }
 
@@ -305,12 +482,6 @@ impl Fp8 {
     #[inline]
     pub fn neg(&self) -> Self {
         Self::zero().sub(self)
-    }
-
-    #[target_feature(enable = "avx512f,avx512ifma")]
-    #[inline]
-    pub fn double(&self) -> Self {
-        self.add(self)
     }
 
     #[target_feature(enable = "avx512f,avx512ifma")]
@@ -348,6 +519,20 @@ impl Fp8 {
         Self(blend(k, &a.0, &b.0))
     }
 
+    /// Lane l takes lane `from[l]`.
+    #[target_feature(enable = "avx512f,avx512ifma")]
+    #[inline]
+    pub fn permute(&self, from: &[i64; LANES]) -> Self {
+        let index = index_vector(from);
+        let mut v = [zero(); LIMBS];
+        let mut j = 0;
+        while j < LIMBS {
+            v[j] = _mm512_permutex2var_epi64(self.0[j], index, self.0[j]);
+            j += 1;
+        }
+        Self(v)
+    }
+
     /// `self^((p-3)/4)`: the reciprocal square root when `self` is a
     /// quadratic residue (p = 3 mod 4). The exponent is shared by every lane,
     /// so a fixed 4-bit window needs no per-lane table lookups.
@@ -378,6 +563,12 @@ impl Fp8 {
         self.pow_p_minus_3_over_4().mul(self)
     }
 
+    /// `self^(p-2)`, the inverse, and 0 for 0: p - 2 = 4·(p-3)/4 + 1.
+    #[target_feature(enable = "avx512f,avx512ifma")]
+    pub fn inverse(&self) -> Self {
+        self.pow_p_minus_3_over_4().square().square().mul(self)
+    }
+
     /// Lanes whose plain value exceeds (p - 1) / 2: the lexicographically
     /// larger of the two square roots.
     #[target_feature(enable = "avx512f,avx512ifma")]
@@ -389,8 +580,5 @@ impl Fp8 {
     }
 }
 
-#[target_feature(enable = "avx512f,avx512ifma")]
-#[inline]
-fn two_p() -> [__m512i; LIMBS] {
-    add_limbs(&splat_limbs(&P), &splat_limbs(&P))
-}
+#[cfg(test)]
+pub(super) mod tests;

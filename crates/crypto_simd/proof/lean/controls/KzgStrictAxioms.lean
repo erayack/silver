@@ -7,6 +7,20 @@ import controls.ExtenderSpecInstance
 import controls.ExtenderExternalBoundary
 import controls.ExtenderMathematical
 import controls.ExtenderLayout
+import controls.ExtenderKernelBoundary
+import controls.ExtenderKernelBytes
+import controls.ExtenderKernelFft
+import controls.ExtenderKernelTranspose
+import controls.ExtenderKernelShortStage
+import controls.ExtenderKernelLazy
+import controls.ExtenderKernelRange
+import controls.ExtenderKernelPipeline
+import controls.LeftShiftIntrinsic
+import controls.Fr8Swap
+import controls.Fr8Words
+import controls.SignedLimbs
+import controls.InterpolationKernel
+import controls.Msm8
 
 -- Check the proof, its concrete instance, and every negative control together.
 #assert_standard_axioms

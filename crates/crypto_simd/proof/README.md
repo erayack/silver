@@ -2,7 +2,7 @@
 
 One Lean project checks the Charon/Aeneas translation of `silver_crypto_simd`'s G1 and G2 batch decoders, `kzg::CellBatchVerifier` and `kzg::CellExtender`. BLS decoding is proved for all inputs and lengths, with an explicit scalar-blst agreement premise for specification equality on fallback paths. KZG verification is proved under its blst operation contracts and that same G1 scalar premise. Cell extension takes the full `BlstCorrect` contract and the separate `FrToBytesCorrect` serialization law. The statements concern generated Lean code; the consolidated [trust list](#what-a-reader-must-trust) explains their connection to Rust and the linked implementation.
 
-The BLS scope is point decoding and subgroup checks, including SIMD kernels, scalar routes and output writes. It does not include full BLS signature verification. The KZG scope includes `CellBatchVerifier::new` and `verify`, and `CellExtender::new` and `compute`, including repeated calls. Both generated `Default` implementations delegate to their constructors.
+The BLS scope is point decoding and subgroup checks, including SIMD kernels, scalar routes and output writes. It does not include full BLS signature verification. The KZG scope includes `CellBatchVerifier::new` and `verify`, and `CellExtender::new` and `compute`, including the IFMA Fr FFT, verifier interpolation and MSM8 kernels, scalar fallback and repeated calls. Both generated `Default` implementations delegate to their constructors.
 
 The public BLS wrappers and G2 kernel, and both KZG types' public entry points, are proved in generated Lean semantics. Scalar blst implementations remain external contracts. The Lake package is `lean_bls_simd`; its library is `LeanBlsSimd`.
 
@@ -105,11 +105,25 @@ theorem verify_eq_spec [e : KzgExternals] (hblst : BlstCorrect e)
 
 The headline takes `[e : KzgExternals]`, `(hblst : BlstCorrect e)` and `(hg1 : UncompressG1.BlstMatchesSpec)`. `BlstCorrect` covers thirteen of the fourteen KZG operations, excluding `frToBytes`, and G2 decoding at the two embedded setup constants. A consumer with full G2 scalar agreement can discharge the latter via `g2_decode_of_blstMatchesSpec`; the KZG headline requires only the two-input law.
 
+The generated constructor selects both the interpolation kernel and `verify.Lincomb`'s MSM kernel from `simdAvailable`. An arbitrary `StateInvariant` state does not link those two choices. The generic public headlines therefore retain `BlstCorrect`, including the scalar `lincomb` law. Separately named wrappers describe the generated `verify.Lincomb` constructor and dispatch; the existing public wrappers retain their statements.
+
+Selecting both dispatch branches in the generated call graph gives these external-field reachability counts:
+
+| Route | Fields reached |
+|---|---|
+| Construction | `fr_u64`, `fr_mul`, `fr_inverse`, `g2_decode`, `g2_neg` |
+| Both kernels, including construction | The construction fields, plus `fr_bytes`, `fr_add`, `hash`, `g1_neg`, `g1_add`, `g1_affine`, `pairing`: twelve fields. |
+| Both scalar routes, including construction | The same twelve fields, plus `fr_sub` and `lincomb`: fourteen fields. |
+
+`Routes.verify_preserves_routes` proves that every successful generated verification preserves both stored route flags. Together with `new_returns_ok_route`, it preserves the constructor's choices across repeated successful calls. The counts describe external-field reachability; the generic theorem's premises remain unchanged. The inherited G1 scalar decoder agreement remains separate. The verifier does not use `FrToBytesCorrect`.
+
 `default_eq_new` proves that the generated `Default` result equals `new`; the construction guarantee therefore applies through that public entry point too.
 
 `verify_eq_upstream` has the same execution and state conclusion for the literal upstream `verifyCellKzgProofBatch` action. It additionally requires `TrustedSetup.get! = pure embeddedSetup`. The principal embedded-setup theorem has no runtime-loader premise. The same distinction applies to `model_eq_embedded_spec` and `model_eq_spec`.
 
 A fixed dictionary `e` is quantified over the complete KZG statement. Equality to the specification holds for either value of its SIMD flag. The BLS theorem models one SIMD observation per decoder call; the KZG theorem does not formalize arbitrary changes to that observation between calls.
+
+Construction stores interpolation and MSM kernels when SIMD is available. Interpolation dispatches on its stored option; downstream linear combinations dispatch through `verify.Lincomb.sum`. The kernel checks canonical encodings and interpolates cells with `Fr8` and a 64-point `Fft8` DIT. The scalar route uses decoded evaluation scratch. The outer `StateInvariant` fixes the kernel's tables and buffer lengths while permitting scratch contents from earlier calls. Both routes preserve it and produce the same interpolation commitment.
 
 #### Input and runtime scope
 
@@ -136,9 +150,11 @@ theorem compute_eq_spec [e : KzgExternals] (hblst : BlstCorrect e)
         (verdict = false → out = cells)
 ```
 
-Every call returns `ok`. Success writes the specification's exact cell bytes. Rejection agrees with a specification error and leaves all output cells unchanged. The invariant fixes the precomputed roots, inverse roots, inverse size and shift powers, and the two scratch-vector lengths. It allows scratch contents left by earlier successful or rejected calls.
+Every call returns `ok`. Success writes the specification's exact cell bytes. Rejection agrees with a specification error and leaves all output cells unchanged. The invariant fixes the scalar roots, inverse roots, inverse size and shift powers, the two scalar scratch-vector lengths, and the optional kernel's FFT tables, shift multipliers and buffer lengths. It allows scratch contents left by earlier successful or rejected calls.
 
-The headline requires the whole `BlstCorrect e` record, including field, group, hash and pairing laws, plus `FrToBytesCorrect e`. It needs no G1 scalar agreement or setup-loader premise. `Extender.default_eq_new` covers `Default`, and `Extender.model_eq_spec` equates the full model result with the upstream action. `Extender.model_accepts_iff` characterizes canonical input. `Extender.spec_instance_nonvacuous` witnesses both external contracts and successful construction together.
+The headline requires the whole `BlstCorrect e` record, including field, group, hash and pairing laws, plus `FrToBytesCorrect e`. The serialization premise covers the scalar fallback's `fr_to_bytes` call; the kernel proves its own canonical byte encoding and does not use that premise. It needs no G1 scalar agreement or setup-loader premise. `Extender.default_eq_new` covers `Default`, and `Extender.model_eq_spec` equates the full model result with the upstream action. `Extender.model_accepts_iff` characterizes canonical input. The two nonvacuity witnesses use specification dictionaries with SIMD disabled and enabled.
+
+`new_dispatch_refinement` proves that construction stores a kernel exactly when `simdAvailable` is true. Each subsequent `compute` dispatches on that stored option. The internal kernel-route refinement requires neither `BlstCorrect` nor `FrToBytesCorrect`; construction establishes its table invariant using `BlstCorrect`. The one public headline combines this refinement with the scalar route.
 
 ## Using the public results
 
@@ -171,6 +187,22 @@ For G2, import `LeanBlsSimd.Refines.UncompressG2` and use `UncompressG2.uncompre
 Import `LeanBlsSimd.Kzg.Statements`. Supply `[e : KzgExternals]`, `hblst : LeanBlsSimd.Kzg.BlstCorrect e` and `hg1 : LeanBlsSimd.UncompressG1.BlstMatchesSpec`, with the latter resolved at `e.toBlsExternals`. Apply `LeanBlsSimd.Kzg.verify_eq_spec hblst hg1` to obtain successful construction and the verdict/state guarantee for all representable inputs. Use `new_returns_ok` for construction alone or `glue_refinement` for the intermediate model. `default_eq_new` transfers construction through `Default`. `verify_eq_upstream` additionally takes the runtime setup hypothesis stated above.
 
 `BlstCorrect` includes the restricted G2 setup law. If a consumer already has full `UncompressG2.BlstMatchesSpec`, `g2_decode_of_blstMatchesSpec` discharges that field; no all-input G2 premise is required by the KZG headline.
+
+For individual generated calls, import `LeanBlsSimd.Kzg.Refines`. The supporting wrappers expose these cell premises and results:
+
+| Wrapper | Cell interface |
+|---|---|
+| `decode_cells_refines` | Proves the canonical-decoding verdict on both routes. Its evaluation-scratch equality applies when `v.kernel = none`. |
+| `interpolation_commitment_refines` | Takes `cells` and `InterpolationKernel.CellsRep cells evals`, plus evaluation-scratch equality conditional on `v.kernel = none`. |
+| `pairing_holds_refines` | Takes the same cell relation and conditional scratch premise, and proves the specification's pairing verdict. |
+
+`Kzg/Lincomb.lean` supplies `verify_lincomb_refinement` for generated `verify.Lincomb.sum`, with the encoded linear-combination contract and updated scratch. `Interpolation.setup_verify_lincomb` specializes it to the embedded setup. The existing `g1_lincomb_refinement` and `Interpolation.setup_lincomb` statements remain available.
+
+`verify_lincomb_kernel_refinement` and `Interpolation.setup_verify_lincomb_kernel` cover stored MSM kernels without `BlstCorrect.lincomb`. `lincomb_new_isSome` characterizes constructor selection, and `lincomb_sum_route` preserves the stored route on successful calls. `new_returns_ok_route` characterizes both constructor choices. `Routes.verify_preserves_routes` proves their preservation through every successful generated verification. These internal route results do not strengthen `StateInvariant`.
+
+`CellsRep` requires matching batch lengths and 64 evaluations per cell. Every 32-byte element must decode successfully through `bytesToBlsField` to its corresponding evaluation. That decoder rejects integers at least `r`; the relation does not accept a noncanonical encoding of the same residue. The headline derives this relation from successful cell checks and discharges the scalar scratch premise internally. It needs no additional caller assumption.
+
+[`controls/downstream/KzgSmoke.lean`](lean/controls/downstream/KzgSmoke.lean) consumes all three wrapper statements from an independent package. Its kernel consumers discharge the conditional scratch premise using the stored kernel option.
 
 [controls/KzgSpecInstance.lean](lean/controls/KzgSpecInstance.lean) is a worked application using the specification-backed dictionary. Its final application is:
 
@@ -212,10 +244,10 @@ open LeanBlsSimd.Kzg
 1. **Lean and dependencies.** Lean v4.29.1's kernel and only `propext`, `Classical.choice` and `Quot.sound`. `LeanBlsSimd/Axioms.lean` checks the imported BLS and KZG theorems, generated entry points and their transitive dependencies. `acceptedAxioms` is empty; `sorryAx`, `native_decide` and `bv_decide` dependencies are rejected. Aeneas's library can contain unrelated proof placeholders without those entering the checked closure. Using `lake exe cache get` additionally trusts downloaded Mathlib `.olean` artifacts, which Lean imports without rechecking their proofs; building Mathlib from source avoids that reliance.
 2. **Specification and mathematics.** Mathlib v4.29.1 and [ethereum/EthLib at `d1331f02`](https://github.com/ethereum/EthLib/tree/d1331f02e308fe6d0aedda8601e4d5b0fc360318), including its field, group law, decoders, subgroup checks, KZG validation and cell-batch and `computeCells` specifications, and their fidelity to Ethereum's requirements. Agreement with vectors is finite evidence, not a proof of equivalence to other specifications or of the provenance of the embedded ceremony data. Manual review connects `G2Spec.verdict` to the private decoding stage of `coreVerify`: its fixed-size type supplies length 96, then it calls `G2.uncompress` and `G2.inSubgroup`. The stage accepts canonical infinity. Public-key validation, hash-to-curve and pairing in full signature verification are outside this proof.
 3. **Input and output interpretation.** `ofArray`, `ofU8`, `ofBatch` and the affine conversions preserve bit-vectors, lanes and fields. Coordinates use six little-endian 64-bit Montgomery limbs with R = 2^384; G2 orders c0 before c1 and x before y. G1 and G2 public verdicts normalize through `toAffine`, including all-zero infinity. The G2 kernel conversion reads projective x/y; its bridge to the normalized verdict is proved for decoded finite points with z = 1. KZG's reduced scalar encoding uses four 64-bit Montgomery limbs with R = 2^256. The representation targets blst's 64-bit platform layout.
-4. **Extraction and generated-code preparation.** Charon's MIR semantics, Aeneas's translation and the deterministic adaptations in `prepare-extraction.py` described in [reproduction](#reproducing-the-extraction). The pinned Aeneas revision is `d9733413`, Charon is `ed22146b`, and Charon uses nightly-2026-02-07 rather than the workspace's Rust 1.91.0. `extract.sh` verifies checkout pins and available binary version information; a Charon binary from another commit with the same reported crate version is not distinguished. The extraction uses the x86_64 chunk helpers. Transfer to targets selecting other helpers relies on feature detection selecting the scalar route. Exact `--check` reproduction detects drift, not translator bugs.
-5. **External semantics and bindings.** Aeneas's pinned Lean library models integers, arrays, slices, bounds/overflow checks and `partial_fixpoint` loops. The handwritten definitions in `Extracted/TypesExternal.lean` and `FunsExternal.lean` bind the vector type, twelve AVX-512 intrinsics, lane extraction, affine defaults, feature detection, scalar wrappers, KZG dictionary fields, cloning, vector defaults and `u32` stepping. Intrinsics implement the Intel SDM/Rust `core::arch` model; lane extraction preserves order and defaults zero every limb. `LincombScratch.new` and `COMPRESSED_LEN` are generated.
+4. **Extraction and generated-code preparation.** Charon's MIR semantics, Aeneas's translation and the deterministic adaptations in `prepare-extraction.py` described in [reproduction](#reproducing-the-extraction). The pinned Aeneas revision is `d9733413`, Charon is `ed22146b`, and Charon uses nightly-2026-02-07 rather than the workspace's Rust 1.91.0. `extract.sh` verifies checkout pins and available binary version information; a Charon binary from another commit with the same reported crate version is not distinguished. The extraction targets x86_64, including its BLS chunk helpers, Fr FFT and verifier MSM8 kernels. The theorem includes the scalar route of this extraction; it does not check a separate non-x86_64 extraction. Transfer to other target configurations relies on their feature detection and source gating. Exact `--check` reproduction detects drift, not translator bugs.
+5. **External semantics and bindings.** Aeneas's pinned Lean library models integers, arrays, slices, bounds/overflow checks, little- and big-endian byte conversions, and `partial_fixpoint` loops. The handwritten definitions in `Extracted/TypesExternal.lean` and `FunsExternal.lean` bind the vector type and fourteen AVX-512 intrinsics. They also bind lane extraction, affine defaults, feature detection, scalar wrappers, KZG dictionary fields, cloning, vector defaults, `Vec.clear`, `Vec.is_empty` and `u32` stepping. `Vec.clear` returns an empty logical vector; `Vec.is_empty` tests whether its logical list is empty. These bindings describe contents, without modeling allocation capacity. Intrinsics implement the Intel SDM/Rust `core::arch` model. `_mm512_permutex2var_epi64` chooses a source with index bit 3 and its lane with the low three bits, ignoring higher bits. `_mm512_slli_epi64` shifts each lane left modulo `2^64`; an immediate of at least 64 produces zero. Lane extraction preserves order and defaults zero every limb. The Fr encoder proves its result using the library's byte-conversion semantics. Agreement of these intrinsic models with hardware remains a trust assumption; per-intrinsic hardware vectors are a separate check. `LincombScratch.new`, `verify.Lincomb.new`, the MSM8 functions and `COMPRESSED_LEN` are generated.
 6. **Shared scalar and SIMD observations.** The linked blst is version 0.3.16, pinned by [`Cargo.lock`](../../../Cargo.lock). `BlsExternals` supplies an arbitrary Boolean and deterministic total scalar functions. `uncompressG1` has the full 48-byte agreement law `UncompressG1.BlstMatchesSpec` for G1 specification equality, including the KZG verifier. `uncompressG2` has the full 96-byte law `UncompressG2.BlstMatchesSpec` for G2 specification equality; KZG's `BlstCorrect.g2_decode` requires that same observation to agree only at `G2_MONOMIAL_0` and `G2_MONOMIAL_64`. Each law covers acceptance, exact affine limbs and infinity. The scalar wrappers return `ok`, trusting termination and absence of Rust-level failure, and use the same function on every fallback. Without the scalar law the BLS result still characterizes specification verdicts on decided kernel lanes and scalar verdicts elsewhere. Each BLS call reads feature detection once after checking lengths; this does not assert stability between calls. KZG fixes the inherited observation for its theorem.
-7. **KZG operation contracts.** `BlstCorrect` assumes the thirteen `blst_ops` laws of the same blst 0.3.16, with the reduced-output field laws supported by the [manual Fr source audit](#manual-blst-fr-audit). These laws cover scalar arithmetic/conversion, SHA-256 hashing, group operations, linear combination and pairing. Laws apply at the stated representation and validity premises; inversion needs a nonzero field element. Jacobian results need only represent the same point, and scratch threading is retained. The specification pairing has opaque loop semantics, so neither the kernel certificates nor the controls prove blst's implementation. The joint `specExternals_correct` witness rules out contradictory contracts, but the linked blst implementation remains an external assumption. `FrToBytesCorrect e` requires `e.frToBytes (frEncode x)` to succeed with `blsFieldToBytes x` for every field element `x`. These are canonical, 32-byte big-endian encodings. The serialization path calls `blst_scalar_from_fr` (using `from_mont_256`) and `blst_bendian_from_scalar`. The manual Fr audit does not cover this path; its reduction and byte-order properties remain unaudited external assumptions. The verifier does not call serialization. The extender requires the entire `BlstCorrect` record plus `FrToBytesCorrect`.
+7. **KZG operation contracts.** `BlstCorrect` assumes thirteen `blst_ops` laws of the same blst 0.3.16. Its separate `g2_decode` law concerns the inherited decoder, giving the fourteen fields counted in the route table. The reduced-output field laws are supported by the [manual Fr source audit](#manual-blst-fr-audit). These laws cover scalar arithmetic/conversion, SHA-256 hashing, group operations, linear combination and pairing. Laws apply at the stated representation and validity premises; inversion needs a nonzero field element. Jacobian results need only represent the same point, and scratch threading is retained. The specification pairing has opaque loop semantics, so neither the kernel certificates nor the controls prove blst's implementation. The joint `specExternals_correct` witness rules out contradictory contracts, but the linked blst implementation remains an external assumption. `FrToBytesCorrect e` requires `e.frToBytes (frEncode x)` to succeed with `blsFieldToBytes x` for every field element `x`. These are canonical, 32-byte big-endian encodings. The serialization path calls `blst_scalar_from_fr` (using `from_mont_256`) and `blst_bendian_from_scalar`. The manual Fr audit does not cover this path; its reduction and byte-order properties remain unaudited external assumptions. The verifier does not call serialization. The extender requires the entire `BlstCorrect` record plus `FrToBytesCorrect`. The [verifier route table](#kzg-verifier) qualifies external-field reachability; the generic public contract retains every field.
 8. **Runtime setup for literal-upstream corollaries.** Only `verify_eq_upstream` and `LeanBlsSimd.Kzg.model_eq_spec` require `TrustedSetup.get! = pure embeddedSetup`, including that no importer changes the public `TrustedSetup.globalRef`. The initialized reference and `ST.Prim.Ref.get` are opaque in Lean. The embedded-setup theorem instead uses the explicit value and the proved embedded-byte certificates.
 
 Compiled Rust additionally depends on the compiler, linking, ABI, CPU detection and hardware. The theorem describes Aeneas execution results; it does not prove absence of allocation failures or capacity panics, as detailed in the KZG runtime scope above. The extender has fixed buffer sizes, but its allocations still rely on the runtime and available memory.
@@ -231,7 +263,7 @@ lake build
 
 `lake exe cache get` fetches Mathlib's prebuilt files; run it from `lean/`. Lean imports those files without rechecking Mathlib's proofs. Building Mathlib from source avoids reliance on those prebuilt artifacts.
 
-`lake build` compiles Aeneas's Lean library and the proof, then runs the axiom guard. Aeneas's library may print `declaration uses 'sorry'` warnings; the guard checks that none of the declarations it covers depend on those `sorry`s. The default build prints the library guard and the stricter control guard. Each reports its theorem count, nine generated entry points, and `axioms used: [propext, Quot.sound, Classical.choice]`. A cold build also compiles uncached dependencies and needs substantially more time than a rebuild.
+`lake build` compiles Aeneas's Lean library and the proof, then runs the axiom guard. Aeneas's library may print `declaration uses 'sorry'` warnings; the guard checks that none of the declarations it covers depend on those `sorry`s. The default build prints the library guard and the stricter control guard. Each reports its theorem count, 59 generated entry points, and `axioms used: [propext, Quot.sound, Classical.choice]`. A cold build also compiles uncached dependencies and needs substantially more time than a rebuild.
 
 Negative controls check that selected mutations are rejected. Other controls check concrete inputs and the axiom list. Every top-level control must exit 0:
 
@@ -272,7 +304,7 @@ make -C crates/crypto_simd
 SILVER_REQUIRE_IFMA=1 cargo test --locked -p silver_crypto_simd --all-features
 ```
 
-The IFMA requirement applies to the BLS kernel checks on a supported x86_64 host. Lean jobs can use substantial memory; run one at a time. The default build and the controls must be rebuilt after changing an import before their results are used.
+The IFMA requirement applies to the BLS and Fr FFT kernel checks on a supported x86_64 host. Lean jobs can use substantial memory; run one at a time. The default build and the controls must be rebuilt after changing an import before their results are used.
 
 ### Reproducing the extraction
 
@@ -286,7 +318,7 @@ Aeneas records each item's origin in a `Source: '<file>', lines <span>` comment.
 
 If the generated code has drifted, run `./extract.sh` without `--check`, which replaces `Types.lean` and `Funs.lean`, and follow `lean/README.md`. Rebuild and fix the affected BLS or KZG refinements. Update the models and specification proofs where behaviour changes. Then rerun the controls, Lean differential tests and Rust checks, and update the BLS source table below when its files change. A passing vector test does not replace the drift check, since it covers only the recorded inputs.
 
-The extraction roots are `crate::bls::decompress_g2::decompress`, `crate::bls::uncompress_in_g1`, `crate::bls::uncompress_in_g2`, `crate::kzg::verify` and `crate::kzg::cell_extender`. The KZG roots reach both public types' constructors, methods and `Default` implementations; individual `kzg::blst_ops` functions remain opaque. `prepare-extraction.py` then:
+The extraction roots are `crate::bls::decompress_g2::decompress`, `crate::bls::uncompress_in_g1`, `crate::bls::uncompress_in_g2`, `crate::kzg::verify` and `crate::kzg::cell_extender`. The KZG roots reach both public types' constructors, methods and `Default` implementations, including `Fr8`, `Fft8`, `ExtensionKernel`, `InterpolationKernel`, `verify.Lincomb` and the BLS `msm8` module. Individual scalar `kzg::blst_ops` functions remain opaque. `prepare-extraction.py` then:
 
 - scopes BLS definitions over `BlsExternals` and KZG definitions over its child `KzgExternals`, so the latter inherit a single BLS dictionary;
 - quotes exactly six generated `full` identifiers;
@@ -309,6 +341,7 @@ All adaptations run before the drift comparison. Only numeric source spans are m
 | `LeanBlsSimd/Proofs/` | The model against the specification, including G1's `DecompressG1.lean`, G2's `Kernel.lean` and the G2 wrapper verdict bridge in `UncompressG2.lean`. |
 | `LeanBlsSimd/Refines/` | The generated code against the model, function by function, with public wrapper APIs in `UncompressG1.lean` and `UncompressG2.lean`, both length-mismatch theorems in `WrapperLengths.lean`, and G2's kernel headline in `Complete.lean`. |
 | `LeanBlsSimd/Kzg/` | KZG specification decomposition, setup certificates, decoder bridge, representation laws, verifier refinements and public statements; `Extender/` contains the cell-extension model, refinements and specification bridge. |
+| `LeanBlsSimd/Msm8/` | Generated verifier MSM refinements: GLV splitting, stores, buckets, affine batches, complete sums and output representation. |
 | `LeanBlsSimd/Axioms.lean` | The common axiom guard for BLS and KZG. |
 | `controls/` | BLS/KZG Lean controls, the common `AxiomLog.lean`, `KzgStrictAxioms.lean`, extraction fixtures in `extraction-check.py`, and the independent `downstream/` package. |
 | `Test/Main.lean`, `Test/Differential/` | The differential CLI, shared parser and separate G1/G2 checks; the G1/G2 module docstrings describe the formats. |
@@ -318,6 +351,56 @@ All adaptations run before the drift comparison. Only numeric source spans are m
 ## BLS proof internals
 
 The proof has two parts: the generated code returns exactly the result of a hand-written model, and the model agrees with the specification on every lane the kernel decides. G2's Scott completeness uses a character-sum bound on the curve's point count; G1 uses the elementary finite point-count bound described below. Recorded test vectors also compare the generated code and model with the compiled Rust. Those tests check the translation on particular inputs; they are not a proof of the translation itself.
+
+### Montgomery multiplication and squaring
+
+`Proofs/EarlyCarry.lean` proves the wrapping carry identity under the inverse-modulus premise.
+`Proofs/Reduction.lean` proves that each generated reduction row agrees with the reference model
+on the limbs above its row index, then transports that agreement through all rows and final
+carry extraction. The row's dead low limb is deliberately outside this equality.
+`Proofs/Square.lean` equates the triangular square accumulator with the full product accumulator,
+including wrapping additions. The Fp8 and Fr8 refinements use these identities to reuse the
+existing arithmetic bounds and public contracts.
+
+### Lazy field arithmetic and point formulas
+
+Fp8 uses the same [range classes as the Fr8 FFT kernel](#ifma-fr-fft-kernel), with modulus `p` and eight radix-52 limbs:
+
+| Class | Integer value | Limbs | Lean predicates |
+|---|---|---|---|
+| Normalized | In `[0, R)`, where `R = 2^416` | Each in `[0, 2^52)` | `SignedLimbs.Normalized` |
+| Reduced | In `[0, 2p)` | Normalized | `Fp8Inv`; `Fp8.Holds` also records the field value |
+| `Lazy k m` | In `[0, k*p)` | Signed magnitudes below `m*2^52` | `Fp8.Lazy`; `Fp8.LazyRep` also records the field value |
+| Bounded | In `[0, k*p)` | Normalized | `Fp8.BoundRep` records the bound and field value |
+| Offset | Exactly `c*p` | Normalized | `Fp8.Offset` |
+
+The shared `SignedLimbs` model defines raw addition, offset subtraction and signed carrying for both fields.
+Its width-generic normalization theorem preserves values in `[0, 2^(52*n))` when each limb has magnitude below `2^62`.
+The five- and eight-limb theorems follow as corollaries.
+`Refines/SignedLimbs.lean` shares the normalization, raw-addition and offset-subtraction refinements across both widths.
+`Proofs/Fp8Lazy.lean` connects these operations to Montgomery field values and composes their bounds.
+`Proofs/Fp8Holds.lean` supplies the reduced field representations shared by Fp8 and Fp2 proofs.
+Conditional subtraction preserves residues when its offset is a multiple of `p`.
+`Proofs/Fp8Multiple.lean` proves that `multiple_of_p c` returns normalized limbs for `c*p`, for every `c < 2^12`.
+
+`mul_spec_of_product_lt` accepts normalized operands with product below `R*p` and proves a reduced result.
+The existing multiplication theorems follow as special cases.
+G1 formulas keep intermediate values below `10p`, with limb magnitudes below `6*2^52` before carrying.
+Their largest product bound is `8p * 8p`, from squaring the doubled difference in point addition.
+Offsets of `2p`, `4p` and `8p` keep differences nonnegative; final conditional subtractions restore reduced coordinates.
+The G1 correctness theorems retain their reduced input and output contracts and their undecided-mask premises.
+
+`Fp2x8.LazyRep` and `Fp2x8.BoundRep` apply the Fp8 classes to each component.
+`BoundRep.mul` accepts normalized components below `16p`; its Karatsuba sums stay below `32p`.
+The largest underlying Fp8 product is below `1024p²`, which is below `R*p`.
+`BoundRep.square` accepts normalized components below `8p` and offsets the component difference by `8p`.
+Its imaginary component uses `c0 * (2*c1)`, carrying the doubled operand before multiplying.
+Both lemmas return reduced components; the existing reduced-input `Holds.mul` and `Holds.square` statements follow as corollaries.
+
+G2's double and affine-add formulas use the same componentwise bounds as G1, with reduced coordinates at both boundaries.
+Their multiplication operands stay below `16p`, and their square operands below `8p`.
+G1 and G2 retain separate models of Rust's offset structs but share the Fp8 reduction-chain proofs.
+The G2 formula theorems preserve their exact field triples and undecided-mask equalities.
 
 ### G1 Scott criterion
 
@@ -419,7 +502,13 @@ Paths below are relative to `lean/controls/`. The common reproduction commands r
 | `G2Consumer.lean` | The public G2 list and model corollaries and length mismatch result can be applied from a separate module; a specification-backed external satisfies the universal premise at both SIMD settings. |
 | `G1Consumer.lean` | A downstream module imports only the G1 public theorem, applies it with arbitrary externals, and constructs an instance satisfying its blst hypothesis. |
 | `Statements.lean` | Changed constants and formulas break their proof scripts, including G1's Scott-membership proof when the model drops the y negation. |
-| `Limbs.lean`, `Fp8.lean`, `G2Group.lean`, `Decompress.lean` | A mutated constant, formula, carry or mask breaks the proof that uses it. |
+| `Limbs.lean`, `Fp8.lean`, `G2Group.lean`, `Decompress.lean` | A mutated constant, formula, carry or mask breaks the proof that uses it. `Limbs.lean` also shows that the early-carry model expression depends on its shift. |
+| `EarlyCarry.lean` | Both modulus constants satisfy the carry identity; omitting or decreasing MASK52 and replacing the wrapping sum by a natural-number sum give concrete counterexamples. |
+| `Square.lean` | The triangular square accumulator equals the full product; omitting cross-term doubling fails on an input with two nonzero limbs. |
+| `Fp8Lazy.lean` | Missing conditional subtraction violates the reduced bound; an insufficient offset makes a difference negative; a tighter lazy bound fails. Normalized operands alone do not guarantee a reduced product. |
+| `Fp2Lazy.lean` | Karatsuba sums need carrying; a smaller square offset makes a valid lazy difference negative. Omitting the imaginary-component doubling violates the square contract. |
+| `G2Lazy.lean` | Dropping the final conditional subtraction leaves nonreduced components. Replacing the double formula's `8p` offset with `4p` makes a valid intermediate difference negative. |
+| `Reduction.lean` | Both widths retain the stale dead limb; dropping the inverse premise can change a surviving limb. The valid inverse case agrees above the row index. |
 | `Generator.lean` | −z, or a wrong ψ constant, breaks `psi_generator`. |
 | `ScottCardinality.lean` | The generator's order is not r²; dropping either Hasse bound makes the numerical exclusion of multiples of r² false. |
 | `CharacterSums.lean` | Scott soundness and completeness together; zero, cube and noncube fibers over F₇; the affine point count over F₅; and a counterexample to the Jacobi norm identity for trivial characters. |
@@ -429,18 +518,25 @@ Paths below are relative to `lean/controls/`. The common reproduction commands r
 
 ### Extracted BLS source
 
-`lean/LeanBlsSimd/Extracted/Types.lean` and `Funs.lean` contain items generated from the following Rust files. These content hashes pin the source read by the extraction.
+`lean/LeanBlsSimd/Extracted/Types.lean` and `Funs.lean` contain items generated from the following Rust files. These content hashes inventory the Rust sources, including shared arithmetic and the verifier MSM module. `extract.sh --check` verifies their correspondence with the generated files.
 
 | File | sha256 | git blob |
 |---|---|---|
-| `mod.rs` | `b0a85004d44096d34032190c2a26f35bf69afa35da4c36c271bdeb738d2771d5` | `099bade6d9bfa27953083b8167571f1da29a5a4e` |
-| `constants.rs` | `903c4ea8360c254f1bd048d1be4df95511fd7a6e1db2257f47704e270589449f` | `87190c24741f42bc50d3cae4ed384995cdc15f14` |
-| `fp8.rs` | `0ba4b0f9dbc78dfe5032722d46739c58ec91ac86960c1257b201ae9a3d870512` | `11d1dbb2c69b3bd2dad3e502247e0165ef25b9ed` |
-| `fp2x8.rs` | `9d5c8b5e87d996b2c374f8c38438c16f171bd8e39cab012267337e8baee5b069` | `951eadde84eca23e2ebe8626bc0382a205497071` |
-| `g1x8.rs` | `2063afb8b7b931b44006b7979df3f0846bd0bc4e832ab8728d06735ecb18b7c9` | `ddbd6159490ff0f58b27dbf4b4e63db92bac5391` |
-| `g2x8.rs` | `57a02d26fda9dd934c647fe7020e961a6c2efcd1e20ed72a09202cf2ccef7295` | `804ebf1d0e6681d20f07ede1867cef929ebe190c` |
+| `mod.rs` | `dd8a02f6ab04a9d551bcbde38d7f38fee443da87d5898ee275928b40783c2bc8` | `9c3e8f3497e7fa8bc5480cbe885a7afead31eb1c` |
+| `constants.rs` | `95192c2244e7943f2f4af9ed51d300095e5f8aaec786dcd8b3b15fc726ea35ac` | `3cc205a7535304e34c2e228986f75adada41d616` |
+| `fp8.rs` | `3728131dfd4a6789b5425eec372d935db6ae77a4777111cec184d58073701a14` | `36b704758ef3de51bc02a348f808625c79ef20cc` |
+| `fp2x8.rs` | `c2a2394e2ae3e658817d9875357d6adcf253d1b7ff4a3f18cd5ff8dbc40a5a91` | `bef231eaa255d7aeafacf993b5683858f52dd126` |
+| `g1x8.rs` | `abfc112018480584432803847be6c3e0cfc4ecad337f5e056d192c9768acace9` | `f15106b38a07d6a682bebfacbf3710a9643552d4` |
+| `g2x8.rs` | `3e5da4797933264da07aa002060cb02d9b0caf794013c02a2a1984b174e9294b` | `9bbffcc30319f2c024adfa74748ad57e4236b437` |
 | `decompress.rs` | `718f280500e78890c78b175fe36378b62cf57244b356b6555ede1c829e93e184` | `1a9052c76f9797fd07e760df899ef017aa0adf62` |
 | `decompress_g2.rs` | `14df66f6f153149fc329bce2f2229a1f10c190bb9727d1604cd52a552df82cb8` | `e8f7d7cef432288936367f602a7b79838095bead` |
+| `msm8/buckets.rs` | `be851281cbaf447dc017f10ae547bfe812775c88a2d52535da77fed6e41a22a8` | `cd15238747cca7186210ba2d3c3c9701522d9017` |
+| `msm8/glv.rs` | `bf298f838003c087769cb56f78551c6c44be19e61eb7dc0f9829a15403f6d74b` | `b928b5ac231282c0f01a501374503e7c41798c7b` |
+| `msm8/mod.rs` | `3150fe70dfbb59cf2565233572f007da62eb72fcaa509ea6b5b0b978c7d097cd` | `e6a4df8247c2f7cb3823e5a6451e1a4ba629949d` |
+| `msm8/pairs.rs` | `e5197813677cac8870d3357d93f540499bceda88c89e2627329022e3eb0b9fb7` | `eb4df17a69f6e399455f45dab4a0372d7ece2afa` |
+| `msm8/store.rs` | `749fe26d42ecd4b27d87046333f0d8181cc398779c7db2cc1038cd106a9093ad` | `a789fae4b3fe488eb85c56c24db8d5c8e4ba4104` |
+
+The MSM uses `msm8/`, shared `fp8.rs` inversion and `g1x8.rs` complete point operations.
 
 G1 coverage includes `uncompress_in_g1`, `decompress_g1_chunk`, the decoder, group operations and shared arithmetic. Feature detection and the scalar blst wrapper remain the explicit trusted externals. G2 coverage includes `uncompress_in_g2`, `decompress_g2_chunk`, the decoder, group operations and shared arithmetic. The G2 wrapper refinement proves the chunk routing, padding bounds, fallback calls and output writes. The correspondence to `coreVerify` is described in the consolidated trust list. The extraction also includes blst 0.3.16's field and affine structures from `src/bindings.rs`.
 
@@ -448,14 +544,19 @@ To check for changes since the proof, run this from `crates/crypto_simd/src/bls`
 
 ```sh
 sha256sum -c <<'EOF'
-b0a85004d44096d34032190c2a26f35bf69afa35da4c36c271bdeb738d2771d5  mod.rs
-903c4ea8360c254f1bd048d1be4df95511fd7a6e1db2257f47704e270589449f  constants.rs
-0ba4b0f9dbc78dfe5032722d46739c58ec91ac86960c1257b201ae9a3d870512  fp8.rs
-9d5c8b5e87d996b2c374f8c38438c16f171bd8e39cab012267337e8baee5b069  fp2x8.rs
-2063afb8b7b931b44006b7979df3f0846bd0bc4e832ab8728d06735ecb18b7c9  g1x8.rs
-57a02d26fda9dd934c647fe7020e961a6c2efcd1e20ed72a09202cf2ccef7295  g2x8.rs
+dd8a02f6ab04a9d551bcbde38d7f38fee443da87d5898ee275928b40783c2bc8  mod.rs
+95192c2244e7943f2f4af9ed51d300095e5f8aaec786dcd8b3b15fc726ea35ac  constants.rs
+3728131dfd4a6789b5425eec372d935db6ae77a4777111cec184d58073701a14  fp8.rs
+c2a2394e2ae3e658817d9875357d6adcf253d1b7ff4a3f18cd5ff8dbc40a5a91  fp2x8.rs
+abfc112018480584432803847be6c3e0cfc4ecad337f5e056d192c9768acace9  g1x8.rs
+3e5da4797933264da07aa002060cb02d9b0caf794013c02a2a1984b174e9294b  g2x8.rs
 718f280500e78890c78b175fe36378b62cf57244b356b6555ede1c829e93e184  decompress.rs
 14df66f6f153149fc329bce2f2229a1f10c190bb9727d1604cd52a552df82cb8  decompress_g2.rs
+be851281cbaf447dc017f10ae547bfe812775c88a2d52535da77fed6e41a22a8  msm8/buckets.rs
+bf298f838003c087769cb56f78551c6c44be19e61eb7dc0f9829a15403f6d74b  msm8/glv.rs
+3150fe70dfbb59cf2565233572f007da62eb72fcaa509ea6b5b0b978c7d097cd  msm8/mod.rs
+e5197813677cac8870d3357d93f540499bceda88c89e2627329022e3eb0b9fb7  msm8/pairs.rs
+749fe26d42ecd4b27d87046333f0d8181cc398779c7db2cc1038cd106a9093ad  msm8/store.rs
 EOF
 ```
 
@@ -480,6 +581,9 @@ If a file fails, find its proved version with `git log --all --find-object=<blob
 | `Statements.lean` | Model/spec equivalence, interpolation, construction, refinement and headline theorems |
 | `Refines.lean` | Supporting statements for decoding, challenge, roots, IFFT and pairing inputs |
 | `Refines/` | Proofs for the extracted functions and shared loop lemmas |
+| `InterpolationKernel/` | Canonical cell checks, weighted columns, the shared 64-point DIT, coefficient stores and kernel construction |
+| `Lincomb.lean` | Generated `verify.Lincomb` dispatch, scalar conversion and MSM8 composition |
+| `Routes.lean` | Preservation of both stored kernel options through successful generated verifier calls |
 | `Decoder.lean` | Direct composition with the shared BLS decoder proofs |
 | `G1Bridge.lean` | Generic transport theorem for independent extractions; the shared verifier uses `Decoder.lean` |
 
@@ -497,7 +601,69 @@ The challenge preimage proof matches upstream's serialization of decoded cells. 
 
 `Primitives.lean` proves construction from the shared roots refinement. `Decode.lean` proves decoding and early rejection, `Scale.lean` proves coefficient shifting, and `WriteStep.lean`, `WriteBytes.lean` and `Write.lean` prove every output byte and the first-half copy. `Refines.lean` composes the generated operations and preserves `Basic.lean`'s invariant; `Statements.lean` supplies the public results. The verifier's roots and FFT theorems take `ExternalsCorrect` and delegate to refinements with `BlstCorrect` premises.
 
+#### IFMA Fr FFT kernel
+
+`Kernel/Basic.lean` relates each vector's eight lanes to field elements. Each lane's integer value reads its five limbs as signed 64-bit integers. The range classes match `fr8.rs`:
+
+| Class | Integer value | Limbs |
+|---|---|---|
+| Normalized | Below `2^260` | Each in `[0, 2^52)` |
+| Reduced (`Bounded`) | In `[0, 2r)` | Normalized |
+| `Lazy k m` | In `[0, k*r)` | Each has magnitude below `m*2^52` |
+
+`Model/SignedLimbs.lean` and `Proofs/SignedLimbs.lean` provide signed carry and raw arithmetic facts. `normalise` preserves the integer value when its limbs have magnitude below `2^62` and its value lies below `2^260`. `Refines/Fr8.lean` equates uncarried products with `Fr8.mulRaw`, using the [shared early-carry reduction proof](#montgomery-multiplication-and-squaring). `Reduction.rows_agree` transfers the surviving limbs to the reference accumulator. `Refines/Fr8Interleaving.lean` equates each combined row with independent reduction and product rows, including their wrapping additions. `Fr8.reduce_while_multiplying_eq` composes the rows into exactly `(reduce t, product a b)`. `Fr8.product_bound` bounds every unreduced accumulator limb below `2^56`, for arbitrary inputs. `Proofs/Fr8Product.lean` bounds the reduced product limbs below `2^57`. It bounds their value below `2r`, assuming normalized operands with `a*b < r*2^260`.
+
+Multiplication constants carry `R = 2^260` and have canonical representatives below `r`. `MultiplierRep` records both properties. `FftInvariant` requires this representation for all wide and short twiddles; `StateInvariant` also requires it for shift multipliers. The constructors establish these invariants through `load_multiplier_refinement`, which proves canonicality from the exact modulo-`r` packing equation, without an additional external premise.
+
+Canonical table multipliers permit multiplication of any normalized data operand within the product bound `a*b < r*2^260`. A noncanonical representative of the same field element need not satisfy that bound. `ExtenderKernelLazy.lean` checks a unit-multiplier counterexample whose raw product exceeds `2r`.
+
+`Kernel/Lazy.lean` connects signed ranges to field representations. `Fr8Lazy.lean` proves normalization and raw operations; `Fr8Mul.lean` proves bounded products. `Fr8Offset.lean` constructs multiples of `r`, `Fr8Reduced.lean` reduces normalized values, and `Fr8AddSub.lean` composes reduced arithmetic. `Fr8Arithmetic.lean` proves canonicalization.
+
+`Fr8ByteLoad.lean` proves the four 64-byte loads used by `U256x8`. `Fr8Swap.lean` proves the shift/mask/add byte swap, and `Fr8Endian.lean` connects it to big-endian conversion. `Fr8Words.lean` proves both rounds of block permutation and the conversion between four 64-bit words and five 52-bit limbs. `Fr8WordStore.lean` supplies the byte-write and frame lemmas. `Fr8BytesDecode.lean` composes these refinements to recover every raw 256-bit input, including rejected values. `Fr8BytesEncode.lean` composes canonicalization and the inverse conversion to prove exact big-endian output bytes while preserving the surrounding output slice.
+
+`Refines/Transpose.lean` proves the shared 8×8 shuffle from its generated intrinsic calls. `Kernel/Fr8Transpose.lean` and `Kernel/Fr8.lean` lift it to all five limbs; `FftOperations.lean` preserves the field representation of each lane. `FftShort.lean` proves stages 1, 2 and 4 on transposed blocks, including the skipped product when the twiddle is 1. `FftShortPipeline.lean` equates the three generated short stages with the per-butterfly loops in `FftShortModel.lean`. `FftShortSteps.lean` supplies loop equations; `FftShortOne.lean` handles the stage without pending products. `FftBlocks.lean` composes the two transposes, short stages and block stores. `Kernel/FftTableBuild.lean` and `FftTables.lean` prove the seven splat twiddles and the strided wide table.
+
+DIT starts with reduced data. Its short stages produce `Lazy 4 3`, `Lazy 8 36`, then `Lazy 16 73`. Each wide stage increases the two bounds by 2 and 33 respectively. For `w = log2(n)-3` wide stages, the result is `Lazy (16+2*w) (73+33*w)`, at most `Lazy 34 370`. The normalization proof uses `k ≤ 35`, the proved inequality `35*r < 2^260`, and limbs with magnitude below `2^62`. Its bound `m ≤ 1024` ensures the limb premise; `Lazy 34 370` meets both bounds. The shift product produces `Lazy 2 32`, the DIF input class. DIF preserves this class until its final short stage, whose outputs are reduced. The byte encoding contract requires reduced inputs.
+
+`FftPairIndex.lean` proves the butterfly index formula and the partition into disjoint pairs. `FftWidePipeline.lean` records completed pairs and the pending product. `FftWideOperands.lean` proves operand reads and output stores; `FftWideRun.lean` proves the generated pipeline preserves this state. `FftWidePair.lean` supplies the per-butterfly arithmetic bounds, and `FftWide.lean` applies them to every output.
+
+`Fft.lean` composes the block pass and wide butterflies. `FftMath.lean` proves the iterative DIT and DIF transforms equal the specification with bit reversal on their input and output respectively. Its induction covers every power-of-two size, including 1; the generated kernel contracts cover sizes 64 through 4096. `RootsValid` uses the specification's primitive-root predicate and powers directly.
+
+`Kernel/Construct.lean` initializes the two FFT tables, shift multipliers and 512 data vectors. `Decode.lean`, `Shift.lean` and `Encode.lean` prove each generated loop, and `Refines.lean` composes them. Rejected decoding retains the raw 256-bit integers, which may exceed the arithmetic bound. The state invariant therefore constrains the data length and immutable tables; the next decode overwrites every data vector before arithmetic. Successful decoding establishes the stronger data representation. Output writes preserve the first 64 cells and serialize the extension into cells 64 through 127.
+
+The scalar and kernel route lemmas preserve the outer extender invariant. The kernel route also preserves all tables, and the scalar route preserves `kernel = none`. Their case split proves the public theorem for construction and repeated calls.
+
+### Verifier interpolation kernel
+
+`InterpolationKernel/Basic.lean` defines the verifier kernel's `StateInvariant`. The inverse FFT satisfies the shared `FftInvariant`, and each shift satisfies `MultiplierRep`. Column, shift and used-flag buffers have fixed lengths. The invariant places no arithmetic condition on stale scratch columns. `Construct.lean` proves these properties from the generated constructor, including canonical shift multipliers for `64⁻¹ * cosetShift(column)⁻ᵏ`. `Roots.lean` establishes `RootsValid` for the 64-point roots and their inverses.
+
+`Check.lean` equates the generated canonical masks with specification decoding for every cell byte string. `CellsRep` connects accepted cells with their 64 field elements. `Fr8Splat.lean` proves the broadcast weight representation, including the factor of 16 converting blst's Montgomery radix to the kernel's. `AddCell.lean` proves weighted accumulation: a column's first raw product is normalized before it is stored, and later additions restore the reduced range. `Aggregate.lean` and `Accumulate.lean` connect the generated used flags and columns to the scalar aggregation model. Clearing the flags makes stale columns irrelevant; each first use overwrites its column with bounded data.
+
+`Column.lean` reuses the extender's `dit_refinement` and lazy range bounds at size 64. It proves the DIT on bit-reversed column data, normalization, multiplication by the column's shift factors and addition into reduced sums. `Store.lean` proves canonical coefficient bytes and their scalar decoding. `Interpolate.lean` composes these operations into exact equality with `Model.columnRli`, preserving the kernel invariant. The interpolation-commitment and pairing proofs compose these results with `verify.Lincomb` for both MSM dispatch routes. The kernel uses the existing `BlstCorrect.fr_u64`, `fr_mul` and `fr_bytes` laws; it adds no external contract or serialization premise.
+
 For source changes, follow the [KZG maintenance guide](lean/README.md#kzg-maintenance). It covers both types, including the verifier's [constructor panic message](lean/README.md#constructor-panic-message).
+
+### Verifier MSM8 kernel
+
+`lean/LeanBlsSimd/Msm8/` proves the verifier's eight-lane G1 linear combination. It is a verifier internal, alongside the interpolation kernel. The extender uses the shared Fr FFT proofs but does not call MSM8.
+
+The refinements cover generated word arithmetic, scalar conversion, point stores, signed digits, buckets, affine batches and complete projective sums. They establish successful `Result` execution under internal representation and size invariants. The group proofs connect these results to the specification's weighted sum.
+
+`PlainWords.lean` converts reduced blst scalars to ordinary little-endian words, preserving their values and length. Multiplication by 16 cancels blst's Montgomery factor `2^256` through the Fr kernel's factor `2^260`. Finite filtering removes paired infinity inputs without changing the sum. `G1AffineValid` supplies subgroup validity; reduced scalar encodings supply values below `2^255`.
+
+`Glv.lean` checks the generated constants and carry arithmetic against `Model/Glv.lean`. The constants satisfy `λ = z² − 1` and `r = λ² + λ + 1`. The model uses the exact fixed-point reciprocal `Z2_OVER_R` and threshold `HALF_R_UP`. For every `0 ≤ k < 2^255`, the signed outputs satisfy `k₁ + λ*k₂ ≡ k (mod r)` and `|k₁|, |k₂| < 2^127`. `GlvGroup.lean` proves `σ(P) = [λ]P` for subgroup points, using the existing Scott completeness theorem. The split therefore preserves each point's scalar contribution.
+
+`Store*.lean`, `Conversion.lean` and `AffineInput.lean` connect generated loads and writes to represented points. Point `i` occupies rows `2*i` and `2*i+1`, holding its x and y coordinates as eight radix-`2^52` words. Conversion changes the coordinate Montgomery factor from blst's `2^384` to Fp8's `2^416`. The proof checks the literal `TWO_POW_448_MOD_P = 2^448 mod p`. The first `n` entries hold signed original points; the next `n` hold signed endomorphism images. A reference uses its low 31 bits as the point index and bit 31 as a negation flag. Stores write lanes in order, so repeated indices retain the last write. Padding repeats the final job and preserves its result.
+
+`SignedDigits.lean`, `Buckets.lean` and `Fill.lean` prove the generated signed-digit trace and exact ordered bucket contents. The selected widths are 4, 6 and 8 bits, with 32, 22 and 16 windows respectively. These windows cover the carry above a 127-bit half. A digit exactly at the half-window threshold remains positive. Queue reductions preserve each bucket's group sum while allocating or reusing independent output slots.
+
+Affine batches accumulate nonzero x-coordinate differences into inversion chains. `Inversion.lean` proves that the generated exponent chain, including its final multiplication, computes exponent `p−2`. Batch invariants establish nonzero factors before inversion and justify unwinding the product. Equal x-coordinates reject a batch before inversion. The caller refills the original buckets and sums them using complete projective additions. Those additions cover infinity, doubling and cancellation.
+
+`WindowSum.lean`, `Flatten.lean` and `Lanes.lean` recover the bucket and window weights. Bucket `b` contributes weight `b+1`; window `j` contributes `2^(bits*j)`. `Refines.lean` composes the generated chunk loop without an input-length bound. `OutputBridge.lean` connects the resulting lane to the generated `lane_zero_in_blst` conversion and the specification's `G1.msm`. Its conclusion is `G1Rep`, preserving infinity and affine coordinates without requiring identical Jacobian representatives.
+
+`Bounds.lean` proves the counter bounds for a nonempty chunk with `n ≤ 2^24` finite points. There are at most `2*n` references per bucket and `2*n*windows` references overall. The store reserves `2*n + n*windows` points. The requested doubled row count fits 32 bits; allocated indices and the sentinel fit below the sign bit. Padding adds at most 15 entries. These are internal chunk bounds, not an additional public input-length premise.
+
+The generated outer MSM loop processes chunks of at most `CHUNK = 4096` inputs. It combines their results with complete G1x8 additions. The constant satisfies `CHUNK ≤ 2^24`, establishing the finite-point bounds used by `Bounds.lean`. Group-sum composition covers every representable aligned input length; the public theorem adds no chunk-size premise. Empty inputs and chunks containing only infinity points contribute the identity. Chunking does not introduce a blst fallback.
 
 ### Field and point representations
 
@@ -537,10 +703,24 @@ Paths below are relative to `lean/controls/`.
 | `KzgExternalBoundary.lean` | Mutations violate each of the fourteen blst laws; `wrongScalarG1_rejected` proves `¬ G1DecoderCorrect wrongScalarG1` using the real generated decoder with SIMD off and a scalar observation that returns `some` infinity for invalid bytes requiring `none`. |
 | `KzgMathematical.lean` | Bit reversal, inverse coset-shift direction and inverse FFT scaling. |
 | `KzgSetupBoundary.lean` | Replacing embedded G2 point 64 with infinity violates the setup match. |
+| `InterpolationKernel.lean` | Wrong inverse-size shift factors or used-column flags violate the generated contracts. Unnormalized first products violate bounded DIT input. Noncanonical cells are rejected. Canonical acceptance and normalization supply positive controls. |
+| `Msm8.lean` | Wrong bucket indices, digit signs, GLV constants and window weights violate their laws. Skipping equal-x rejection or the inverse chain's final multiplication fails concrete controls. Queue aliasing, allocation, repeated-job padding and scalar-word length have positive and negative cases. |
 | `ExtenderSpecInstance.lean` | The spec dictionary instantiates construction, canonicality, exact output bytes, specification errors and unchanged output on rejection. |
 | `ExtenderExternalBoundary.lean` | Wrong field bytes and failed serialization violate `FrToBytesCorrect` while preserving the reused `BlstCorrect` contract. |
 | `ExtenderMathematical.lean` | Extender input/output bit reversal, coset shifting, forward FFT direction and inverse FFT scaling at the blob size. |
 | `ExtenderLayout.lean` | First-half copying, the extension's cell-64 offset, rejection of noncanonical blobs and output preservation on rejection; generated decoding rejects an all-`ff` blob. |
+| `ExtenderKernelBoundary.lean` | The generated range mask rejects exact raw out-of-range values; permutation uses bit 3 and ignores higher bits; multiplier construction requires its factor of 16. The kernel route works with a dictionary whose scalar serialization fails. |
+| `ExtenderKernelBytes.lean` | Omitting arithmetic reduction or output canonicalization, reversing byte order, omitting the cell-64 offset, and clearing the preserved first half each violate the generated contracts. |
+| `Fr8Swap.lean` | A wrong byte-swap mask changes the generated vector result. |
+| `Fr8Words.lean` | A wrong unpacking shift or decode/encode block-permutation index changes the generated result; the controls pin the correct expressions to the extraction. |
+| `ExtenderKernelFft.lean` | Swapped short-stage twiddles and a shifted wide-table read violate the generated table invariant. Semantic controls distinguish skipping a nonunit short-stage product, omitting either block transpose, and substituting inverse DIF/forward DIT without the required bit reversals. |
+| `ExtenderKernelTranspose.lean` | A copied generated transpose network is pinned by definitional equality; changing its first shuffle index changes an observed output lane. |
+| `ExtenderKernelShortStage.lean` | A copied generated DIT short-stage pipeline body is pinned by definitional equality. A wrong twiddle offset changes the pending product. |
+| `SignedLimbs.lean` | Raw addition needs the stated limb bound. Replacing the arithmetic carry shift with a logical shift changes the represented integer of a fixture with a negative limb. |
+| `ExtenderKernelLazy.lean` | Omitting the final reduction from generated addition leaves `2r` outside the reduced range. A noncanonical unit multiplier makes the raw product exceed `2r`. Numeric examples check headroom for `Lazy 34 370`; a boundary check rejects `36r < 2^260`. |
+| `ExtenderKernelPipeline.lean` | A copied `first_of_pair` pins to the extraction. A wrong stride aliases consecutive butterflies and changes their operand indices. |
+| `ExtenderKernelRange.lean` | At `h = 1`, valid short-stage inputs at `2r−1` produce `4r−2`, outside `LazyRep (4*h−1)`. |
+| `LeftShiftIntrinsic.lean` | Left shifts preserve lanes, discard overflow, and return zero for counts at least 64. Mutations to counts, lane order and overflow handling fail. |
 | `KzgStrictAxioms.lean` | The shared proof, concrete instance and all KZG negative controls use only the three standard axioms. |
 | `KzgSetupAxioms.lean`, `KzgRefinementAxioms.lean`, `KzgRepresentationAxioms.lean`, `KzgSpecBridgeAxioms.lean`, `KzgPolynomialAxioms.lean` | Scoped axiom checks for setup, refinement, representations, spec bridge and interpolation. |
 | `extraction-check.py` | Sixteen fixtures: unchanged output and numeric source-span changes pass; changed setup-row order, an added declaration, late BLS definitions (including attribute-prefixed constants), a wrong `full` count, an extender-body edit, and missing or duplicated verifier/extender entry points are rejected. |

@@ -1,8 +1,11 @@
+import LeanBlsSimd.Kzg.Lincomb
 import LeanBlsSimd.Kzg.Refines.Interpolation
 import LeanBlsSimd.Kzg.SetupValidity
 import LeanBlsSimd.Kzg.Refines.Cosets
 import LeanBlsSimd.Kzg.Refines.Fft
 import LeanBlsSimd.Kzg.InterpolationModel
+import LeanBlsSimd.Kzg.InterpolationIdentity
+import LeanBlsSimd.Kzg.InterpolationKernel.Interpolate
 import EthCryptographySpecs.Proofs.Kzg.Fft
 
 open Aeneas Aeneas.Std Result ControlFlow
@@ -72,14 +75,12 @@ private theorem encoded_scalars_read (coeffs : List Fr) (v : alloc.vec.Vec blst.
     (hv : v.val = coeffs.map frEncode) : (v.val.map frRead).toArray = coeffs.toArray := by
   simp only [hv, List.map_map, Function.comp_def, frRead_frEncode, List.map_id']
 
-theorem setup_lincomb [e : KzgExternals] (h : ExternalsCorrect e)
+private theorem setup_lincomb_inputs
     (s : setup.Setup) (hs : SetupRep s) (coeffs : List Fr) (hcoeffs : coeffs.length = 64)
-    (v : alloc.vec.Vec blst.blst_fr) (hv : v.val = coeffs.map frEncode)
-    (scratch : blst_ops.LincombScratch) :
-    ∃ point scratch',
-      blst_ops.g1_lincomb (alloc.vec.Vec.deref s.g1_monomial) (alloc.vec.Vec.deref v) scratch =
-        ok (point, scratch') ∧
-      G1Rep point (G1.msm (rustG1Bytes.map (fun b => (specPoint b).getD G1.zero)) coeffs.toArray) := by
+    (v : alloc.vec.Vec blst.blst_fr) (hv : v.val = coeffs.map frEncode) :
+    (alloc.vec.Vec.deref s.g1_monomial).val.length = (alloc.vec.Vec.deref v).val.length ∧
+      (∀ p ∈ (alloc.vec.Vec.deref s.g1_monomial).val, G1AffineValid p) ∧
+      (∀ x ∈ (alloc.vec.Vec.deref v).val, FrReduced x) := by
   have hsize : (alloc.vec.Vec.deref s.g1_monomial).val.length =
       (alloc.vec.Vec.deref v).val.length := by
     simp only [alloc.vec.Vec.deref, setup_points_size s hs, hv, List.length_map, hcoeffs]
@@ -88,11 +89,55 @@ theorem setup_lincomb [e : KzgExternals] (h : ExternalsCorrect e)
     simp only [alloc.vec.Vec.deref, hv] at hx
     obtain ⟨f, _, rfl⟩ := List.mem_map.mp hx
     exact frEncode_reduced f
+  exact ⟨hsize, setup_points_valid s hs, hscalars⟩
+
+theorem setup_lincomb [e : KzgExternals] (h : ExternalsCorrect e)
+    (s : setup.Setup) (hs : SetupRep s) (coeffs : List Fr) (hcoeffs : coeffs.length = 64)
+    (v : alloc.vec.Vec blst.blst_fr) (hv : v.val = coeffs.map frEncode)
+    (scratch : blst_ops.LincombScratch) :
+    ∃ point scratch',
+      blst_ops.g1_lincomb (alloc.vec.Vec.deref s.g1_monomial) (alloc.vec.Vec.deref v) scratch =
+        ok (point, scratch') ∧
+      G1Rep point (G1.msm (rustG1Bytes.map (fun b => (specPoint b).getD G1.zero)) coeffs.toArray) := by
+  obtain ⟨hsize, hpoints, hscalars⟩ := setup_lincomb_inputs s hs coeffs hcoeffs v hv
   obtain ⟨point, scratch', hcall, hrep⟩ := h.blst.lincomb
     (alloc.vec.Vec.deref s.g1_monomial) (alloc.vec.Vec.deref v) scratch hsize
-    (setup_points_valid s hs) hscalars
+    hpoints hscalars
   refine ⟨point, scratch', hcall, ?_⟩
   simpa only [alloc.vec.Vec.deref, setup_points_read s hs, encoded_scalars_read coeffs v hv] using hrep
+
+
+theorem setup_verify_lincomb [e : KzgExternals] (h : ExternalsCorrect e)
+    (s : setup.Setup) (hs : SetupRep s) (coeffs : List Fr) (hcoeffs : coeffs.length = 64)
+    (v : alloc.vec.Vec blst.blst_fr) (hv : v.val = coeffs.map frEncode)
+    (scratch : verify.Lincomb) :
+    ∃ point scratch',
+      scratch.sum (alloc.vec.Vec.deref s.g1_monomial) (alloc.vec.Vec.deref v) =
+        ok (point, scratch') ∧
+      G1Rep point (G1.msm (rustG1Bytes.map (fun b => (specPoint b).getD G1.zero)) coeffs.toArray) := by
+  obtain ⟨hsize, hpoints, hscalars⟩ := setup_lincomb_inputs s hs coeffs hcoeffs v hv
+  obtain ⟨point, scratch', hcall, hrep⟩ := verify_lincomb_raw_refinement h.blst scratch
+    (alloc.vec.Vec.deref s.g1_monomial) (alloc.vec.Vec.deref v) hsize
+    hpoints hscalars
+  refine ⟨point, scratch', hcall, ?_⟩
+  simpa only [alloc.vec.Vec.deref, setup_points_read s hs, encoded_scalars_read coeffs v hv] using hrep
+
+
+theorem setup_verify_lincomb_kernel [e : KzgExternals]
+    (s : setup.Setup) (hs : SetupRep s) (coeffs : List Fr) (hcoeffs : coeffs.length = 64)
+    (v : alloc.vec.Vec blst.blst_fr) (hv : v.val = coeffs.map frEncode)
+    (scratch : verify.Lincomb) (state : msm8.Msm8) (hroute : scratch.msm = some state) :
+    ∃ point scratch',
+      scratch.sum (alloc.vec.Vec.deref s.g1_monomial) (alloc.vec.Vec.deref v) =
+        ok (point, scratch') ∧
+      G1Rep point (G1.msm (rustG1Bytes.map (fun b => (specPoint b).getD G1.zero)) coeffs.toArray) ∧ scratch'.msm.isSome = true := by
+  obtain ⟨hsize, hpoints, hscalars⟩ := setup_lincomb_inputs s hs coeffs hcoeffs v hv
+  obtain ⟨point, scratch', hcall, hnext, hrep⟩ := verify_lincomb_raw_kernel_refinement scratch state hroute
+    (alloc.vec.Vec.deref s.g1_monomial) (alloc.vec.Vec.deref v) hsize
+    hpoints hscalars
+  refine ⟨point, scratch', hcall, ?_, ?_⟩
+  · simpa only [alloc.vec.Vec.deref, setup_points_read s hs, encoded_scalars_read coeffs v hv] using hrep
+  · exact hnext
 
 
 private theorem inverseFft_eq (values : _root_.Array Fr) (hvalues : values.size = 64) :
@@ -262,6 +307,7 @@ private theorem resize_nil {α : Type} (n : Nat) (x : α) :
 
 private theorem interpolation_commitment_execution [e : KzgExternals] (h : ExternalsCorrect e)
     (v : verify.CellBatchVerifier) (hv : StateInvariant v) (indices : Slice U64)
+    (cells : Slice (Array U8 2048#usize)) (hkernel : v.kernel = none)
     (evals : _root_.Array CosetEvals) (powers : _root_.Array Fr)
     (hs : Model.RliInputs (indices.val.map (·.val)).toArray evals powers)
     (he : v.evaluations.val = (evals.toList.flatMap _root_.Array.toList).map frEncode)
@@ -269,7 +315,7 @@ private theorem interpolation_commitment_execution [e : KzgExternals] (h : Exter
     let ag := aggregateColumns (evals.toList.flatMap _root_.Array.toList) powers.toList
       (indices.val.map (·.val)) (List.replicate 8192 Fr.zero) (List.replicate 128 false)
     let coefficients := (List.range 128).foldl (totalStep ag.1 ag.2) (List.replicate 64 Fr.zero)
-    ∃ point next, verify.CellBatchVerifier.interpolation_commitment v indices = ok (point, next) ∧
+    ∃ point next, verify.CellBatchVerifier.interpolation_commitment v indices cells = ok (point, next) ∧
       StateInvariant next ∧
       G1Rep point (G1.msm (rustG1Bytes.map (fun b => (specPoint b).getD G1.zero)) coefficients.toArray) := by
   dsimp only
@@ -293,7 +339,7 @@ private theorem interpolation_commitment_execution [e : KzgExternals] (h : Exter
     simpa only [List.size_toArray, List.length_map] using hs.1.symm
   have hpowerCount : powers.toList.length = indices.val.length := by
     simpa only [List.size_toArray, List.length_map, _root_.Array.length_toList] using hs.2.1.symm
-  have hevals : evaluations.length = indices.val.length*64 := by
+  have hevals : evaluations.length = indices.val.length * 64 := by
     simpa only [evaluations, _root_.Array.length_toList, hcount] using flat_length evals.toList hrows
   have hindices : ∀ i ∈ indices.val, i.val < 128 := by
     intro i hi
@@ -322,14 +368,14 @@ private theorem interpolation_commitment_execution [e : KzgExternals] (h : Exter
   obtain ⟨coeff, hcoeff, hvcoeff⟩ := resize_fields v.coefficients FIELD_ELEMENTS_PER_CELL zero
   have hcoeffLen : coeff.val.length = 64 := by simp [hvcoeff, FIELD_ELEMENTS_PER_CELL]
   obtain ⟨finalCol, finalCoeff, result, htransform, _, _, hresult⟩ := transform_columns_loop h
-    v.cosets hv.2 ag.1 (List.replicate 64 Fr.zero) ag.2 aggColumns aggFlags col coeff total
+    v.cosets hv.2.1 ag.1 (List.replicate 64 Fr.zero) ag.2 aggColumns aggFlags col coeff total
     haggColumns' haggFlags' hvtotal' hagLen.1 hagLen.2 (by simp) hcolLen hcoeffLen
     { start := 0#usize, «end» := 128#usize } (by simp) (by simp)
   let coefficients := (List.range 128).foldl (totalStep ag.1 ag.2) (List.replicate 64 Fr.zero)
   have hresult' : result.val = coefficients.map frEncode := by
     simpa only [UScalar.ofNatCore_val_eq, List.drop_zero, coefficients] using hresult
   have hresultLen : coefficients.length = 64 := totals_length _ _ _ _ (by simp)
-  obtain ⟨point, scratch, hlincomb, hpoint⟩ := setup_lincomb h v.setup hv.1 coefficients hresultLen
+  obtain ⟨point, scratch, hlincomb, hpoint⟩ := setup_verify_lincomb h v.setup hv.1 coefficients hresultLen
     result hresult' v.lincomb
   let next := { v with
     cosets := v.cosets, columns := aggColumns, column_used := aggFlags,
@@ -337,11 +383,11 @@ private theorem interpolation_commitment_execution [e : KzgExternals] (h : Exter
   have hmul : 128#usize * FIELD_ELEMENTS_PER_CELL = ok 8192#usize := by
     simp only [FIELD_ELEMENTS_PER_CELL]
     show UScalar.tryMk .Usize 8192 = _
-    have hb : 8192 < 2^System.Platform.numBits := by
+    have hb : 8192 < 2 ^ System.Platform.numBits := by
       rcases System.Platform.numBits_eq with hh | hh <;> simp [hh]
     simp [UScalar.tryMk, UScalar.tryMkOpt, Result.ofOption, hb]
   refine ⟨point, next, ?_, hv, hpoint⟩
-  simp only [verify.CellBatchVerifier.interpolation_commitment, hzero, bind_tc_ok,
+  simp only [verify.CellBatchVerifier.interpolation_commitment, hzero, hkernel, bind_tc_ok,
     Function.uncurry_apply_pair, hcolumns0, cells_per_ext_blob_eq, hmul, hcolumns,
     hflags0, hflags, haggregate, htotal0, htotal, hcol, hcoeff, htransform, hlincomb, next]
 
@@ -351,20 +397,48 @@ namespace LeanBlsSimd.Kzg
 
 theorem interpolation_commitment_refinement [e : KzgExternals] (h : ExternalsCorrect e)
     (v : verify.CellBatchVerifier) (hv : StateInvariant v) (indices : Slice U64)
+    (cells : Slice (Array U8 2048#usize))
     (evals : _root_.Array CosetEvals) (powers : _root_.Array Fr)
     (hs : Model.RliInputs (indices.val.map (·.val)).toArray evals powers)
     (_hb : indices.val.length * 2048 ≤ Isize.max.toNat)
-    (he : v.evaluations.val = (evals.toList.flatMap _root_.Array.toList).map frEncode)
+    (hcell : InterpolationKernel.CellsRep cells evals)
+    (he : v.kernel = none → v.evaluations.val = (evals.toList.flatMap _root_.Array.toList).map frEncode)
     (hp : v.r_powers.val = powers.toList.map frEncode) :
-    ∃ point next, verify.CellBatchVerifier.interpolation_commitment v indices = ok (point, next) ∧
+    ∃ point next, verify.CellBatchVerifier.interpolation_commitment v indices cells = ok (point, next) ∧
       StateInvariant next ∧
       G1Rep point (G1.msm
         (rustG1Bytes.map (fun b => (specPoint b).getD G1.zero))
         (Model.columnRli (indices.val.map (·.val)).toArray evals powers)) := by
-  obtain ⟨point, next, hcall, hnext, hrep⟩ :=
-    Interpolation.interpolation_commitment_execution h v hv indices evals powers hs he hp
-  refine ⟨point, next, hcall, hnext, ?_⟩
-  have hmodel := Interpolation.aggregate_columnRli (indices.val.map (·.val)).toArray evals powers hs
-  simpa only [hmodel] using hrep
+  cases hkernel : v.kernel with
+  | none =>
+    obtain ⟨point, next, hcall, hnext, hrep⟩ :=
+      Interpolation.interpolation_commitment_execution h v hv indices cells hkernel evals powers hs (he hkernel) hp
+    refine ⟨point, next, hcall, hnext, ?_⟩
+    have hmodel := Interpolation.aggregate_columnRli (indices.val.map (·.val)).toArray evals powers hs
+    simpa only [hmodel] using hrep
+  | some kernel =>
+    have hk : InterpolationKernel.StateInvariant kernel := by simpa only [hkernel] using hv.2.2
+    have hzero : blst_ops.fr_from_u64 0#u64 = ok (frEncode Fr.zero) := h.blst.fr_u64 0#u64
+    obtain ⟨buffer, hbuffer, hbufferVal⟩ := Interpolation.resize_fields
+      v.interpolation FIELD_ELEMENTS_PER_CELL (frEncode Fr.zero)
+    have hbufferLen : buffer.val.length = 64 := by
+      simp [hbufferVal, FIELD_ELEMENTS_PER_CELL]
+    obtain ⟨kernel', out, hcall, hkernel', hout⟩ := InterpolationKernel.interpolate_refinement h.blst
+      kernel hk cells indices (alloc.vec.Vec.deref v.r_powers) (alloc.vec.Vec.deref buffer)
+      evals powers hcell hs hp hbufferLen
+    let result : alloc.vec.Vec blst.blst_fr := ⟨out.val, out.property⟩
+    let coefficients := (Model.columnRli (indices.val.map (·.val)).toArray evals powers).toList
+    have hcoefficients : coefficients.length = 64 := by
+      simp only [coefficients, _root_.Array.length_toList, columnRli_size]
+    obtain ⟨point, scratch, hlincomb, hpoint⟩ := Interpolation.setup_verify_lincomb h v.setup hv.1
+      coefficients hcoefficients result hout v.lincomb
+    let next := { v with interpolation := result, lincomb := scratch, kernel := some kernel' }
+    simp only [alloc.vec.Vec.deref, result] at hcall hlincomb
+    refine ⟨point, next, ?_, ⟨hv.1, hv.2.1, hkernel'⟩, ?_⟩
+    · simp only [verify.CellBatchVerifier.interpolation_commitment, hzero, hkernel, bind_tc_ok,
+        hbuffer, alloc.vec.Vec.deref_mut, alloc.vec.Vec.deref, lift, hcall,
+        Function.uncurry_apply_pair, hlincomb,
+        next, result]
+    · simpa only [coefficients, _root_.Array.toArray_toList] using hpoint
 
 end LeanBlsSimd.Kzg

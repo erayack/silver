@@ -1,5 +1,6 @@
 import LeanBlsSimd.Constants
 import LeanBlsSimd.Model.Intrinsics
+import LeanBlsSimd.Model.SignedLimbs
 
 /-!
 # `fp8.rs`
@@ -200,9 +201,28 @@ def square (self : Fp8) : Fp8 := self.mul self
 
 def from_plain (values : Vector Limbs 8) : Fp8 := (load values).mul (splat_limbs (.ofList R2_MOD_P))
 
-def canonical (self : Fp8) : Fp8 :=
-  let (d, borrow) := Simd.sub_limbs self.limbs (Simd.splat_limbs (.ofList P))
+def cond_sub (self c : Fp8) : Fp8 :=
+  let (d, borrow) := Simd.sub_limbs self.limbs c.limbs
   ⟨Simd.blend (Simd.borrowed borrow) d self.limbs⟩
+
+def canonical (self : Fp8) : Fp8 := self.cond_sub (splat_limbs (.ofList P))
+
+def multipleStep (c : ℕ) (s : Vector M512 LIMBS × ℕ) (j : Fin LIMBS) :=
+  let n := (Limbs.ofList P)[j].toNat * c + s.2
+  (s.1.set j (Simd.splat (UInt64.ofNat n &&& .ofNat MASK52)), n / 2 ^ 52)
+
+def multiple_of_p (c : UInt64) : Fp8 :=
+  ⟨((List.finRange LIMBS).foldl (multipleStep c.toNat) (.replicate _ Simd.zero, 0)).1⟩
+
+def add_raw (self rhs : Fp8) : Fp8 :=
+  ⟨.ofFn fun j => _mm512_add_epi64 self.limbs[j] rhs.limbs[j]⟩
+
+def sub_raw (self rhs offset : Fp8) : Fp8 :=
+  ⟨.ofFn fun j => _mm512_sub_epi64
+    (_mm512_add_epi64 self.limbs[j] offset.limbs[j]) rhs.limbs[j]⟩
+
+def normalise (self : Fp8) : Fp8 :=
+  ofLanes (.ofFn fun l => SignedLimbs.normalise (self.lane l))
 
 def to_plain (self : Fp8) : Vector Limbs 8 :=
   (self.mul (splat_limbs (.ofList ONE_PLAIN))).canonical.store
@@ -213,17 +233,15 @@ def to_blst_limbs (self : Fp8) : Vector (Vector UInt64 6) 8 :=
 
 def add (self rhs : Fp8) : Fp8 :=
   let s := Simd.add_limbs self.limbs rhs.limbs
-  let (d, borrow) := Simd.sub_limbs s Simd.two_p
+  let (d, borrow) := Simd.sub_limbs s (multiple_of_p 2).limbs
   ⟨Simd.blend (Simd.borrowed borrow) d s⟩
 
 def sub (self rhs : Fp8) : Fp8 :=
   let (d, borrow) := Simd.sub_limbs self.limbs rhs.limbs
-  let wrapped := Simd.add_limbs d Simd.two_p
+  let wrapped := Simd.add_limbs d (multiple_of_p 2).limbs
   ⟨Simd.blend (Simd.borrowed borrow) d wrapped⟩
 
 def neg (self : Fp8) : Fp8 := Fp8.zero.sub self
-
-def double (self : Fp8) : Fp8 := self.add self
 
 def half (self : Fp8) : Fp8 := self.mul (splat_limbs (.ofList HALF_MONT))
 
@@ -264,3 +282,13 @@ def is_larger_root_mask (self : Fp8) : Mmask8 :=
 end Fp8
 
 end LeanBlsSimd
+
+namespace LeanBlsSimd.Fp8
+
+def inverse (self : Fp8) : Fp8 :=
+  self.pow_p_minus_3_over_4.square.square.mul self
+
+def permute (self : Fp8) (indices : Vector Int64 8) : Fp8 :=
+  ⟨self.limbs.map fun row => _mm512_permutex2var_epi64 row (indices.map Int64.toUInt64) row⟩
+
+end LeanBlsSimd.Fp8

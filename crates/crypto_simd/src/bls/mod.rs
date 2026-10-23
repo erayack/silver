@@ -37,6 +37,9 @@ pub mod g1x8;
 #[cfg(target_arch = "x86_64")]
 #[allow(clippy::missing_safety_doc)]
 pub mod g2x8;
+#[cfg(target_arch = "x86_64")]
+#[allow(clippy::missing_safety_doc)]
+pub mod msm8;
 
 #[cfg(target_arch = "x86_64")]
 use std::arch::x86_64::__mmask8;
@@ -45,6 +48,8 @@ use blst::{
     BLST_ERROR, blst_p1_affine_in_g1, blst_p1_uncompress, blst_p2_affine_in_g2, blst_p2_uncompress,
 };
 pub use blst::{blst_p1_affine, blst_p2_affine};
+
+use crate::simd_available;
 
 pub const COMPRESSED_LEN: usize = 48;
 pub const G2_COMPRESSED_LEN: usize = 96;
@@ -59,20 +64,6 @@ const MIN_KERNEL_LANES: usize = 3;
 pub struct Membership {
     pub members: __mmask8,
     pub undecided: __mmask8,
-}
-
-/// Built without the `simd` feature, every point goes to blst, as on a CPU
-/// without the instructions.
-#[cfg(target_arch = "x86_64")]
-pub fn simd_available() -> bool {
-    cfg!(feature = "simd") &&
-        is_x86_feature_detected!("avx512f") &&
-        is_x86_feature_detected!("avx512ifma")
-}
-
-#[cfg(not(target_arch = "x86_64"))]
-pub fn simd_available() -> bool {
-    false
 }
 
 /// `Some` iff blst accepts the encoding as a point of G1.

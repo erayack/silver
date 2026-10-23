@@ -1,0 +1,94 @@
+import LeanBlsSimd.Kzg.Externals
+import LeanBlsSimd.Kzg.Extender.Model
+import LeanBlsSimd.Model.SignedLimbs
+
+open Aeneas Aeneas.Std Result
+open EthCryptographySpecs Bls Kzg
+open silver_crypto_simd silver_crypto_simd.kzg
+open scoped EthCryptographySpecs.Bls.Fr
+
+attribute [-instance] Lean.Grind.Fin.instHPowFinNatOfNeZero
+attribute [-instance] Lean.Grind.Fin.instPowFinNatOfNeZero
+
+namespace LeanBlsSimd.Kzg.Extender.Kernel
+
+def laneNat (x : fr8.Fr8) (lane : Fin 8) : Nat :=
+  ((List.finRange 5).map fun j =>
+    (x.val[j.val]!)[lane].toNat * 2 ^ (52 * j.val)).sum
+
+def Normalized (x : fr8.Fr8) : Prop :=
+  ∀ (j : Fin 5) (lane : Fin 8), (x.val[j.val]!)[lane].toNat < 2 ^ 52
+
+def Bounded (x : fr8.Fr8) : Prop :=
+  Normalized x ∧ ∀ lane, laneNat x lane < 2 * Fr.modulus
+
+def laneValue (x : fr8.Fr8) (lane : Fin 8) : Fr := Fr.ofNat (laneNat x lane)
+
+def Represents (x : fr8.Fr8) (values : Fin 8 → Fr) : Prop :=
+  Bounded x ∧ ∀ lane, laneValue x lane = values lane
+
+def laneInt (x : fr8.Fr8) (lane : Fin 8) : ℤ :=
+  ∑ j : Fin 5, SignedLimbs.limb (x.val[j.val]!)[lane] * (2 : ℤ) ^ (52 * j.val)
+
+def Lazy (k m : Nat) (x : fr8.Fr8) : Prop :=
+  ∀ lane, 0 ≤ laneInt x lane ∧ laneInt x lane < (k : ℤ) * Fr.modulus ∧
+    ∀ j : Fin 5, |SignedLimbs.limb (x.val[j.val]!)[lane]| < (m : ℤ) * 2 ^ 52
+
+def lazyLaneValue (x : fr8.Fr8) (lane : Fin 8) : Fr := laneInt x lane
+
+def LazyRep (k m : Nat) (x : fr8.Fr8) (values : Fin 8 → Fr) : Prop :=
+  Lazy k m x ∧ ∀ lane, lazyLaneValue x lane = values lane
+
+/-- Canonical Montgomery constants carry R = 2^260; data lanes represent plain integers. -/
+def MultiplierRep (x : fr8.Fr8) (values : Fin 8 → Fr) : Prop :=
+  Represents x (fun lane => values lane * Fr.ofNat (2 ^ 260)) ∧
+    ∀ lane, laneNat x lane < Fr.modulus
+
+def DataRep (data : Slice fr8.Fr8) (values : _root_.Array Fr) : Prop :=
+  values.size = 8 * data.val.length ∧
+    ∀ v : Fin data.val.length,
+      Represents data.val[v.val] (fun lane => values[8 * v.val + lane.val]!)
+
+def LazyDataRep (k m : Nat) (data : Slice fr8.Fr8) (values : _root_.Array Fr) : Prop :=
+  values.size = 8 * data.val.length ∧
+    ∀ v : Fin data.val.length,
+      LazyRep k m data.val[v.val] (fun lane => values[8 * v.val + lane.val]!)
+
+def TransformSize (n : Nat) : Prop :=
+  ∃ logSize : Nat, 6 ≤ logSize ∧ logSize ≤ 12 ∧ n = 2 ^ logSize
+
+def sampleRoots (roots : _root_.Array Fr) (n : Nat) : _root_.Array Fr :=
+  _root_.Array.ofFn (n := n) fun i => roots[i.val * (roots.size / n)]!
+
+def RootsValid (roots : _root_.Array Fr) : Prop :=
+  ∃ (omega : Fr) (k : Nat), roots.size = 2 ^ k ∧ IsPrimitiveRoot omega (2 ^ k) ∧
+    ∀ i, i < roots.size → roots[i]! = omega ^ i
+
+def FftInvariant (table : fft8.Fft8) (roots : _root_.Array Fr) : Prop :=
+  TransformSize roots.size ∧ table.vectors.val = roots.size / 8 ∧
+  table.wide.val.length = roots.size / 8 - 1 ∧
+  (∀ stage : Nat, 3 ≤ stage → 2 ^ stage < roots.size →
+    ∀ v : Fin (2 ^ stage / 8),
+      MultiplierRep table.wide.val[2 ^ stage / 8 - 1 + v.val]!
+        (fun lane => roots[(8 * v.val + lane.val) * (roots.size / (2 * 2 ^ stage))]!)) ∧
+  table.short.val.length = 7 ∧
+  (∀ h : Nat, h = 1 ∨ h = 2 ∨ h = 4 →
+    ∀ j : Fin h,
+      MultiplierRep table.short.val[h - 1 + j.val]!
+        (fun _ => roots[j.val * (roots.size / (2 * h))]!))
+
+def shiftFactor (i : Nat) : Fr :=
+  (Kzg.Model.roots 13)[i]! * (Fr.ofNat 4096).inverse
+
+/-- Rejected input may leave unbounded data lanes; the next decode overwrites all 512 vectors. -/
+def StateInvariant (kernel : extension_kernel.ExtensionKernel) : Prop :=
+  FftInvariant kernel.inverse (Kzg.Model.inverseRoots (Kzg.Model.roots 12)) ∧
+  FftInvariant kernel.forward (Kzg.Model.roots 12) ∧
+  kernel.shift.val.length = 512 ∧ kernel.data.val.length = 512 ∧
+  ∀ v : Fin 512,
+    MultiplierRep kernel.shift.val[v.val]! (fun lane => shiftFactor (8 * v.val + lane.val))
+
+def SameTables (before after : extension_kernel.ExtensionKernel) : Prop :=
+  after.inverse = before.inverse ∧ after.forward = before.forward ∧ after.shift = before.shift
+
+end LeanBlsSimd.Kzg.Extender.Kernel

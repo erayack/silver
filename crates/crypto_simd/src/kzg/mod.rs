@@ -16,7 +16,15 @@ mod cell_extender;
 mod challenge;
 mod cosets;
 mod domain;
+#[cfg(target_arch = "x86_64")]
+mod extension_kernel;
 mod fft;
+#[cfg(target_arch = "x86_64")]
+mod fft8;
+#[cfg(target_arch = "x86_64")]
+mod fr8;
+#[cfg(target_arch = "x86_64")]
+mod interpolation_kernel;
 mod setup;
 mod trusted_setup;
 mod verify;
@@ -31,6 +39,8 @@ pub const CELLS_PER_EXT_BLOB: usize = 2 * FIELD_ELEMENTS_PER_BLOB / FIELD_ELEMEN
 pub const BYTES_PER_CELL: usize = FIELD_ELEMENTS_PER_CELL * BYTES_PER_FIELD_ELEMENT;
 pub const BYTES_PER_BLOB: usize = FIELD_ELEMENTS_PER_BLOB * BYTES_PER_FIELD_ELEMENT;
 
+#[cfg(all(test, target_arch = "x86_64"))]
+mod kernel_tests;
 #[cfg(all(test, feature = "spec_vectors"))]
 mod spec_vectors;
 #[cfg(test)]
