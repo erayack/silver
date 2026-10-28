@@ -15,7 +15,9 @@ use silver_common::{
     EngineGetPayloadReq, EngineGetPayloadResp, EnginePreparePayloadReq, EnginePreparePayloadResp,
     EngineReq, PayloadFrame, ProduceBlockFailure, ProducedBlock, ProducedEnvelope,
     SidecarBidRequest, SidecarBidResponse, TCacheProducer, TCacheRead, TRead,
-    ssz_hash_gloas::{EMPTY_EXECUTION_REQUESTS, ExecutionRequestsView},
+    ssz_hash_gloas::{
+        EMPTY_EXECUTION_REQUESTS, EMPTY_EXECUTION_REQUESTS_ROOT, ExecutionRequestsView,
+    },
     ssz_view::{
         BEACON_BLOCK_BODY_FIXED, BLOCK_SYNC_AGGREGATE_SIZE, BuilderBidFuluView,
         ExecutionPayloadEnvelopeView, ExecutionPayloadView, SignedBuilderBidFuluView,
@@ -1142,7 +1144,7 @@ impl BeaconStateTile {
             return Err(ProduceBlockFailure::PayloadUnavailable);
         }
         let (parent, _) = self.verified_parent(&proposal)?;
-        let external = self.bid_commitment(&proposal, parent, builder_bids).ok();
+        let external = self.bid_commitment(&proposal, parent, builder_bids);
         let local = local.and_then(|payload| match self.local_commitment(&proposal, payload) {
             Ok(local) => Some(local),
             Err(failure) => {
@@ -1156,13 +1158,8 @@ impl BeaconStateTile {
         });
         let local = local.map(|(bid, _)| bid);
         let candidates = if local_wins { [local, external] } else { [external, local] };
-        let mut failure = ProduceBlockFailure::NoAcceptableBid;
         for commitment in candidates.into_iter().flatten() {
-            match self.build_packed(
-                proposal,
-                commitment.builds_on_full_parent,
-                |tile, operations| tile.build_gloas_block(proposal, &commitment, operations),
-            ) {
+            match self.build_committed(proposal, &commitment) {
                 Ok(block) => return Ok(block),
                 Err(error) => {
                     silver_log::warn!(
@@ -1170,11 +1167,22 @@ impl BeaconStateTile {
                         ?error,
                         "candidate failed block construction"
                     );
-                    failure = error;
                 }
             }
         }
-        Err(failure)
+        silver_log::info!(slot = proposal.slot, "no bid or local payload built; returning empty");
+        let empty = self.empty_commitment(&proposal, parent)?;
+        self.build_committed(proposal, &empty)
+    }
+
+    fn build_committed(
+        &mut self,
+        proposal: Proposal,
+        commitment: &BidCommitment,
+    ) -> Result<ProducedBlock, ProduceBlockFailure> {
+        self.build_packed(proposal, commitment.builds_on_full_parent, |tile, operations| {
+            tile.build_gloas_block(proposal, commitment, operations)
+        })
     }
 
     fn check_slot_proposable(&self, slot: Slot) -> Result<(), ProduceBlockFailure> {
@@ -1244,8 +1252,8 @@ impl BeaconStateTile {
         proposal: &Proposal,
         parent: StateId,
         builder_bids: &[u8],
-    ) -> Result<BidCommitment, ProduceBlockFailure> {
-        let (branch, full) = self.bid_branch(proposal)?;
+    ) -> Option<BidCommitment> {
+        let (branch, full) = self.bid_branch(proposal).ok()?;
         let mut builder: Option<WeighedBid<'_>> = None;
         for bid in BuilderBid::iter(builder_bids) {
             if let Some(bid) = self.weigh_builder_bid(&branch, bid) &&
@@ -1274,29 +1282,23 @@ impl BeaconStateTile {
         let (signed_bid, value, weight, builder_entry) = match (builder, p2p) {
             (Some(bid), _) => (bid.signed_bid.to_vec(), bid.value, bid.weight, Some(bid.entry)),
             (None, Some((bid, signature))) => {
-                // The bid is variable, so the container leads with its offset.
-                let mut signed_bid = ((4 + signature.len()) as u32).to_le_bytes().to_vec();
-                signed_bid.extend_from_slice(signature);
-                bid.write_ssz(&mut signed_bid).expect("writes to a Vec");
+                let mut signed_bid = Vec::new();
+                bid.write_signed_ssz(signature, &mut signed_bid);
                 (signed_bid, u128::from(bid.value), p2p_weight.expect("pooled bid"), None)
             }
             (None, None) => {
                 silver_log::info!(slot = proposal.slot, full, "no admitted bid on the branch");
-                return Err(ProduceBlockFailure::NoAcceptableBid);
+                return None;
             }
         };
-        let parent_requests = if full {
-            self.payload_execution_requests.get(&proposal.parent_root)
-        } else {
-            &EMPTY_EXECUTION_REQUESTS
-        };
+        let parent_requests = self.parent_requests(full, &proposal.parent_root);
         let parent_state = self.state.read_view(parent);
-        Ok(BidCommitment {
+        Some(BidCommitment {
             signed_bid,
             value: wei_from_gwei(value),
             weight,
             local: None,
-            parent_requests: parent_requests.into(),
+            parent_requests,
             builds_on_full_parent: branch.parent_hash ==
                 parent_state.slot.state().latest_execution_payload_bid.block_hash,
             builder_entry,
@@ -1398,26 +1400,66 @@ impl BeaconStateTile {
                 frame.execution_requests,
             ),
         };
-        let mut signed_bid = 100u32.to_le_bytes().to_vec();
-        signed_bid.extend_from_slice(&G2_POINT_AT_INFINITY);
-        bid.write_ssz(&mut signed_bid).expect("writes to a Vec");
-        let parent_requests = if full {
-            self.payload_execution_requests.get(&proposal.parent_root)
+        let commitment = self.self_build_commitment(&bid, full, frame.block_value, Some(payload));
+        Ok((commitment, frame.should_override_builder))
+    }
+
+    /// A self-built bid whose payload is never revealed, so the slot's
+    /// payload is empty. Its `block_hash` is zero, which no parent has.
+    fn empty_commitment(
+        &self,
+        proposal: &Proposal,
+        parent: StateId,
+    ) -> Result<BidCommitment, ProduceBlockFailure> {
+        let (branch, full) = self.bid_branch(proposal)?;
+        let bid = ExecutionPayloadBid {
+            parent_block_hash: branch.parent_hash,
+            parent_block_root: proposal.parent_root,
+            block_hash: [0; 32],
+            prev_randao: self
+                .state
+                .read_view(parent)
+                .randao_mixes
+                .at_epoch(proposal.slot / SLOTS_PER_EPOCH),
+            fee_recipient: [0; 20],
+            gas_limit: 0,
+            builder_index: BUILDER_INDEX_SELF_BUILD,
+            slot: proposal.slot,
+            value: 0,
+            execution_payment: 0,
+            blob_kzg_commitments: Default::default(),
+            execution_requests_root: *EMPTY_EXECUTION_REQUESTS_ROOT,
+        };
+        Ok(self.self_build_commitment(&bid, full, [0; 32], None))
+    }
+
+    fn self_build_commitment(
+        &self,
+        bid: &ExecutionPayloadBid,
+        builds_on_full_parent: bool,
+        value: [u8; 32],
+        local: Option<TCacheRead>,
+    ) -> BidCommitment {
+        let mut signed_bid = Vec::new();
+        bid.write_signed_ssz(&G2_POINT_AT_INFINITY, &mut signed_bid);
+        BidCommitment {
+            signed_bid,
+            value,
+            weight: BidWeight::local(&value),
+            local,
+            parent_requests: self.parent_requests(builds_on_full_parent, &bid.parent_block_root),
+            builds_on_full_parent,
+            builder_entry: None,
+        }
+    }
+
+    fn parent_requests(&self, builds_on_full_parent: bool, parent_root: &B256) -> Box<[u8]> {
+        let requests = if builds_on_full_parent {
+            self.payload_execution_requests.get(parent_root)
         } else {
             &EMPTY_EXECUTION_REQUESTS
         };
-        Ok((
-            BidCommitment {
-                signed_bid,
-                value: frame.block_value,
-                weight: BidWeight::local(&frame.block_value),
-                local: Some(payload),
-                parent_requests: parent_requests.into(),
-                builds_on_full_parent: full,
-                builder_entry: None,
-            },
-            frame.should_override_builder,
-        ))
+        requests.into()
     }
 
     #[timed]

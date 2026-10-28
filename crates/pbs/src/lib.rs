@@ -16,12 +16,16 @@ mod bid;
 mod block_submission;
 mod builder_bids;
 mod builder_config;
+mod builder_pools;
+mod builder_preferences;
 mod header_fetch;
 mod json_bid;
+mod json_payload_bid;
 mod registrations;
 
-pub use builder_bids::BuilderBids;
+pub use builder_bids::{BuilderBids, BuilderEvent};
 pub use builder_config::{BuilderConfig, BuilderEntry};
+pub use builder_preferences::{PreferenceFailures, PreferencesBody};
 
 const CONSENSUS_VERSION: &str = "Eth-Consensus-Version";
 /// The only fork whose bids and blinded blocks this client handles.
@@ -107,8 +111,8 @@ impl PbsClient {
                 tokens,
                 CONNECTION_CAPACITY,
                 1,
-                REQUEST_TIMEOUT,
-            ),
+            )
+            .expect("pbs.endpoint is http://"),
             registry: registry.try_clone().expect("mio Registry::try_clone failed"),
             requests: VecDeque::new(),
             bodies: Vec::new(),
@@ -177,7 +181,8 @@ impl PbsClient {
         }
         let Some(Request { id, body }) = self.requests.front() else { return };
         let registrations = &self.bodies[body.clone()];
-        self.pool.enqueue(*id, &post_registrations(registrations), &self.registry);
+        let post = post_registrations(registrations);
+        self.pool.enqueue(*id, &post, REQUEST_TIMEOUT, &self.registry);
     }
 }
 
