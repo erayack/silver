@@ -13,9 +13,10 @@ use silver_beacon_state_data::{
 use silver_common::{
     BeaconApiRequest, BeaconApiResponse, BeaconStateEvent, BlockSource, BuilderBidsResponse,
     DataColumnsEvent, DataKind, EngineResp, GossipTopic, HeadChange, HeadRoots, NewGossipMsg,
-    Origin, PayloadResolution, PtcObservation, ReplayBlock, RequestId, RpcInbound, RpcResponse,
-    RpcResponseInbound, SidecarBidResponse, SilverSpine, SyncUpdate, TCacheError, TCacheId,
-    TCacheProducer, TCacheRead, TCacheReader, TCacheTable, TProducer, TReadMode, TileId, hex32,
+    Origin, PayloadResolution, PayloadValidationStatus, PtcObservation, ReplayBlock, RequestId,
+    RpcInbound, RpcResponse, RpcResponseInbound, SidecarBidResponse, SilverSpine, SyncNeed,
+    SyncUpdate, TCacheError, TCacheId, TCacheProducer, TCacheRead, TCacheReader, TCacheTable,
+    TProducer, TReadMode, TileId, hex32,
     ssz_view::{STATUS_V2_SIZE, SYNC_COMMITTEE_CONTRIBUTION_SIZE},
     ticker::{MAXIMUM_GOSSIP_CLOCK_DISPARITY, SlotTicker, TickEvent},
 };
@@ -27,7 +28,7 @@ use crate::{
     fork_choice::{ExecutionStatus, FORK_CHOICE_NODES_HINT, ForkChoice},
     ssz_hash, stf,
     tile::{
-        attestation_pool::AttestationPool,
+        attestation_pool::{AttestationPool, UnknownRootVotes},
         attestation_root_memo::AttestationRootMemo,
         bid_pool::BidPool,
         block_production::{BlockProduction, Proposal},
@@ -100,10 +101,7 @@ pub enum Feedback {
         parent_root: B256,
         block_root: B256,
     },
-    RequestEnvelope {
-        block_root: B256,
-        att_slot: Slot,
-    },
+    Request(SyncNeed),
     Ignore,
     AlreadySeen,
     TooOld,
@@ -138,9 +136,7 @@ impl Debug for Feedback {
                 hex32(parent_root),
                 hex32(block_root)
             ),
-            Self::RequestEnvelope { block_root, att_slot } => {
-                write!(f, "RequestEnvelope(0x{}, att_slot={att_slot})", hex32(block_root))
-            }
+            Self::Request(need) => write!(f, "Request({need:?})"),
             Self::BlockKnown(r) => write!(f, "BlockKnown(0x{})", hex32(r)),
         }
     }
@@ -205,6 +201,7 @@ pub struct BeaconStateTile {
     seen_aggregators: SeenValidators,
     seen_aggregates: SeenAggregates,
     attestation_pool: AttestationPool,
+    unknown_root_votes: UnknownRootVotes,
     attestation_root_memo: AttestationRootMemo,
     votes: Votes,
     seen_sync_msgs: [SeenValidators; silver_common::SYNC_COMMITTEE_SUBNETS],
@@ -310,6 +307,7 @@ impl BeaconStateTile {
             seen_aggregators: SeenValidators::new(val_cap),
             seen_aggregates: SeenAggregates::new(),
             attestation_pool: AttestationPool::new(),
+            unknown_root_votes: UnknownRootVotes::new(),
             votes: Votes::new(),
             seen_sync_msgs: std::array::from_fn(|_| SeenValidators::new(val_cap)),
             sync_contribution_pool: SyncContributionPool::new(),
@@ -828,6 +826,7 @@ impl BeaconStateTile {
         // Block `slot` packs slot `slot - 1` member by member; older singles
         // only as their committee's sum.
         self.attestation_pool.collapse_before(floor);
+        self.unknown_root_votes.on_slot(slot);
         self.sync_contribution_pool.prune_before(floor);
         self.payload_attestation_pool.prune_before(floor);
         self.seen_aggregates.prune_before(floor);
@@ -858,11 +857,17 @@ impl BeaconStateTile {
                     StagedVerdict::Kept => {}
                     StagedVerdict::NotStaged => {
                         self.on_payload_verdict(&r.block_root, r.latest_valid_hash, r.status);
+                        if r.status == PayloadValidationStatus::Valid {
+                            self.promote_unknown_root_votes(producers);
+                        }
                     }
                 }
             }
             EngineResp::Fcu(r) => {
                 self.on_payload_verdict(&r.block_root, r.latest_valid_hash, r.status);
+                if r.status == PayloadValidationStatus::Valid {
+                    self.promote_unknown_root_votes(producers);
+                }
             }
             EngineResp::PreparePayload(r) => self.on_payload_prepared(r, producers),
             EngineResp::GetPayload(r) => self.on_payload(r, producers),
@@ -1096,9 +1101,6 @@ impl BeaconStateTile {
         }
     }
 }
-
-#[cfg(feature = "ef_tests")]
-use silver_common::PayloadValidationStatus;
 
 /// EF `fork_choice`/`sync` vector harness API: thin gated wrappers over the
 /// private production methods.
