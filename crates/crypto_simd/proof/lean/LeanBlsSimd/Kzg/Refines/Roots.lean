@@ -1,10 +1,11 @@
+import LeanBlsSimd.Kzg.Fr.Arithmetic
 import LeanBlsSimd.Kzg.Refines.Loop
-import LeanBlsSimd.Kzg.Externals
+import LeanBlsSimd.Kzg.ScalarConstants
 import LeanBlsSimd.Kzg.Model
-import EthCryptographySpecs.Proofs.Bls.Fr
+import EthLib.Cryptography.Proofs.Bls.Fr
 
 open Aeneas Aeneas.Std Result ControlFlow
-open EthCryptographySpecs Bls Kzg
+open EthLib.Cryptography Bls Kzg
 open silver_crypto_simd silver_crypto_simd.kzg silver_crypto_simd.bls
 
 deriving instance DecidableEq for Aeneas.Std.Error
@@ -16,7 +17,7 @@ namespace Refinement
 set_option maxRecDepth 16000
 set_option maxHeartbeats 2000000
 
-private theorem powers_loop [e : KzgExternals] (h : BlstCorrect e)
+private theorem powers_loop
     (root power : Fr) (rs : alloc.vec.Vec blst.blst_fr)
     (iter : core.ops.range.Range Usize)
     (hi : iter.start.val ≤ iter.end.val)
@@ -42,8 +43,8 @@ private theorem powers_loop [e : KzgExternals] (h : BlstCorrect e)
     have hp : alloc.vec.Vec.push rs (frEncode power) = ok rs' := by
       simp [alloc.vec.Vec.push, hlen, rs']
     have hv : rs'.val = rs.val ++ [frEncode power] := rfl
-    have hmul : blst_ops.fr_mul (frEncode power) (frEncode root) =
-        ok (frEncode (power * root)) := h.fr_mul _ _
+    have hmul : fr.fr_mul (frEncode power) (frEncode root) =
+        ok (frEncode (power * root)) := FrScalar.fr_mul_refines _ _
     have hi' : it'.start.val ≤ it'.end.val := by rw [he, hs]; omega
     have hk' : it'.end.val - it'.start.val = k := by rw [he, hs]; omega
     obtain ⟨out, hout, hvout⟩ := ih (power * root) rs' it' hi'
@@ -90,9 +91,9 @@ private theorem primitive_power_step (i : Nat) :
     congr 1
     omega
 
-private theorem primitive_step [e : KzgExternals] (h : BlstCorrect e)
+private theorem primitive_step
     (logOrder : U32) (i : Fin 256) (hi : logOrder.val ≤ i.val) (x : Fr) :
-    domain.primitive_root_loop.body logOrder (frEncode (Fr.ofNat 7))
+    domain.primitive_root_loop.body logOrder
       (frEncode x) (bit32 (i.val + 1)) =
       ok (cont (frEncode (if ((Fr.modulus - 1) / 2^i.val) % 2 = 1
         then x * x * Fr.ofNat 7 else x * x), bit32 i.val)) := by
@@ -102,22 +103,21 @@ private theorem primitive_step [e : KzgExternals] (h : BlstCorrect e)
   have hc : (bit32 (i.val + 1)) > logOrder := by
     simp only [GT.gt, UScalar.lt_equiv, hib]
     omega
-  have he : domain.primitive_root_loop.body logOrder (frEncode (Fr.ofNat 7))
+  have he : domain.primitive_root_loop.body logOrder
       (frEncode x) (bit32 (i.val + 1)) = (do
       let (b, flag) ← primitiveBits (bit32 (i.val + 1))
       ok (cont (frEncode (if flag then x * x * Fr.ofNat 7 else x * x), b))) := by
-    simp only [domain.primitive_root_loop.body, hc, if_true, primitiveBits,
-      blst_ops.fr_mul, h.fr_mul, bind_tc_ok, bind_assoc]
+    simp only [domain.primitive_root_loop.body, primitive_root_of_unity_eq, hc, if_true, primitiveBits,
+      FrScalar.fr_mul_refines, bind_tc_ok, bind_assoc]
     simp only [Function.uncurry_apply_pair, beq_iff_eq, apply_ite]
     congr!
     all_goals split_ifs <;> rfl
   rw [he, primitive_bits]
   simp only [bind_tc_ok, Function.uncurry_apply_pair, decide_eq_true_eq]
 
-private theorem primitive_loop [e : KzgExternals] (h : BlstCorrect e)
+private theorem primitive_loop
     (logOrder : U32) (n : Nat) (hl : logOrder.val ≤ n) (hn : n ≤ 256) :
-    loop (fun (x, b) => domain.primitive_root_loop.body logOrder
-      (frEncode (Fr.ofNat 7)) x b) (frEncode (primitivePower n), bit32 n) =
+    loop (fun (x, b) => domain.primitive_root_loop.body logOrder x b) (frEncode (primitivePower n), bit32 n) =
       ok (frEncode (primitivePower logOrder.val)) := by
   induction n using Nat.strongRecOn with
   | ind n ih =>
@@ -133,7 +133,7 @@ private theorem primitive_loop [e : KzgExternals] (h : BlstCorrect e)
       simp only [he]
     · have hn0 : 0 < n := by omega
       have hn1 : n - 1 < 256 := by omega
-      have hstep := primitive_step h logOrder ⟨n - 1, hn1⟩ (by change logOrder.val ≤ n - 1; omega)
+      have hstep := primitive_step logOrder ⟨n - 1, hn1⟩ (by change logOrder.val ≤ n - 1; omega)
         (primitivePower n)
       have hnEq : n - 1 + 1 = n := by omega
       simp only [hnEq] at hstep
@@ -143,20 +143,18 @@ private theorem primitive_loop [e : KzgExternals] (h : BlstCorrect e)
       simp only [hstep, hp]
       exact ih (n - 1) (by omega) (by omega) (by omega)
 
-theorem primitive_root_refinement_of_blst [e : KzgExternals] (h : BlstCorrect e)
+theorem primitive_root_refinement_of_blst
     (logOrder : U32) (hl : logOrder.val ≤ 256) :
     domain.primitive_root logOrder = ok (frEncode
       (Fr.powNat (Fr.ofNat 7) ((Fr.modulus - 1) / 2^logOrder.val))) := by
   unfold domain.primitive_root domain.primitive_root_loop
-  simp only [domain.PRIMITIVE_ROOT_OF_UNITY, blst_ops.fr_from_u64,
-    h.fr_u64, bind_tc_ok]
+  rw [fr_one_eq]
   have h0 : primitivePower 256 = Fr.ofNat 1 := by
     rw [primitivePower, show (Fr.modulus - 1) / 2^256 = 0 by decide, Fr.powNat_zero]
     rfl
-  change loop (fun (x, b) => domain.primitive_root_loop.body logOrder
-    (frEncode (Fr.ofNat 7)) x b) (frEncode (Fr.ofNat 1), bit32 256) = _
+  change loop (fun (x, b) => domain.primitive_root_loop.body logOrder x b) (frEncode (Fr.ofNat 1), bit32 256) = _
   rw [← h0]
-  exact primitive_loop h logOrder 256 hl (by omega)
+  exact primitive_loop logOrder 256 hl (by omega)
 
 private theorem model_roots (l : Nat) (hl : l ≤ 13) :
     Model.roots l = computePowers (primitivePower l) (2^l) := by
@@ -166,7 +164,7 @@ end Refinement
 
 open Refinement
 
-theorem roots_refinement_of_blst [e : KzgExternals] (h : BlstCorrect e) (logOrder : U32)
+theorem roots_refinement_of_blst (logOrder : U32)
     (hl : logOrder.val ≤ 13) :
     ∃ rs, domain.roots_of_unity logOrder = ok rs ∧
       rs.val = (Model.roots logOrder.val).toList.map frEncode := by
@@ -190,27 +188,27 @@ theorem roots_refinement_of_blst [e : KzgExternals] (h : BlstCorrect e) (logOrde
     simp only [UScalar.ofNatCore_val_eq, one_mul, hv]
     exact Nat.mod_eq_of_lt (by omega)
   have hmax : 2^logOrder.val ≤ Usize.max := by scalar_tac
-  obtain ⟨rs, hr, hval⟩ := powers_loop h (primitivePower logOrder.val) Fr.one
+  obtain ⟨rs, hr, hval⟩ := powers_loop (primitivePower logOrder.val) Fr.one
     (alloc.vec.Vec.with_capacity blst.blst_fr order)
     { start := 0#usize, «end» := order }
     (by simp [hv]) (by simpa [alloc.vec.Vec.with_capacity, hv] using hmax)
   refine ⟨rs, ?_, ?_⟩
   · unfold domain.roots_of_unity
-    rw [hshift, primitive_root_refinement_of_blst h logOrder (by omega)]
-    simp only [blst_ops.fr_from_u64, h.fr_u64, bind_tc_ok]
+    rw [hshift, primitive_root_refinement_of_blst logOrder (by omega)]
+    simp only [fr_one_eq, bind_tc_ok]
     exact hr
   · simpa [alloc.vec.Vec.with_capacity, hv, model_roots _ hl, computePowers] using hval
 
-theorem Refinement.primitive_root_refinement [e : KzgExternals] (h : ExternalsCorrect e)
+theorem Refinement.primitive_root_refinement
     (logOrder : U32) (hl : logOrder.val ≤ 256) :
     domain.primitive_root logOrder = ok (frEncode
       (Fr.powNat (Fr.ofNat 7) ((Fr.modulus - 1) / 2^logOrder.val))) :=
-  Refinement.primitive_root_refinement_of_blst h.blst logOrder hl
+  Refinement.primitive_root_refinement_of_blst logOrder hl
 
-theorem roots_refinement [e : KzgExternals] (h : ExternalsCorrect e) (logOrder : U32)
+theorem roots_refinement (logOrder : U32)
     (hl : logOrder.val = 6 ∨ logOrder.val = 13) :
     ∃ rs, domain.roots_of_unity logOrder = ok rs ∧
       rs.val = (Model.roots logOrder.val).toList.map frEncode :=
-  roots_refinement_of_blst h.blst logOrder (by rcases hl with h | h <;> omega)
+  roots_refinement_of_blst logOrder (by rcases hl with h | h <;> omega)
 
 end LeanBlsSimd.Kzg

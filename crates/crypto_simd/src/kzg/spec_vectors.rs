@@ -9,10 +9,12 @@ use crate::{
     bls::COMPRESSED_LEN,
     kzg::{
         BYTES_PER_BLOB, BYTES_PER_CELL, BYTES_PER_FIELD_ELEMENT, CELLS_PER_EXT_BLOB,
-        CellBatchVerifier, CellExtender, blst_ops::fr_from_bytes, challenge::Preimage,
-        verify::Deduplicated,
+        CellBatchVerifier, CellExtender, blst_ops::fr_from_bytes,
+        challenge::challenge_in_parts_portable, verify::Deduplicated,
     },
 };
+#[cfg(target_arch = "x86_64")]
+use crate::{kzg::challenge::challenge_in_parts, sha_kernel_runs};
 
 fn suite(name: &str) -> Vec<(String, String)> {
     let dir =
@@ -103,9 +105,9 @@ fn verify_cell_kzg_proof_batch_vectors() {
     assert!(unrepresentable < 10, "most vectors reach the verifier: {unrepresentable} did not");
 }
 
+/// In parts, on the SHA extensions and in plain Rust.
 #[test]
 fn challenge_vectors() {
-    let mut preimage = Preimage::new();
     for (name, data) in suite("compute_verify_cell_kzg_proof_batch_challenge") {
         let commitments = fixed::<COMPRESSED_LEN>(hex_items(field(&data, "commitments"))).unwrap();
         let commitment_of_cell: Vec<usize> =
@@ -119,9 +121,28 @@ fn challenge_vectors() {
         let proofs = fixed::<COMPRESSED_LEN>(hex_items(field(&data, "proofs"))).unwrap();
         assert_eq!(cells.len(), cell_indices.len(), "{name}");
         let expected: [u8; 32] = hex_items(field(&data, "output")).remove(0).try_into().unwrap();
-        let got =
-            preimage.challenge(&commitments, &commitment_of_cell, &cell_indices, &cells, &proofs);
-        assert_eq!(Some(got), fr_from_bytes(&expected), "{name}");
+        #[cfg(target_arch = "x86_64")]
+        if sha_kernel_runs() {
+            // SAFETY: `sha_kernel_runs` checked the SHA extensions and SSE4.1.
+            let got = unsafe {
+                challenge_in_parts(
+                    &commitments,
+                    &commitment_of_cell,
+                    &cell_indices,
+                    &cells,
+                    &proofs,
+                )
+            };
+            assert_eq!(Some(got), fr_from_bytes(&expected), "SHA extensions, {name}");
+        }
+        let got = challenge_in_parts_portable(
+            &commitments,
+            &commitment_of_cell,
+            &cell_indices,
+            &cells,
+            &proofs,
+        );
+        assert_eq!(Some(got), fr_from_bytes(&expected), "plain Rust, {name}");
     }
 }
 

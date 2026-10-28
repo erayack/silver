@@ -8,7 +8,7 @@ import LeanBlsSimd.Kzg.Extender.Write
 import LeanBlsSimd.Kzg.Extender.Acceptance
 
 open Aeneas Aeneas.Std Result
-open EthCryptographySpecs Bls Kzg Kzg.BitReversal
+open EthLib.Cryptography Bls Kzg Kzg.BitReversal
 open silver_crypto_simd silver_crypto_simd.kzg
 
 namespace LeanBlsSimd.Kzg.Extender.Kernel
@@ -85,7 +85,7 @@ theorem extend_refinement (kernel : extension_kernel.ExtensionKernel)
 
 /-- The generated Some branch needs no correctness law for any external operation.
 `compute` dispatches on the stored kernel without reading `simdAvailable`. -/
-theorem compute_refinement [KzgExternals]
+theorem compute_refinement
     (v : cell_extender.CellExtender) (hv : Extender.StateInvariant v)
     (kernel : extension_kernel.ExtensionKernel) (hkernel : v.kernel = some kernel)
     (blob : Blob) (cells : Cells) :

@@ -8,13 +8,13 @@ use blst::blst_fr;
 
 use crate::kzg::{
     BYTES_PER_BLOB, BYTES_PER_CELL, BYTES_PER_FIELD_ELEMENT, CELLS_PER_EXT_BLOB,
-    FIELD_ELEMENTS_PER_BLOB, FIELD_ELEMENTS_PER_CELL,
-    blst_ops::{fr_from_bytes, fr_from_u64, fr_inverse, fr_mul, fr_to_bytes},
+    FIELD_ELEMENTS_PER_BLOB, FIELD_ELEMENTS_PER_CELL, FR_ZERO, INVERSE_BLOB_SIZE,
     domain::{inverse_roots, reverse_bits, roots_of_unity},
     fft::{fft, inverse_fft},
+    fr::{fr_from_bytes, fr_mul, fr_to_bytes},
 };
 #[cfg(target_arch = "x86_64")]
-use crate::{kzg::extension_kernel::ExtensionKernel, simd_available};
+use crate::{ifma_available, kzg::extension_kernel::ExtensionKernel};
 
 const LOG_BLOB: u32 = 12;
 const LOG_EXT_BLOB: u32 = 13;
@@ -42,20 +42,18 @@ impl Default for CellExtender {
 impl CellExtender {
     pub fn new() -> Self {
         let roots = roots_of_unity(LOG_BLOB);
-        let zero = fr_from_u64(0);
         let mut shift_powers = roots_of_unity(LOG_EXT_BLOB);
-        shift_powers.resize(FIELD_ELEMENTS_PER_BLOB, zero);
+        shift_powers.resize(FIELD_ELEMENTS_PER_BLOB, FR_ZERO);
         let mut evaluations = Vec::with_capacity(FIELD_ELEMENTS_PER_BLOB);
-        evaluations.resize(FIELD_ELEMENTS_PER_BLOB, zero);
+        evaluations.resize(FIELD_ELEMENTS_PER_BLOB, FR_ZERO);
         let mut coefficients = Vec::with_capacity(FIELD_ELEMENTS_PER_BLOB);
-        coefficients.resize(FIELD_ELEMENTS_PER_BLOB, zero);
+        coefficients.resize(FIELD_ELEMENTS_PER_BLOB, FR_ZERO);
         let inverse_roots = inverse_roots(&roots);
-        let inverse_size = fr_inverse(&fr_from_u64(FIELD_ELEMENTS_PER_BLOB as u64));
         #[cfg(target_arch = "x86_64")]
-        let kernel = if simd_available() {
-            // SAFETY: `simd_available` confirmed avx512f and avx512ifma on this CPU.
+        let kernel = if ifma_available() {
+            // SAFETY: `ifma_available` confirmed avx512f and avx512ifma on this CPU.
             Some(unsafe {
-                ExtensionKernel::new(&roots, &inverse_roots, &shift_powers, &inverse_size)
+                ExtensionKernel::new(&roots, &inverse_roots, &shift_powers, &INVERSE_BLOB_SIZE)
             })
         } else {
             None
@@ -63,7 +61,7 @@ impl CellExtender {
         Self {
             roots,
             inverse_roots,
-            inverse_size,
+            inverse_size: INVERSE_BLOB_SIZE,
             shift_powers,
             evaluations,
             coefficients,
@@ -72,13 +70,9 @@ impl CellExtender {
         }
     }
 
-    #[cfg(test)]
+    #[cfg(all(test, target_arch = "x86_64"))]
     pub(crate) fn without_kernel() -> Self {
-        Self {
-            #[cfg(target_arch = "x86_64")]
-            kernel: None,
-            ..Self::new()
-        }
+        Self { kernel: None, ..Self::new() }
     }
 
     /// False exactly when the spec's `computeCells` rejects `blob`: some
@@ -90,7 +84,7 @@ impl CellExtender {
     ) -> bool {
         #[cfg(target_arch = "x86_64")]
         if let Some(kernel) = &mut self.kernel {
-            // SAFETY: `kernel` is built only where `simd_available` held.
+            // SAFETY: `kernel` is built only where `ifma_available` held.
             if !unsafe { kernel.decode(blob) } {
                 return false;
             }

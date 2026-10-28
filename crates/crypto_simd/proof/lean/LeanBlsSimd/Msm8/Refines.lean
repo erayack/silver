@@ -4,9 +4,9 @@ open Aeneas Aeneas.Std Result ControlFlow Error
 open silver_crypto_simd silver_crypto_simd.bls
 noncomputable section
 namespace LeanBlsSimd.Msm8
-open EthCryptographySpecs Bls
+open EthLib.Cryptography Bls
 
-private theorem slice_range {α : Type} (xs : Slice α) (start finish : Usize)
+theorem slice_range {α : Type} (xs : Slice α) (start finish : Usize)
     (hstart : start.val ≤ finish.val) (hfinish : finish.val ≤ xs.val.length) :
     ∃ ys, core.slice.index.Slice.index (core.slice.index.SliceIndexRangeUsizeSlice α)
         xs {start, «end» := finish} = ok ys ∧
@@ -16,7 +16,7 @@ private theorem slice_range {α : Type} (xs : Slice α) (start finish : Usize)
     hstart, hfinish, and_self, if_true]
   exact ⟨_, rfl, rfl⟩
 
-private theorem input_sum_split (ps : List blst.blst_p1_affine)
+theorem input_sum_split (ps : List blst.blst_p1_affine)
     (words : List ScalarWords) (start count : ℕ) :
     (((ps.drop start).zip (words.drop start)).map inputContribution).sum =
       ((((ps.drop start).take count).zip ((words.drop start).take count)).map
@@ -34,7 +34,7 @@ private theorem input_sum_split (ps : List blst.blst_p1_affine)
   have hsum := congrArg (fun xs => (xs.map inputContribution).sum) hsplit
   simpa only [List.map_append, List.sum_append, htake, hdrop] using hsum.symm
 
-private theorem chunk_end (points : Slice blst.blst_p1_affine) (start : Usize)
+theorem chunk_end (points : Slice blst.blst_p1_affine) (start : Usize)
     (hstart : start.val < points.val.length) :
     ∃ finish : Usize,
       (do
@@ -131,7 +131,7 @@ private theorem msm_loop_refinement
 end LeanBlsSimd.Msm8
 
 namespace LeanBlsSimd.Msm8
-open EthCryptographySpecs Bls
+open EthLib.Cryptography Bls
 
 theorem msm_refinement
     (state : msm8.Msm8) (points : Slice blst.blst_p1_affine) (scalars : Slice ScalarWords)

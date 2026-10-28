@@ -1,5 +1,46 @@
+import LeanBlsSimd.Pairing.LaneFinal
+import LeanBlsSimd.Pairing.LaneMiller
+import LeanBlsSimd.LaneTower.Frobenius
+import LeanBlsSimd.LaneTower.LineCoordinates
+import LeanBlsSimd.LaneTower.CyclotomicCoordinates
+import LeanBlsSimd.LaneTower.Identity
+import LeanBlsSimd.Spec.PairingProduct
+import LeanBlsSimd.Spec.Cyclotomic.Field
+import LeanBlsSimd.Refines.FrobeniusConstants
+import LeanBlsSimd.Portable.Msm.Refines
+import LeanBlsSimd.Portable.Msm.Sum
+import LeanBlsSimd.Portable.Msm.Initialise
+import LeanBlsSimd.Portable.Msm.Input
+import LeanBlsSimd.Portable.Msm.PairRounds
+import LeanBlsSimd.Portable.Msm.Queue
+import LeanBlsSimd.Portable.Msm.BatchRun
+import LeanBlsSimd.Portable.Msm.StoreLifecycle
+import LeanBlsSimd.Portable.Msm.FillReady
+import LeanBlsSimd.Portable.Decode.Correct
+import LeanBlsSimd.Portable.G1.PairScott
+import LeanBlsSimd.Portable.G1.Scott
+import LeanBlsSimd.Portable.Fp.BatchInverse
+import LeanBlsSimd.Portable.Fp.Sqrt
+import LeanBlsSimd.Portable.Fp.PairSqrt
+import LeanBlsSimd.Portable.Fp.Correct
+import LeanBlsSimd.Portable.Fp.Reduction
+import LeanBlsSimd.Portable.Fp.MultiplyAdd
+import LeanBlsSimd.Portable.Fp.Words
+import LeanBlsSimd.Sha256.Correct
+import LeanBlsSimd.Sha256.GeneratedUpdateRefines
+import LeanBlsSimd.Sha256.ExtensionCompress
+import LeanBlsSimd.Sha256.ExtensionLoad
+import LeanBlsSimd.Sha256.ExtensionLayout
+import LeanBlsSimd.Sha256.ExtensionSchedule
+import LeanBlsSimd.Sha256.PortableCompress
+import LeanBlsSimd.Sha256.ContractAdapter
+import LeanBlsSimd.Sha256.Streaming
+import LeanBlsSimd.Spec.Sha256
+import LeanBlsSimd.Kzg.SetupLiterals
+import LeanBlsSimd.Kzg.Fr.ByteEncode
 import LeanBlsSimd.Constants
 import LeanBlsSimd.Spec.Fp2
+import LeanBlsSimd.Spec.PairingEquations
 import LeanBlsSimd.Spec.G2Curve
 import LeanBlsSimd.Spec.Scott
 import LeanBlsSimd.Spec.ScottCardinality
@@ -17,6 +58,7 @@ import LeanBlsSimd.Refines.Complete
 import LeanBlsSimd.Refines.UncompressG1
 import LeanBlsSimd.Refines.UncompressG2
 import LeanBlsSimd.Kzg
+import LeanBlsSimd.Kzg.Routes
 
 /-!
 Fails the build if any theorem under `LeanBlsSimd`, or any of `checkedDefinitions`, uses an axiom
@@ -90,18 +132,51 @@ def checkedDefinitions : Array Name := #[``silver_crypto_simd.bls.decompress_g2.
   ``silver_crypto_simd.bls.msm8.store.PointStore.store_points,
   ``silver_crypto_simd.bls.msm8.pairs.batch_inverse,
   ``silver_crypto_simd.bls.msm8.pairs.BatchedAdds.run,
-  ``silver_crypto_simd.bls.msm8.buckets.SignedDigits.next_digit,
+  ``silver_crypto_simd.bls.signed_digits.SignedDigits.next_digit,
   ``silver_crypto_simd.bls.msm8.buckets.Buckets.fill,
   ``silver_crypto_simd.bls.msm8.buckets.Buckets.queue_round,
   ``silver_crypto_simd.bls.msm8.buckets.Buckets.sum,
-  ``silver_crypto_simd.bls.msm8.glv.decompose,
+  ``silver_crypto_simd.bls.glv.decompose,
   ``silver_crypto_simd.bls.msm8.Msm8.Insts.CoreDefaultDefault.default,
   ``silver_crypto_simd.bls.msm8.Msm8.chunk_sum,
   ``silver_crypto_simd.bls.msm8.Msm8.msm,
   ``silver_crypto_simd.bls.msm8.lane_zero_in_blst,
   ``silver_crypto_simd.kzg.fr8.Fr8.plain_words,
-  ``silver_crypto_simd.kzg.verify.Lincomb.new,
-  ``silver_crypto_simd.kzg.verify.Lincomb.sum]
+  ``silver_crypto_simd.kzg.verify.CurveWork.new,
+  ``silver_crypto_simd.kzg.verify.CurveWork.sum,
+  ``silver_crypto_simd.kzg.fr.fr_add,
+  ``silver_crypto_simd.kzg.fr.fr_sub,
+  ``silver_crypto_simd.kzg.fr.fr_mul,
+  ``silver_crypto_simd.kzg.fr.fr_from_bytes,
+  ``silver_crypto_simd.kzg.fr.fr_from_bytes_reduced,
+  ``silver_crypto_simd.kzg.fr.fr_to_bytes,
+  ``silver_crypto_simd.kzg.fr.fr_to_words,
+  ``silver_crypto_simd.sha256.extensions.Sha256.new,
+  ``silver_crypto_simd.sha256.extensions.Sha256.update,
+  ``silver_crypto_simd.sha256.extensions.Sha256.finish,
+  ``silver_crypto_simd.sha256.portable.Sha256.new,
+  ``silver_crypto_simd.sha256.portable.Sha256.update,
+  ``silver_crypto_simd.sha256.portable.Sha256.finish,
+  ``silver_crypto_simd.portable.fp.Fp.add,
+  ``silver_crypto_simd.portable.fp.Fp.sub,
+  ``silver_crypto_simd.portable.fp.Fp.mul,
+  ``silver_crypto_simd.portable.fp.Fp.mul_on_baseline,
+  ``silver_crypto_simd.portable.fp.Fp.mul_on_bmi2,
+  ``silver_crypto_simd.portable.fp.Fp.is_zero,
+  ``silver_crypto_simd.portable.g1.G1.from_blst,
+  ``silver_crypto_simd.portable.g1.G1.to_blst,
+  ``silver_crypto_simd.portable.g1.G1.neg,
+  ``silver_crypto_simd.portable.g1.G1.add_complete,
+  ``silver_crypto_simd.portable.decompress.uncompress_in_g1,
+  ``silver_crypto_simd.portable.decompress.uncompress_pair_in_g1,
+  ``silver_crypto_simd.portable.msm.Msm.msm,
+  ``silver_crypto_simd.bls.pairing.MillerLines.pairing_check,
+  ``silver_crypto_simd.kzg.verify.CurveWork.scalar,
+  ``silver_crypto_simd.kzg.verify.CurveWork.pairing_check,
+  ``silver_crypto_simd.kzg.blst_pairing.pairing_check,
+  ``silver_crypto_simd.kzg.verify.PairingSums.points,
+  ``silver_crypto_simd.kzg.verify.PairingSums.points_in_lanes,
+  ``silver_crypto_simd.kzg.verify.two_lanes]
 
 def libraryTheorems : CommandElabM (Array Name) := do
   let theorems := (← getEnv).constants.fold (init := #[]) fun found c info =>

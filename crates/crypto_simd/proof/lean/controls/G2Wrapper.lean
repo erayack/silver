@@ -75,11 +75,11 @@ example : G2Spec.verdict G2Spec.infinity = some
   G2Spec.infinity_verdict
 
 theorem malformed_infinity_verdict : G2Spec.verdict (G2Spec.infinity.set 95 1) = none := by
-  unfold G2Spec.verdict EthCryptographySpecs.Bls.G2.uncompress
+  unfold G2Spec.verdict EthLib.Cryptography.Bls.G2.uncompress
   decide +kernel
 
 def generator : Encoding := .ofFn fun i =>
-  (EthCryptographySpecs.Bls.G2.compress EthCryptographySpecs.Bls.G2.generator).data[i.val]!
+  (EthLib.Cryptography.Bls.G2.compress EthLib.Cryptography.Bls.G2.generator).data[i.val]!
 
 /-- info: (true, true) -/
 #guard_msgs in
@@ -91,7 +91,7 @@ def generator : Encoding := .ofFn fun i =>
 open Aeneas Aeneas.Std Result
 open silver_crypto_simd silver_crypto_simd.bls
 
-@[reducible] def rejecting : BlsExternals := ⟨false, fun _ => none, fun _ => none⟩
+@[reducible] def rejecting : BlsExternals := ⟨fun _ => none⟩
 
 example : ¬ @BlstMatchesSpec rejecting := by
   intro h
@@ -99,7 +99,7 @@ example : ¬ @BlstMatchesSpec rejecting := by
   change (none : Option blst.blst_p2_affine) = specVerdict _ at hi
   simp [specVerdict, ofArray_toArray, G2Spec.infinity_verdict] at hi
 
-@[reducible] def accepting : BlsExternals := ⟨false, fun _ => none, fun _ =>
+@[reducible] def accepting : BlsExternals := ⟨fun _ =>
   some (toBlstP2Affine (point (.replicate 6 0) (.replicate 6 0)
     (.replicate 6 0) (.replicate 6 0)))⟩
 
@@ -109,7 +109,7 @@ example : ¬ @BlstMatchesSpec accepting := by
   change some _ = specVerdict _ at hi
   simp [specVerdict, ofArray_toArray, malformed_infinity_verdict] at hi
 
-@[reducible] def wrongLimbs : BlsExternals := ⟨false, fun _ => none, fun _ => some (toBlstP2Affine sentinel)⟩
+@[reducible] def wrongLimbs : BlsExternals := ⟨fun _ => some (toBlstP2Affine sentinel)⟩
 
 example : ¬ @BlstMatchesSpec wrongLimbs := by
   intro h
@@ -120,7 +120,7 @@ example : ¬ @BlstMatchesSpec wrongLimbs := by
   have hbad : (1 : UInt64) = 0 := by simpa [sentinel, point] using hx
   exact (by decide : (1 : UInt64) ≠ 0) hbad
 
-example [BlsExternals] (inputs : Slice (Array U8 96#usize))
+example [RuntimeFeatures] [BlsExternals] (inputs : Slice (Array U8 96#usize))
     (out : Slice (Option blst.blst_p2_affine)) (h : out.val.length ≠ inputs.val.length) :
     silver_crypto_simd.bls.uncompress_in_g2 inputs out ≠ ok out := by
   rw [uncompress_in_g2_length_mismatch inputs out h]

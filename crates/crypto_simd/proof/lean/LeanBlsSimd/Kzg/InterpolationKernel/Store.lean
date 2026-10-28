@@ -1,13 +1,14 @@
+import LeanBlsSimd.Kzg.Fr.ByteEncode
 import LeanBlsSimd.Kzg.InterpolationKernel.Basic
 import LeanBlsSimd.Kzg.Extender.Kernel.Fr8
 import LeanBlsSimd.Kzg.Extender.Write
 
 open Aeneas Aeneas.Std Result ControlFlow
-open EthCryptographySpecs Bls Kzg
+open EthLib.Cryptography Bls Kzg
 open silver_crypto_simd silver_crypto_simd.kzg
 
 open private bytesBEToNatAux_eq_fromBytesBEAux
-  from EthCryptographySpecs.Proofs.Kzg.Polynomials
+  from EthLib.Cryptography.Proofs.Kzg.Polynomials
 
 namespace LeanBlsSimd.Kzg.InterpolationKernel
 
@@ -169,7 +170,7 @@ private theorem decode_field_bytes (value : Fr) :
   simp only [bytesToBlsField, field_bytes_size, Constants.BYTES_PER_FIELD_ELEMENT,
     ne_eq, not_true_eq_false, ↓reduceIte, Fr.fromBytesBE, hv', value.isLt, ↓reduceDIte]
 
-private theorem decode_loop [e : KzgExternals] (h : BlstCorrect e)
+private theorem decode_loop
     (buffer : Array U8 2048#usize) (values : _root_.Array Fr)
     (hvalues : values.size = 64) (he : Encoded values 8 buffer)
     (out : Slice blst.blst_fr) (hlen : out.val.length = 64)
@@ -212,8 +213,8 @@ private theorem decode_loop [e : KzgExternals] (h : BlstCorrect e)
     have hback : Array.from_slice (Array.repeat 32#usize 0#u8) src = chunk := by
       apply Subtype.ext
       simp [src, Array.to_slice, chunk.property]
-    have hdecode : blst_ops.fr_from_bytes chunk = ok (some (frEncode values[i.val]!)) := by
-      rw [blst_ops.fr_from_bytes, h.fr_bytes, fieldChunk_bytes buffer values he i.val hit,
+    have hdecode : fr.fr_from_bytes chunk = ok (some (frEncode values[i.val]!)) := by
+      rw [FrScalar.fr_from_bytes_refines, fieldChunk_bytes buffer values he i.val hit,
         decode_field_bytes]
       rfl
     let next := out.set i (frEncode values[i.val]!)
@@ -243,7 +244,7 @@ private theorem decode_loop [e : KzgExternals] (h : BlstCorrect e)
       Array.to_slice_mut, lift, Function.uncurry_apply_pair, hstart, hadd, hstop,
       hindex, hcopy, hback, hdecode, hupdate, bind_tc_ok] using hout
 
-theorem store_canonical_refinement [e : KzgExternals] (h : BlstCorrect e)
+theorem store_canonical_refinement
     (sums : Array fr8.Fr8 8#usize) (values : _root_.Array Fr)
     (hs : DataRep (Array.to_slice sums) values)
     (out : Slice blst.blst_fr) (hlen : out.val.length = 64) :
@@ -254,7 +255,7 @@ theorem store_canonical_refinement [e : KzgExternals] (h : BlstCorrect e)
     simpa only [Array.to_slice, sums.property] using hh
   obtain ⟨buffer, hb, he⟩ := encode_loop sums values hs
     (Array.repeat 2048#usize 0#u8) 0#usize (by decide) (by intro j hj; simp only [UScalar.ofNatCore_val_eq] at hj; omega)
-  obtain ⟨out', hout, ho⟩ := decode_loop h buffer values hsize he out hlen 0#usize
+  obtain ⟨out', hout, ho⟩ := decode_loop buffer values hsize he out hlen 0#usize
     (by decide) (by intro j hj; simp only [UScalar.ofNatCore_val_eq] at hj; omega)
   exact ⟨out', by simp only [interpolation_kernel.store_canonical, hb, hout, bind_tc_ok], ho⟩
 

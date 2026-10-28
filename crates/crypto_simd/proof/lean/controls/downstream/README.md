@@ -1,43 +1,78 @@
-# Independent BLS consumers
+# Independent consumers
 
-This independent Lake package imports `lean_bls_simd` by path and inherits its dependency pins. It checks that the public interface of `silver_crypto_simd::bls` is useful to its consumers. Each file models a consumer extracted separately, which declares its own copies of blst's structs and its own externals class, and uses the published theorems across that boundary. It does not model calls between sibling `bls` and `kzg` modules extracted together in one crate, where the extraction can share the blst structs directly.
+This Lake package imports `lean_bls_simd` by path and inherits its dependency
+pins. Its four default targets check the public BLS, KZG and pairing-field interfaces.
 
-Each file follows the same pattern for one public wrapper:
+## BLS adapters
 
-- It declares the consumer's own blst structs. A `#guard_msgs` control checks that redeclaring the upstream wrapper at its root name is rejected.
-- `Bridge.uncompress_eq_spec_list` transports the upstream list result across the copied structs.
-- The facade `silver_crypto_simd.bls.uncompress_in_g1` or `uncompress_in_g2`, inside the consumer's namespace, reads the function field of the downstream-owned `Fixed.Externals`.
-- `caller` calls the wrapper in the generated spelling. Its only instance parameter is `Fixed.Externals`, and `caller_eq_spec_list` proves its list result.
-- `Fixed.externalsOf upstream` fixes an explicit upstream `BlsExternals` instance inside the adapter. `Fixed.externalsOf_matches_spec` discharges the downstream premise `Fixed.UncompressMatchesSpec` from the upstream `BlstMatchesSpec`.
-- A concrete instance implementing the spec witnesses that the premises are consistent.
+`G1Smoke.lean` models a separately extracted G1 consumer under `silver_kzg`.
+`G2Smoke.lean` models a G2 consumer under `silver_bls`. Each declares its own
+blst-shaped data types and a downstream `Fixed.Externals` function field.
+These are consumer adapters, not replacement dictionaries for the generated
+KZG implementation.
 
-These are interoperability demonstrations, not changes to any consumer's extraction.
+Both files transport specification verdicts across the copied structures.
+The facade retains the generated call spelling, and `caller_eq_spec_list`
+proves the caller's result from the downstream agreement premise.
+A `#guard_msgs` control rejects redeclaration of the upstream wrapper at its
+root name. Adapter and caller axiom checks admit only `propext`,
+`Classical.choice` and `Quot.sound`.
 
-## `G1Smoke.lean`
+G1's `Fixed.externalsOf` captures `RuntimeFeatures` and `KzgExternals`.
+Its general agreement proof uses `UncompressG1.FallbackCorrect`. The IFMA
+example discharges that conditional law without an external agreement
+premise. Portable singleton and pair decoding are proved internally for
+IFMA tails and undecided lanes.
 
-A G1 consumer decodes commitments or proofs. This file models one, extracted separately under the example namespace `silver_kzg`. It copies `blst_fp` and `blst_p1_affine`, and imports `LeanBlsSimd.Refines.UncompressG1`.
+G2's adapter captures `RuntimeFeatures` and a separate upstream
+`BlsExternals` containing only the opaque G2 decoder. Its agreement proof
+requires `UncompressG2.BlstMatchesSpec`. A specification-backed G2 external
+still supplies a concrete witness for that external-function premise.
 
-## `G2Smoke.lean`
+## KZG consumers
 
-A G2 consumer checks signatures. This file models one, extracted separately under the example namespace `silver_bls`. It copies `blst_fp`, `blst_fp2` and `blst_p2_affine`, so its bridge also converts each Fp2 coordinate. It imports `LeanBlsSimd.Refines.UncompressG2`.
+`KzgSmoke.lean` checks the general verifier under the scoped decoder and
+pairing laws. Cell decoding, interpolation, MSM, SHA and scalar/base-field
+arithmetic are proved internally. Extender consumers need no blst laws.
+The examples retain the canonical-cell relation and conditional
+scalar-scratch premise. They cover arbitrary-length MSM8, lane-only linear
+combination and preservation of stored routes.
+
+These examples use the shared data types from the same-crate extraction.
+The imported library proves the generated-component contracts; these examples
+check their public consumer interfaces.
+
+## Pairing-field consumer
+
+`TowerSmoke.lean` imports the field and cyclotomic interfaces independently.
+It checks multiplication, total inverse, the coordinate formula, Frobenius,
+conjugation, easy-part membership and the target-group exponent.
+It assumes no generated pairing correctness.
 
 ## Running
 
-The normal package commands, run from this directory, are:
+From this directory:
 
 ```sh
 lake update
 lake build
 ```
 
-`lake build` builds both files, which are the package's default targets. Lake resolves the `lean_bls_simd` path requirement to `../..` and builds its imported modules as dependencies. For development with an already-built parent library, the ignored package-cache symlink below optionally reuses its installed dependencies without copying them:
+Lake resolves `lean_bls_simd` to `../..` and builds imported modules as
+dependencies. An ignored cache symlink can reuse the parent's dependency
+checkouts when `.lake/packages` does not already exist:
 
 ```sh
 mkdir -p .lake
 ln -s ../../../.lake/packages .lake/packages
 lake update
-lake env lean G1Smoke.lean
-lake env lean G2Smoke.lean
+lake build
 ```
 
-Create the symlink only when `.lake/packages` does not already exist. Each adapter and caller axiom check is wrapped in `#guard_msgs`; the build fails if its list differs from `propext`, `Classical.choice`, and `Quot.sound`.
+`TowerSmoke.lean` consumes the lane tower and shared field mathematics,
+including the decoded lane-table certificate.
+
+The lane examples consume multiplication, one, conjugation, square,
+sparse-line multiplication, Frobenius, total inverse and identity-test
+refinements under `LaneTower.Rep`. The table entries are connected to the
+field basis. Cyclotomic squaring permits zero as well as Φ12 membership.

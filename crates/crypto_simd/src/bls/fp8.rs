@@ -19,14 +19,13 @@ use std::arch::x86_64::{
     _mm512_srai_epi64, _mm512_srli_epi64, _mm512_sub_epi64,
 };
 
-use crate::bls::constants::{
-    HALF_MONT, HALF_P_MINUS_1, LIMB_BITS, LIMBS, MASK52, ONE_PLAIN, P, P_INV52,
-    P_MINUS_3_OVER_4_WINDOWS, R_MOD_P, R2_MOD_P, TWO_POW_384_MOD_P,
+use crate::bls::{
+    constants::{
+        HALF_MONT, HALF_P_MINUS_1, LIMB_BITS, LIMBS, MASK52, ONE_PLAIN, P, P_INV52,
+        P_MINUS_3_OVER_4_WINDOWS, R_MOD_P, R2_MOD_P, TWO_POW_384_MOD_P, TWO_POW_448_MOD_P,
+    },
+    limbs::{LANES, Limbs, pack64, unpack52},
 };
-
-pub const LANES: usize = 8;
-
-pub type Limbs = [u64; LIMBS];
 
 #[derive(Clone, Copy)]
 pub struct Fp8(pub [__m512i; LIMBS]);
@@ -207,46 +206,6 @@ fn reduce_row(t: &mut [__m512i; 2 * LIMBS + 1], p: &[__m512i; LIMBS], pinv: __m5
     }
 }
 
-/// Little-endian 64-bit limbs of a 381-bit value to 52-bit limbs.
-#[inline]
-pub fn unpack52(x: &[u64; 6]) -> Limbs {
-    let mut out = [0u64; LIMBS];
-    for j in 0..LIMBS {
-        let bit = j as u32 * LIMB_BITS;
-        let (word, shift) = ((bit / 64) as usize, bit % 64);
-        let mut v = x[word] >> shift;
-        if shift > 12 && word + 1 < 6 {
-            v |= x[word + 1] << (64 - shift);
-        }
-        out[j] = v & MASK52;
-    }
-    out
-}
-
-/// Inverse of `unpack52`.
-#[inline]
-pub fn pack64(x: &Limbs) -> [u64; 6] {
-    let mut out = [0u64; 6];
-    let mut acc: u128 = 0;
-    let mut acc_bits = 0u32;
-    let mut word = 0;
-    for j in 0..LIMBS {
-        let limb = x[j];
-        acc |= (limb as u128) << acc_bits;
-        acc_bits += LIMB_BITS;
-        if acc_bits >= 64 {
-            out[word] = acc as u64;
-            word += 1;
-            acc >>= 64;
-            acc_bits -= 64;
-        }
-    }
-    if word < 6 {
-        out[word] = acc as u64;
-    }
-    out
-}
-
 impl Fp8 {
     #[target_feature(enable = "avx512f,avx512ifma")]
     #[inline]
@@ -321,6 +280,18 @@ impl Fp8 {
             out[lane] = pack64(&t[lane]);
         }
         out
+    }
+
+    /// The inverse of `to_blst_limbs`, for values below p, reduced.
+    #[target_feature(enable = "avx512f,avx512ifma")]
+    pub fn from_blst_limbs(values: &[[u64; 6]; LANES]) -> Self {
+        let mut limbs = [[0u64; LIMBS]; LANES];
+        let mut lane = 0;
+        while lane < LANES {
+            limbs[lane] = unpack52(&values[lane]);
+            lane += 1;
+        }
+        Self::load(&limbs).mul(&Self::splat_limbs(&TWO_POW_448_MOD_P))
     }
 
     /// Montgomery product: the full 16-limb product, then `reduce`. Every row
@@ -533,10 +504,27 @@ impl Fp8 {
         Self(v)
     }
 
+    /// Lane l takes lane `from[l]` of `self` below 8, else lane `from[l] − 8`
+    /// of `other`.
+    #[target_feature(enable = "avx512f,avx512ifma")]
+    #[inline]
+    pub fn permute2(&self, other: &Self, from: &[i64; LANES]) -> Self {
+        let index = index_vector(from);
+        let mut v = [zero(); LIMBS];
+        let mut j = 0;
+        while j < LIMBS {
+            v[j] = _mm512_permutex2var_epi64(self.0[j], index, other.0[j]);
+            j += 1;
+        }
+        Self(v)
+    }
+
     /// `self^((p-3)/4)`: the reciprocal square root when `self` is a
     /// quadratic residue (p = 3 mod 4). The exponent is shared by every lane,
-    /// so a fixed 4-bit window needs no per-lane table lookups.
+    /// so a fixed 4-bit window needs no per-lane table lookups. Inlined into
+    /// a sole caller, it slowed the G1 decoder by 15%.
     #[target_feature(enable = "avx512f,avx512ifma")]
+    #[inline(never)]
     pub fn pow_p_minus_3_over_4(&self) -> Self {
         let mut table = [Self::one(); 16];
         table[1] = *self;

@@ -1,7 +1,7 @@
 //! AVX-512 IFMA fast path for BLS12-381 G1 and G2 point decompression with
 //! subgroup membership, eight points per step. Lanes the vector path declines,
-//! short chunks, and CPUs without the instructions go through blst, so the
-//! verdicts are blst's either way.
+//! and short chunks use the portable G1 decoder or blst's G2 decoder.
+//! CPUs without IFMA use blst for both groups.
 //!
 //! The fast path is available when the `simd` build feature is enabled. It
 //! additionally requires AVX-512F and AVX-512 IFMA support enabled at run time.
@@ -15,31 +15,51 @@
 )]
 
 // The kernels are `#[target_feature]` functions: every one of them is unsafe to
-// call for the same single reason, that `simd_available` must have been checked
+// call for the same single reason, that `ifma_available` must have been checked
 // on this CPU, so the safety section lives here rather than on each function.
-#[cfg(target_arch = "x86_64")]
 pub mod constants;
 #[cfg(target_arch = "x86_64")]
 #[allow(clippy::missing_safety_doc)]
+#[doc(hidden)]
 pub mod decompress;
 #[cfg(target_arch = "x86_64")]
 #[allow(clippy::missing_safety_doc)]
+#[doc(hidden)]
 pub mod decompress_g2;
 #[cfg(target_arch = "x86_64")]
+pub(crate) mod encoding;
+#[cfg(target_arch = "x86_64")]
 #[allow(clippy::missing_safety_doc)]
+pub(crate) mod fp12;
+#[cfg(target_arch = "x86_64")]
+#[allow(clippy::missing_safety_doc)]
+#[doc(hidden)]
 pub mod fp2x8;
 #[cfg(target_arch = "x86_64")]
 #[allow(clippy::missing_safety_doc)]
+#[doc(hidden)]
 pub mod fp8;
 #[cfg(target_arch = "x86_64")]
 #[allow(clippy::missing_safety_doc)]
+#[doc(hidden)]
 pub mod g1x8;
 #[cfg(target_arch = "x86_64")]
 #[allow(clippy::missing_safety_doc)]
+#[doc(hidden)]
 pub mod g2x8;
+pub(crate) mod glv;
+pub mod limbs;
+#[cfg(target_arch = "x86_64")]
+pub(crate) mod miller_lines;
 #[cfg(target_arch = "x86_64")]
 #[allow(clippy::missing_safety_doc)]
-pub mod msm8;
+pub(crate) mod msm8;
+#[cfg(target_arch = "x86_64")]
+#[allow(clippy::missing_safety_doc)]
+pub(crate) mod pairing;
+pub(crate) mod signed_digits;
+#[cfg(test)]
+pub(crate) mod spec_pairing;
 
 #[cfg(target_arch = "x86_64")]
 use std::arch::x86_64::__mmask8;
@@ -49,7 +69,11 @@ use blst::{
 };
 pub use blst::{blst_p1_affine, blst_p2_affine};
 
-use crate::simd_available;
+use crate::ifma_available;
+#[cfg(target_arch = "x86_64")]
+use crate::portable::decompress::uncompress_all_in_g1;
+#[cfg(target_arch = "x86_64")]
+use crate::portable::decompress::uncompress_in_g1 as uncompress_one_in_g1;
 
 pub const COMPRESSED_LEN: usize = 48;
 pub const G2_COMPRESSED_LEN: usize = 96;
@@ -77,51 +101,53 @@ pub fn uncompress_in_g1_blst(bytes: &[u8; COMPRESSED_LEN]) -> Option<blst_p1_aff
     ok.then_some(point)
 }
 
-/// Sets each `out[i]` to a verdict identical to
-/// `uncompress_in_g1_blst(&inputs[i])`.
+/// Sets each `out[i]` to blst's verdict on `inputs[i]`: `blst_p1_uncompress`,
+/// then `blst_p1_affine_in_g1`. On IFMA, undecided lanes and short tails use
+/// the portable decoder. Without IFMA, every input uses blst.
+#[cfg(target_arch = "x86_64")]
 pub fn uncompress_in_g1(inputs: &[[u8; COMPRESSED_LEN]], out: &mut [Option<blst_p1_affine>]) {
     assert!(out.len() == inputs.len(), "one verdict slot per input");
-    let simd = simd_available();
+    if !ifma_available() {
+        uncompress_all_in_g1_blst(inputs, out);
+        return;
+    }
     let full = inputs.len() / LANES * LANES;
     let mut start = 0;
     while start < full {
-        if simd {
-            let mut chunk = [[0u8; COMPRESSED_LEN]; LANES];
-            chunk.copy_from_slice(&inputs[start..start + LANES]);
-            decompress_g1_chunk(&chunk, &mut out[start..start + LANES]);
-        } else {
-            for lane in 0..LANES {
-                out[start + lane] = uncompress_in_g1_blst(&inputs[start + lane]);
-            }
-        }
+        let mut chunk = [[0u8; COMPRESSED_LEN]; LANES];
+        chunk.copy_from_slice(&inputs[start..start + LANES]);
+        decompress_g1_chunk(&chunk, &mut out[start..start + LANES]);
         start += LANES;
     }
-    while start < inputs.len() {
-        out[start] = uncompress_in_g1_blst(&inputs[start]);
-        start += 1;
+    uncompress_all_in_g1(&inputs[full..inputs.len()], &mut out[full..inputs.len()]);
+}
+
+/// Sets each `out[i]` to blst's verdict on `inputs[i]`.
+#[cfg(not(target_arch = "x86_64"))]
+pub fn uncompress_in_g1(inputs: &[[u8; COMPRESSED_LEN]], out: &mut [Option<blst_p1_affine>]) {
+    assert!(out.len() == inputs.len(), "one verdict slot per input");
+    uncompress_all_in_g1_blst(inputs, out);
+}
+
+fn uncompress_all_in_g1_blst(inputs: &[[u8; COMPRESSED_LEN]], out: &mut [Option<blst_p1_affine>]) {
+    for i in 0..inputs.len() {
+        out[i] = uncompress_in_g1_blst(&inputs[i]);
     }
 }
 
 #[cfg(target_arch = "x86_64")]
 fn decompress_g1_chunk(chunk: &[[u8; COMPRESSED_LEN]; LANES], out: &mut [Option<blst_p1_affine>]) {
-    // SAFETY: `simd_available` confirmed avx512f and avx512ifma on this CPU.
+    // SAFETY: `ifma_available` confirmed avx512f and avx512ifma on this CPU.
     let batch = unsafe { decompress::decompress(chunk) };
     for lane in 0..LANES {
         let bit = 1u8 << lane;
         out[lane] = if batch.undecided & bit != 0 {
-            uncompress_in_g1_blst(&chunk[lane])
+            uncompress_one_in_g1(&chunk[lane])
         } else if batch.valid & bit != 0 {
             Some(batch.points[lane])
         } else {
             None
         };
-    }
-}
-
-#[cfg(not(target_arch = "x86_64"))]
-fn decompress_g1_chunk(chunk: &[[u8; COMPRESSED_LEN]; LANES], out: &mut [Option<blst_p1_affine>]) {
-    for lane in 0..LANES {
-        out[lane] = uncompress_in_g1_blst(&chunk[lane]);
     }
 }
 
@@ -140,7 +166,7 @@ pub fn uncompress_in_g2_blst(bytes: &[u8; G2_COMPRESSED_LEN]) -> Option<blst_p2_
 /// `uncompress_in_g2_blst(&inputs[i])`.
 pub fn uncompress_in_g2(inputs: &[[u8; G2_COMPRESSED_LEN]], out: &mut [Option<blst_p2_affine>]) {
     assert!(out.len() == inputs.len(), "one verdict slot per input");
-    let simd = simd_available();
+    let simd = ifma_available();
     let mut start = 0;
     while start < inputs.len() {
         let rest = inputs.len() - start;
@@ -163,7 +189,7 @@ fn decompress_g2_chunk(chunk: &[[u8; G2_COMPRESSED_LEN]], out: &mut [Option<blst
     for lane in 0..LANES {
         lanes[lane] = chunk[if lane < chunk.len() { lane } else { chunk.len() - 1 }];
     }
-    // SAFETY: `simd_available` confirmed avx512f and avx512ifma on this CPU.
+    // SAFETY: `ifma_available` confirmed avx512f and avx512ifma on this CPU.
     let batch = unsafe { decompress_g2::decompress(&lanes) };
     for lane in 0..chunk.len() {
         let bit = 1u8 << lane;
@@ -185,4 +211,4 @@ fn decompress_g2_chunk(chunk: &[[u8; G2_COMPRESSED_LEN]], out: &mut [Option<blst
 }
 
 #[cfg(all(test, target_arch = "x86_64"))]
-mod tests;
+pub(crate) mod tests;

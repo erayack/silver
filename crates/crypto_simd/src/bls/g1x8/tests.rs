@@ -19,12 +19,12 @@ use crate::{
         blst_p1_affine,
         constants::{LIMBS, MASK52, R_MOD_P},
         fp8::{
-            Fp8, LANES, Limbs,
+            Fp8,
             tests::{below, near_multiple_of_p},
-            unpack52,
         },
+        limbs::{LANES, Limbs, unpack52},
     },
-    kernels_run,
+    ifma_kernels_run,
 };
 
 impl G1x8 {
@@ -114,7 +114,7 @@ fn assert_formulas_match(coordinates: &[[Limbs; LANES]; 6], case: &str) {
 /// of two points, eight combinations to a vector.
 #[test]
 fn formulas_match_the_reference_at_the_input_bounds() {
-    if !kernels_run() {
+    if !ifma_kernels_run() {
         return;
     }
     let edges = [(0, 0), (1, -1), (1, 0), (2, -1)].map(|(k, d)| near_multiple_of_p(k, d));
@@ -129,7 +129,7 @@ fn formulas_match_the_reference_at_the_input_bounds() {
                 n /= edges.len();
             }
         }
-        // SAFETY: `kernels_run` checked `simd_available`.
+        // SAFETY: `ifma_kernels_run` checked `ifma_available`.
         unsafe { assert_formulas_match(&coordinates, &format!("combinations from {first}")) };
     }
 }
@@ -137,20 +137,20 @@ fn formulas_match_the_reference_at_the_input_bounds() {
 /// Random values below 2p: the arithmetic does not need curve points.
 #[test]
 fn formulas_match_the_reference_on_random_lanes() {
-    if !kernels_run() {
+    if !ifma_kernels_run() {
         return;
     }
     let mut rng = ChaCha8Rng::seed_from_u64(0x61);
     let two_p = near_multiple_of_p(2, 0);
     for case in 0..256 {
         let coordinates = std::array::from_fn(|_| std::array::from_fn(|_| below(&mut rng, &two_p)));
-        // SAFETY: `kernels_run` checked `simd_available`.
+        // SAFETY: `ifma_kernels_run` checked `ifma_available`.
         unsafe { assert_formulas_match(&coordinates, &format!("case {case}")) };
     }
 }
 
 /// Multiples of the generator by random 255-bit scalars, whose z is not 1.
-fn random_points(rng: &mut ChaCha8Rng, n: usize) -> Vec<blst_p1> {
+pub(crate) fn random_points(rng: &mut ChaCha8Rng, n: usize) -> Vec<blst_p1> {
     (0..n)
         .map(|_| {
             let mut scalar: [u8; 32] = rng.r#gen();
@@ -165,7 +165,7 @@ fn random_points(rng: &mut ChaCha8Rng, n: usize) -> Vec<blst_p1> {
 }
 
 /// The same point at another Jacobian scale: (λ²x, λ³y, λz).
-fn rescaled(point: &blst_p1, lambda: u64) -> blst_p1 {
+pub(crate) fn rescaled(point: &blst_p1, lambda: u64) -> blst_p1 {
     let (mut l, mut l2, mut l3) = (blst_fp::default(), blst_fp::default(), blst_fp::default());
     let mut out = blst_p1::default();
     // SAFETY: valid pointers to single values; blst reads six words.
@@ -180,14 +180,14 @@ fn rescaled(point: &blst_p1, lambda: u64) -> blst_p1 {
     out
 }
 
-fn negated(point: &blst_p1) -> blst_p1 {
+pub(crate) fn negated(point: &blst_p1) -> blst_p1 {
     let mut out = *point;
     // SAFETY: a valid pointer to a single value.
     unsafe { blst_p1_cneg(&mut out, true) };
     out
 }
 
-fn affine(point: &blst_p1) -> blst_p1_affine {
+pub(crate) fn affine(point: &blst_p1) -> blst_p1_affine {
     let mut out = blst_p1_affine::default();
     // SAFETY: valid pointers to single values.
     unsafe { blst_p1_to_affine(&mut out, point) };
@@ -207,7 +207,7 @@ fn coordinate(values: &[blst_fp; LANES]) -> Fp8 {
 }
 
 #[target_feature(enable = "avx512f,avx512ifma")]
-fn in_lanes(points: &[blst_p1; LANES]) -> G1x8 {
+pub(crate) fn in_lanes(points: &[blst_p1; LANES]) -> G1x8 {
     G1x8 {
         x: coordinate(&points.map(|p| p.x)),
         y: coordinate(&points.map(|p| p.y)),
@@ -237,7 +237,7 @@ fn assert_same_point(got: &blst_p1, want: &blst_p1, case: &str) {
 /// or both, and P + 2P.
 #[test]
 fn complete_additions_match_blst() {
-    if !kernels_run() {
+    if !ifma_kernels_run() {
         return;
     }
     let mut rng = ChaCha8Rng::seed_from_u64(0x62);
@@ -254,7 +254,7 @@ fn complete_additions_match_blst() {
         let left = [p, p, p, infinity, q, odd_infinity, p, rescaled(&r, 7)];
         let right =
             [q, rescaled(&p, 3), rescaled(&negated(&p), 5), q, infinity, infinity, twice, r];
-        // SAFETY: `kernels_run` checked `simd_available`.
+        // SAFETY: `ifma_kernels_run` checked `ifma_available`.
         let (sums, doubles, shifted) = unsafe {
             let (a, b) = (in_lanes(&left), in_lanes(&right));
             (
@@ -294,7 +294,7 @@ fn complete_additions_match_blst() {
 /// and P + 2P.
 #[test]
 fn complete_affine_additions_match_blst() {
-    if !kernels_run() {
+    if !ifma_kernels_run() {
         return;
     }
     let mut rng = ChaCha8Rng::seed_from_u64(0x63);
@@ -310,7 +310,7 @@ fn complete_affine_additions_match_blst() {
         unsafe { blst_p1_double(&mut twice, &p) };
         let left = [p, rescaled(&p, 3), rescaled(&p, 5), infinity, odd_infinity, p, r, q];
         let right = [q, p, negated(&p), q, r, twice, r, q].map(|point| affine(&point));
-        // SAFETY: `kernels_run` checked `simd_available`.
+        // SAFETY: `ifma_kernels_run` checked `ifma_available`.
         let sums = unsafe {
             let a = in_lanes(&left);
             let x = coordinate(&right.map(|point| point.x));
@@ -329,7 +329,7 @@ fn complete_affine_additions_match_blst() {
 /// Σ_l [2^(bits·l)] P_l in lane 0, with some lanes at infinity.
 #[test]
 fn shifted_lane_sums_match_blst() {
-    if !kernels_run() {
+    if !ifma_kernels_run() {
         return;
     }
     let mut rng = ChaCha8Rng::seed_from_u64(0x64);
@@ -337,7 +337,7 @@ fn shifted_lane_sums_match_blst() {
         let mut lanes: [blst_p1; LANES] = random_points(&mut rng, LANES).try_into().unwrap();
         lanes[3] = blst_p1::default();
         lanes[6] = blst_p1::default();
-        // SAFETY: `kernels_run` checked `simd_available`.
+        // SAFETY: `ifma_kernels_run` checked `ifma_available`.
         let got = unsafe { of_lanes(&in_lanes(&lanes).sum_lanes_shifted(bits))[0] };
         let mut want = blst_p1::default();
         for lane in (0..LANES).rev() {

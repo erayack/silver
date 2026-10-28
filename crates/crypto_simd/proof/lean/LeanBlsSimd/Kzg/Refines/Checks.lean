@@ -1,7 +1,7 @@
 import LeanBlsSimd.Kzg.Refines.Cosets
 
 open Aeneas Aeneas.Std Result ControlFlow
-open EthCryptographySpecs Bls Kzg
+open EthLib.Cryptography Bls Kzg
 open silver_crypto_simd silver_crypto_simd.kzg silver_crypto_simd.bls
 
 namespace LeanBlsSimd.Kzg
@@ -77,7 +77,7 @@ private theorem slice_lengths_ne {α β : Type} (a : Slice α) (b : Slice β) :
       exact h (congrArg UScalar.val he)
     simp [he, h]
 
-theorem verify_rejects_lengths [KzgExternals] (v : verify.CellBatchVerifier)
+theorem verify_rejects_lengths [RuntimeFeatures] [KzgExternals] (v : verify.CellBatchVerifier)
     (cs : Slice (Aeneas.Std.Array U8 48#usize)) (indices : Slice U64)
     (cells : Slice (Aeneas.Std.Array U8 2048#usize))
     (ps : Slice (Aeneas.Std.Array U8 48#usize))

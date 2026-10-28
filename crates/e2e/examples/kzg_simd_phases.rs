@@ -10,25 +10,40 @@ use std::{
     time::{Duration, Instant},
 };
 
-use blst::{blst_fp, blst_hash_to_g2, blst_p2, blst_p2_compress, blst_uint64_from_fp};
+use blst::{
+    BLST_ERROR, blst_fp, blst_hash_to_g2, blst_p1_affine_in_g1, blst_p1_uncompress, blst_p2,
+    blst_p2_compress, blst_uint64_from_fp,
+};
 use silver_common::ssz_view::DataColumnSidecarFuluView;
 use silver_crypto_simd::{
     bls::{
-        COMPRESSED_LEN, G2_COMPRESSED_LEN,
+        COMPRESSED_LEN, G2_COMPRESSED_LEN, blst_p1_affine,
         constants::FOUR_MONT,
         decompress::decompress,
         decompress_g2,
         fp2x8::Fp2x8,
-        fp8::{Fp8, LANES, Limbs, unpack52},
+        fp8::Fp8,
         g1x8::G1x8,
         g2x8::G2x8,
-        uncompress_in_g1_blst, uncompress_in_g2_blst,
+        limbs::{LANES, Limbs, unpack52},
+        uncompress_in_g2_blst,
     },
-    simd_available,
+    ifma_available,
 };
 use silver_e2e::da_capture::ColumnFixtures;
 
 const REPS: usize = 7;
+
+/// `Some` iff blst accepts the encoding as a point of G1.
+fn uncompress_in_g1_blst(bytes: &[u8; COMPRESSED_LEN]) -> Option<blst_p1_affine> {
+    let mut point = blst_p1_affine::default();
+    // SAFETY: both pointers are valid for the lengths blst reads and writes.
+    let member = unsafe {
+        blst_p1_uncompress(&mut point, bytes.as_ptr()) == BLST_ERROR::BLST_SUCCESS &&
+            blst_p1_affine_in_g1(&point)
+    };
+    member.then_some(point)
+}
 
 fn best_of<R>(mut f: impl FnMut() -> R) -> Duration {
     let mut best = Duration::MAX;
@@ -155,7 +170,7 @@ fn affine_lanes_g2(points: &[[u8; G2_COMPRESSED_LEN]; LANES]) -> (Fp2x8, Fp2x8) 
 }
 
 fn main() {
-    assert!(simd_available(), "this CPU has no avx512ifma");
+    assert!(ifma_available(), "this CPU has no avx512ifma");
     let cap = ColumnFixtures::da().load();
     let slot = cap.slots.values().next().unwrap();
     let mut batch = [[0u8; COMPRESSED_LEN]; LANES];
@@ -166,7 +181,7 @@ fn main() {
     for (lane, chunk) in proofs.take(LANES).enumerate() {
         batch[lane].copy_from_slice(chunk);
     }
-    // SAFETY: `simd_available` confirmed the target features.
+    // SAFETY: `ifma_available` confirmed the target features.
     let (x, y) = unsafe { affine_lanes(&batch) };
 
     let batch_g2 = g2_batch();

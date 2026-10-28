@@ -6,7 +6,7 @@ open silver_crypto_simd silver_crypto_simd.bls
 noncomputable section
 
 namespace LeanBlsSimd.G1x8
-open EthCryptographySpecs.Bls
+open EthLib.Cryptography.Bls
 
 
 theorem times_two_pow_succ (self : G1x8) (k : ℕ) :
@@ -79,7 +79,7 @@ theorem lane_permute (self : Fp8) (indices : Vector Int64 8) (l : Fin 8) :
   simp [permute, lane, _mm512_permutex2var_epi64]
 
 theorem permute_holds (self : Fp8) (indices : Vector Int64 8) (l : Fin 8)
-    (a : ZMod EthCryptographySpecs.Bls.Fp.modulus)
+    (a : ZMod EthLib.Cryptography.Bls.Fp.modulus)
     (h : self.Holds ⟨indices[l].toUInt64.toNat % 8, Nat.mod_lt _ (by decide)⟩ a) :
     (self.permute indices).Holds l a := by
   constructor <;> rw [lane_permute]
@@ -91,7 +91,7 @@ namespace G1x8
 
 
 theorem permute_holds (self : G1x8) (indices : Vector Int64 8) (l : Fin 8)
-    (P : EthCryptographySpecs.Bls.G1)
+    (P : EthLib.Cryptography.Bls.G1)
     (h : self.Holds ⟨indices[l].toUInt64.toNat % 8, Nat.mod_lt _ (by decide)⟩ P) :
     (self.permute indices).Holds l P :=
   ⟨Fp8.permute_holds _ _ _ _ (Holds.x h), Fp8.permute_holds _ _ _ _ (Holds.y h),
@@ -181,7 +181,7 @@ end G1x8
 end LeanBlsSimd
 
 namespace LeanBlsSimd.G1x8
-open EthCryptographySpecs.Bls
+open EthLib.Cryptography.Bls
 
 
 theorem lanesAbove_index (distance : ℕ) (l : Fin 8) :
@@ -263,7 +263,7 @@ theorem lanesAbove_loop_refines (distance : Usize) (hd : distance.val ≤ 4)
     have hi8 : i.val = 8 := by omega
     have hb : g1x8.lanes_above_loop.body distance (toArray toI64 v) i =
         ok (done (toArray toI64 v)) := by
-      simp [g1x8.lanes_above_loop.body, fp8.LANES, UScalar.lt_equiv, hi8]
+      simp [g1x8.lanes_above_loop.body, limbs.LANES, UScalar.lt_equiv, hi8]
     rw [loop.eq_1]
     simp only [hb]
     congr 2
@@ -276,7 +276,7 @@ theorem lanesAbove_loop_refines (distance : Usize) (hd : distance.val ≤ 4)
     let v' := v.set i.val ((lanesAbove distance.val)[i.val])
     have hb : g1x8.lanes_above_loop.body distance (toArray toI64 v) i =
         ok (cont (toArray toI64 v', i')) := by
-      simp only [g1x8.lanes_above_loop.body, fp8.LANES, UScalar.lt_equiv,
+      simp only [g1x8.lanes_above_loop.body, limbs.LANES, UScalar.lt_equiv,
         UScalar.ofNatCore_val_eq, hlt, ↓reduceIte]
       rw [add_ok _ _ (by omega)]
       simp only [bind_tc_ok]
@@ -314,7 +314,7 @@ private theorem sum_body_refines (bits : Usize) (hb : bits.val ≤ 255)
   have hm : distance.val * bits.val < 2 ^ UScalarTy.Usize.numBits := by
     have := Nat.mul_le_mul hd hb
     omega
-  simp only [g1x8.G1x8.sum_lanes_shifted_loop.body, fp8.LANES, UScalar.lt_equiv,
+  simp only [g1x8.G1x8.sum_lanes_shifted_loop.body, limbs.LANES, UScalar.lt_equiv,
     UScalar.ofNatCore_val_eq, show distance.val < 8 by omega, ↓reduceIte]
   rw [mul_ok _ _ hm]
   simp only [bind_tc_ok, times_two_pow_refines, ofG1x8_toG1x8,
@@ -345,7 +345,7 @@ theorem sum_lanes_shifted_refines (self : g1x8.G1x8) (bits : Usize)
   rw [sum_body_refines bits hb _ _ (by simp only [UScalar.ofNatCore_val_eq]; omega)]
   simp only
   rw [loop.eq_1]
-  simp [g1x8.G1x8.sum_lanes_shifted_loop.body, fp8.LANES,
+  simp [g1x8.G1x8.sum_lanes_shifted_loop.body, limbs.LANES,
     sum_lanes_shifted]
 
 end LeanBlsSimd.G1x8

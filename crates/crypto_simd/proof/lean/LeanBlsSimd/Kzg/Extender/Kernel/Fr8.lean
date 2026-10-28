@@ -1,3 +1,4 @@
+import LeanBlsSimd.Kzg.Fr.Arithmetic
 import LeanBlsSimd.Kzg.Extender.Kernel.Fr8Arithmetic
 import LeanBlsSimd.Refines.Fp8
 import LeanBlsSimd.Kzg.Extender.Kernel.Fr8Bytes
@@ -6,7 +7,7 @@ import LeanBlsSimd.Kzg.Extender.Kernel.Fr8BytesDecode
 import LeanBlsSimd.Kzg.Extender.Kernel.Fr8BytesEncode
 
 open Aeneas Aeneas.Std Result
-open EthCryptographySpecs Bls Kzg
+open EthLib.Cryptography Bls Kzg
 open silver_crypto_simd silver_crypto_simd.kzg
 
 namespace LeanBlsSimd.Kzg.Extender.Kernel
@@ -56,20 +57,12 @@ theorem load_refinement (input : Slice blst.blst_fr) (offset : Usize)
     simp only [BytePacking.loadedLanes, Fin.getElem_fin, Vector.getElem_ofFn]
     rw [(BytePacking.unpack_spec _).2, BytePacking.limbs_ofArray]
 
-theorem multiplier_refinement [e : KzgExternals] (hblst : BlstCorrect e) (w : Fr) :
+theorem multiplier_refinement (w : Fr) :
     fr8.multiplier (frEncode w) = ok (frEncode (w * Fr.ofNat 16)) ∧
       limbs (frEncode (w * Fr.ofNat 16)).l.val = (w.val * 2 ^ 260) % Fr.modulus := by
   refine ⟨?_, encoded_multiplier_limbs w⟩
-  have hs : fr8.SCALE = ok 16#u64 := by
-    unfold fr8.SCALE
-    rw [fr8.LIMBS, fr8.LIMB_BITS]
-    have hc : UScalar.cast .U32 5#usize = 5#u32 := by
-      apply UScalar.eq_of_val_eq
-      simp
-    rw [hc]
-    rfl
-  simp [fr8.multiplier, hs, blst_ops.fr_from_u64, blst_ops.fr_mul,
-    hblst.fr_u64, hblst.fr_mul]
+  rw [fr8.multiplier, fr8_scale_eq]
+  exact FrScalar.fr_mul_refines _ _
 
 theorem load_multiplier_refinement (input : Slice blst.blst_fr) (offset : Usize)
     (values : Fin 8 → Fr) (hsize : offset.val + 8 ≤ input.val.length)

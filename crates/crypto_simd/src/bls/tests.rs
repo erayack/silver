@@ -16,9 +16,13 @@ use rand::{Rng, SeedableRng, rngs::StdRng};
 use rand_chacha::ChaCha8Rng;
 
 use super::*;
-use crate::bls::{
-    constants::P_U64,
-    fp8::{Fp8, LANES, Limbs, pack64, unpack52},
+use crate::{
+    bls::{
+        constants::P_U64,
+        fp8::Fp8,
+        limbs::{LANES, Limbs, pack64, unpack52},
+    },
+    portable::decompress::uncompress_all_in_g1,
 };
 
 fn env_u64(name: &str, default: u64) -> u64 {
@@ -59,7 +63,7 @@ fn g2_limbs(p: &Option<blst_p2_affine>) -> Option<[[u64; 6]; 4]> {
 fn decoding_divergences(
     chunk: &[[u8; G2_COMPRESSED_LEN]; LANES],
 ) -> Vec<(usize, Option<blst_p2_affine>, Option<blst_p2_affine>)> {
-    if !simd_available() {
+    if !ifma_available() {
         return Vec::new();
     }
     let batch = unsafe { decompress_g2::decompress(chunk) };
@@ -78,7 +82,7 @@ fn decoding_divergences(
 /// the blst fallback would hide one that did, so verdicts alone cannot catch
 /// it. Empty without IFMA.
 fn member_lanes_undecided(chunk: &[[u8; G2_COMPRESSED_LEN]; LANES]) -> Vec<(usize, bool)> {
-    if !simd_available() {
+    if !ifma_available() {
         return Vec::new();
     }
     let batch = unsafe { decompress_g2::decompress(chunk) };
@@ -165,15 +169,16 @@ fn assert_uncompress_in_g2_matches_blst(
     }
     assert_eq!(divergences, 0, "seed {seed}: divergences from blst");
     assert_eq!(undecided_members, 0, "seed {seed}: G2 members marked undecided");
-    assert!(kernel_members > 0 || !simd_available(), "seed {seed}: no member reached the kernel");
+    assert!(kernel_members > 0 || !ifma_available(), "seed {seed}: no member reached the kernel");
     kinds
 }
 
 #[test]
 fn uncompress_in_g2_matches_blst_on_every_kind() {
     assert!(
-        simd_available() || std::env::var_os("SILVER_REQUIRE_IFMA").is_none(),
-        "SILVER_REQUIRE_IFMA is set, but the IFMA path is off: no avx512ifma, or no simd feature"
+        ifma_available() || std::env::var_os("SILVER_REQUIRE_IFMA").is_none(),
+        "SILVER_REQUIRE_IFMA is set, but the IFMA path is off: no avx512ifma, no simd feature, \
+         or SILVER_TEST_NO_IFMA"
     );
     let kinds = assert_uncompress_in_g2_matches_blst(uncompress_all);
     assert!(kinds.iter().all(|&n| n > 0), "{kinds:?}");
@@ -200,7 +205,7 @@ fn uncompress_in_g2_matches_blst_at_every_length() {
 
 #[test]
 fn kernel_decodes_both_rare_square_root_branches_like_blst() {
-    if !simd_available() {
+    if !ifma_available() {
         return;
     }
     let mut cases = G2Cases(ChaCha8Rng::seed_from_u64(1));
@@ -221,7 +226,7 @@ fn kernel_decodes_both_rare_square_root_branches_like_blst() {
 /// and one with a member beside them. Infinity must survive every return.
 #[test]
 fn kernel_early_returns_leave_infinity_to_blst() {
-    if !simd_available() {
+    if !ifma_available() {
         return;
     }
     let with_flags = |flags: u8| {
@@ -266,7 +271,7 @@ fn kernel_early_returns_leave_infinity_to_blst() {
     assert!(uncompress_in_g2_blst(&G2_INFINITY).is_some(), "infinity is in G2");
 }
 
-fn serialized(p: &Option<blst_p1_affine>) -> Option<[u8; 96]> {
+pub(crate) fn serialized(p: &Option<blst_p1_affine>) -> Option<[u8; 96]> {
     p.map(|p| {
         let mut out = [0u8; 96];
         unsafe { blst_p1_affine_serialize(out.as_mut_ptr(), &p) };
@@ -274,13 +279,13 @@ fn serialized(p: &Option<blst_p1_affine>) -> Option<[u8; 96]> {
     })
 }
 
-fn compress(p: &blst_p1_affine) -> [u8; COMPRESSED_LEN] {
+pub(crate) fn compress(p: &blst_p1_affine) -> [u8; COMPRESSED_LEN] {
     let mut out = [0u8; COMPRESSED_LEN];
     unsafe { blst_p1_affine_compress(out.as_mut_ptr(), p) };
     out
 }
 
-fn g1_points(n: usize) -> Vec<[u8; COMPRESSED_LEN]> {
+pub(crate) fn g1_points(n: usize) -> Vec<[u8; COMPRESSED_LEN]> {
     (0..n)
         .map(|i| {
             let msg = format!("point {i}");
@@ -304,7 +309,7 @@ fn g1_points(n: usize) -> Vec<[u8; COMPRESSED_LEN]> {
 }
 
 /// Points on the curve but, with overwhelming probability, not in G1.
-fn curve_points_outside_g1(rng: &mut StdRng, n: usize) -> Vec<[u8; COMPRESSED_LEN]> {
+pub(crate) fn curve_points_outside_g1(rng: &mut StdRng, n: usize) -> Vec<[u8; COMPRESSED_LEN]> {
     let four = fp_from(&[4, 0, 0, 0, 0, 0]);
     let mut out = Vec::with_capacity(n);
     while out.len() < n {
@@ -341,7 +346,7 @@ fn field_ops(a: &[Limbs; LANES], b: &[Limbs; LANES]) -> [[[u64; 6]; LANES]; 4] {
 
 #[test]
 fn field_ops_match_blst() {
-    if !simd_available() {
+    if !ifma_available() {
         return;
     }
     let mut rng = StdRng::seed_from_u64(7);
@@ -375,9 +380,6 @@ fn field_ops_match_blst() {
 
 #[test]
 fn verdicts_match_blst_on_members_non_members_and_garbage() {
-    if !simd_available() {
-        return;
-    }
     let mut rng = StdRng::seed_from_u64(11);
     let mut inputs = g1_points(40);
     inputs.extend(curve_points_outside_g1(&mut rng, 20));
@@ -403,11 +405,14 @@ fn verdicts_match_blst_on_members_non_members_and_garbage() {
     }
 
     let got = uncompress_all_g1(&inputs);
+    let mut portable = vec![None; inputs.len()];
+    uncompress_all_in_g1(&inputs, &mut portable);
     assert_eq!(got.len(), inputs.len());
     let mut members = 0;
     for (i, input) in inputs.iter().enumerate() {
         let want = uncompress_in_g1_blst(input);
         assert_eq!(serialized(&got[i]), serialized(&want), "input {i}");
+        assert_eq!(serialized(&portable[i]), serialized(&want), "portable input {i}");
         members += want.is_some() as usize;
     }
     assert_eq!(
@@ -417,7 +422,8 @@ fn verdicts_match_blst_on_members_non_members_and_garbage() {
 }
 
 /// h1 = 3 · 11² · 10177² · 859267² · 52437899², as (prime, exponent).
-const H1_PRIMES: [(u64, u32); 5] = [(3, 1), (11, 2), (10177, 2), (859267, 2), (52437899, 2)];
+pub(crate) const H1_PRIMES: [(u64, u32); 5] =
+    [(3, 1), (11, 2), (10177, 2), (859267, 2), (52437899, 2)];
 
 fn g1_times<const N: usize>(p: &blst_p1, scalar: &[u64; N]) -> blst_p1 {
     let mut out = blst_p1::default();
@@ -426,14 +432,14 @@ fn g1_times<const N: usize>(p: &blst_p1, scalar: &[u64; N]) -> blst_p1 {
     out
 }
 
-fn g1_affine(p: &blst_p1) -> blst_p1_affine {
+pub(crate) fn g1_affine(p: &blst_p1) -> blst_p1_affine {
     let mut out = blst_p1_affine::default();
     unsafe { blst_p1_to_affine(&mut out, p) };
     out
 }
 
 /// Seeded G1 points of small prime order, built like `G2Cases::torsion`.
-struct G1Torsion(ChaCha8Rng);
+pub(crate) struct G1Torsion(pub(crate) ChaCha8Rng);
 
 impl G1Torsion {
     fn curve_point(&mut self) -> blst_p1 {
@@ -450,7 +456,7 @@ impl G1Torsion {
         }
     }
 
-    fn of_order(&mut self, prime_index: usize) -> blst_p1 {
+    pub(crate) fn of_order(&mut self, prime_index: usize) -> blst_p1 {
         let order = H1_PRIMES[prime_index].0;
         loop {
             let mut t = g1_times(&self.curve_point(), &R_LIMBS);
@@ -473,7 +479,7 @@ impl G1Torsion {
 
 #[test]
 fn verdicts_match_blst_on_small_order_components() {
-    if !simd_available() {
+    if !ifma_available() {
         return;
     }
     let mut torsion = G1Torsion(ChaCha8Rng::seed_from_u64(13));

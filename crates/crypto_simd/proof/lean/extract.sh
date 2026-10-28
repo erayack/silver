@@ -1,8 +1,9 @@
 #!/usr/bin/env bash
 # Usage: extract.sh [--check]
 #
-# Regenerate LeanBlsSimd/Extracted/{Types,Funs}.lean from crates/crypto_simd/src using Charon
-# and Aeneas, then print the diff. By default, replace the checked-in files with the result.
+# Regenerate LeanBlsSimd/Extracted/{Types,Literals,Funs}.lean from crates/crypto_simd/src using Charon
+# and Aeneas. Validate exact literal expansion and regenerate controls/ExtractedLiterals.lean.
+# Print the diff and, by default, replace the checked-in files with the result.
 # With --check, leave them unchanged and exit 1 if the comparison finds a difference.
 # The handwritten TypesExternal.lean and FunsExternal.lean are left unchanged.
 #
@@ -30,6 +31,8 @@ esac
 
 lean_dir=$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)
 crate_dir=$(cd "$lean_dir/../.." && pwd)
+
+python3 -I "$lean_dir/controls/setup-literals-check.py"
 
 AENEAS_DIR=$(cd "$AENEAS_DIR" && pwd)
 aeneas="$AENEAS_DIR/bin/aeneas"
@@ -66,28 +69,40 @@ trap 'rm -rf "$work"' EXIT
 
 # A separate target directory keeps Charon's nightly build out of the workspace's `target/`.
 # `fp8::lanes` is a `transmute`, which Aeneas cannot translate; FunsExternal.lean defines it.
-# Each blst wrapper stays external; making the whole module opaque crashes this Aeneas revision.
-opq=()
-while read -r function; do
-  opq+=(--opaque "crate::kzg::blst_ops::$function")
-done < <(sed -n 's/^pub fn \([a-z0-9_]*\).*/\1/p' "$crate_dir/src/kzg/blst_ops.rs")
+# The `sha256` loads and stores hold raw pointers, which Aeneas cannot model.
+# The `*_available` checks query the CPU; FunsExternal.lean leaves their answers free.
+# The blst decoders and scalar pairing wrapper stay external.
 (cd "$crate_dir" &&
   CARGO_TARGET_DIR="$work/target" "$charon" cargo --preset aeneas \
     --start-from crate::bls::decompress_g2::decompress --start-from crate::bls::uncompress_in_g1 \
     --start-from crate::bls::uncompress_in_g2 \
-    --start-from crate::kzg::verify --start-from crate::kzg::cell_extender "${opq[@]}" \
-    --opaque crate::bls::fp8::lanes --opaque crate::simd_available \
-    --opaque crate::bls::uncompress_in_g1_blst --opaque crate::bls::uncompress_in_g2_blst \
+    --start-from crate::kzg::verify --start-from crate::kzg::cell_extender \
+    --opaque crate::bls::fp8::lanes --opaque crate::ifma_available \
+    --opaque crate::sha_available --opaque crate::bmi2_available \
+    --opaque crate::bls::uncompress_in_g1_blst \
+    --opaque crate::bls::uncompress_in_g2_blst \
+    --opaque crate::kzg::blst_pairing::pairing_check \
+    --opaque crate::sha256::extensions::load_bytes \
+    --opaque crate::sha256::extensions::load_words \
+    --opaque crate::sha256::extensions::store_words \
     --dest-file "$work/silver_crypto_simd.llbc")
 
 "$aeneas" -backend lean -split-files -subdir LeanBlsSimd/Extracted \
   -dest "$work/lean" "$work/silver_crypto_simd.llbc"
 
-# Supply the external dictionary, quote reserved identifiers and hoist setup rows.
-python3 -I "$lean_dir/prepare-extraction.py" "$work/lean/LeanBlsSimd/Extracted/Funs.lean"
+cp "$work/lean/LeanBlsSimd/Extracted/Funs.lean" "$work/RawFuns.lean"
 
-for f in Types.lean Funs.lean; do
-  for side in "$lean_dir/LeanBlsSimd/Extracted/$f" "$work/lean/LeanBlsSimd/Extracted/$f"; do
+# Bind runtime dictionaries, quote reserved identifiers and split setup literals.
+python3 -I "$lean_dir/prepare-extraction.py" "$work/lean/LeanBlsSimd/Extracted/Funs.lean"
+mkdir -p "$work/lean/controls"
+python3 -I "$lean_dir/controls/extraction-check.py" \
+  --raw "$work/RawFuns.lean" --prepared "$work/lean/LeanBlsSimd/Extracted" \
+  --lean-control "$work/lean/controls/ExtractedLiterals.lean"
+
+files=(LeanBlsSimd/Extracted/{Types,Literals,Funs}.lean controls/ExtractedLiterals.lean)
+
+for f in "${files[@]}"; do
+  for side in "$lean_dir/$f" "$work/lean/$f"; do
     if [[ ! -f $side ]]; then
       echo "missing $side" >&2
       exit 2
@@ -101,10 +116,10 @@ mask_spans() {
 }
 
 drift=false
-for f in Types.lean Funs.lean; do
-  mkdir -p "$work/committed" "$work/regenerated"
-  mask_spans "$lean_dir/LeanBlsSimd/Extracted/$f" >"$work/committed/$f"
-  mask_spans "$work/lean/LeanBlsSimd/Extracted/$f" >"$work/regenerated/$f"
+for f in "${files[@]}"; do
+  mkdir -p "$work/committed/$(dirname "$f")" "$work/regenerated/$(dirname "$f")"
+  mask_spans "$lean_dir/$f" >"$work/committed/$f"
+  mask_spans "$work/lean/$f" >"$work/regenerated/$f"
   status=0
   git --no-pager diff --no-index --exit-code "$work/committed/$f" "$work/regenerated/$f" ||
     status=$?
@@ -126,5 +141,6 @@ if $check; then
   exit 0
 fi
 
-cp "$work/lean/LeanBlsSimd/Extracted/Types.lean" "$work/lean/LeanBlsSimd/Extracted/Funs.lean" \
-  "$lean_dir/LeanBlsSimd/Extracted/"
+for f in "${files[@]}"; do
+  cp "$work/lean/$f" "$lean_dir/$f"
+done

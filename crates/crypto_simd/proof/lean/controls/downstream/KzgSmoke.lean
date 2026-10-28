@@ -1,14 +1,36 @@
+import LeanBlsSimd.Kzg.Extender.Statements
 import LeanBlsSimd.Kzg.Refines
+import LeanBlsSimd.Kzg.Routes
 
 open Aeneas Aeneas.Std Result
-open EthCryptographySpecs Bls Kzg
+open EthLib.Cryptography Bls Kzg
 open silver_crypto_simd silver_crypto_simd.kzg silver_crypto_simd.bls
 open LeanBlsSimd LeanBlsSimd.Kzg
 
 namespace silver_kzg.Kzg
 
-theorem scalar_decode_populates_evaluations [e : KzgExternals]
-    (hblst : BlstCorrect e) (hg1 : UncompressG1.BlstMatchesSpec)
+theorem verify_after_construction [cpu : RuntimeFeatures] [KzgExternals]
+    [UncompressG1.FallbackCorrect] :
+    ∃ initial, verify.CellBatchVerifier.new = ok initial ∧ StateInvariant initial ∧
+      (BlstPairing.CorrectFor initial.curve_work →
+      ∀ input : Input, input.Representable → ∃ verdict next,
+        input.generated initial = ok (verdict, next) ∧ StateInvariant next ∧
+        CurveWork.isLanes next.curve_work = CurveWork.isLanes initial.curve_work ∧
+        Model.rejectErrors input.embeddedSpec = verdict) := by
+  obtain ⟨initial, hnew, hs, hcall⟩ := verify_eq_spec
+  exact ⟨initial, hnew, hs, hcall initial hs⟩
+
+theorem extend_after_construction [cpu : RuntimeFeatures]
+    (blob : Extender.Blob) (cells : Extender.Cells) :
+    ∃ initial verdict next out, cell_extender.CellExtender.new = ok initial ∧
+      cell_extender.CellExtender.compute initial blob cells = ok (verdict, next, out) ∧
+      Extender.StateInvariant next ∧ (verdict = true ↔ Extender.Canonical blob) ∧
+      (verdict = false → out = cells) := by
+  obtain ⟨initial, hnew, hs, hcall⟩ := Extender.compute_eq_spec
+  obtain ⟨verdict, next, out, hrun, hn, hv, _, _, hunchanged⟩ := hcall initial hs blob cells
+  exact ⟨initial, verdict, next, out, hnew, hrun, hn, hv, hunchanged⟩
+
+theorem scalar_decode_populates_evaluations
     (v : verify.CellBatchVerifier) (hscalar : v.kernel = none)
     (cells : Slice (Aeneas.Std.Array U8 2048#usize))
     (hb : cells.val.length * 2048 ≤ Isize.max.toNat) :
@@ -18,11 +40,10 @@ theorem scalar_decode_populates_evaluations [e : KzgExternals]
         (((cellElements cells.val).takeWhile Option.isSome).filterMap id).map frEncode ∧
       next.setup = v.setup ∧ next.cosets = v.cosets := by
   obtain ⟨next, hcall, hevaluations, hsetup, hcosets⟩ :=
-    decode_cells_refines hblst hg1 v cells hb
+    decode_cells_refines v cells hb
   exact ⟨next, hcall, hevaluations hscalar, hsetup, hcosets⟩
 
-theorem kernel_interpolates_cells [e : KzgExternals]
-    (hblst : BlstCorrect e) (hg1 : UncompressG1.BlstMatchesSpec)
+theorem kernel_interpolates_cells [cpu : RuntimeFeatures]
     (v : verify.CellBatchVerifier) (hv : StateInvariant v)
     (kernel : interpolation_kernel.InterpolationKernel) (hkernel : v.kernel = some kernel)
     (indices : Slice U64) (cells : Slice (Aeneas.Std.Array U8 2048#usize))
@@ -36,13 +57,13 @@ theorem kernel_interpolates_cells [e : KzgExternals]
       G1Rep point (G1.msm
         (rustG1Bytes.map (fun b => (specPoint b).getD G1.zero))
         (Model.columnRli (indices.val.map (·.val)).toArray evals powers)) := by
-  apply interpolation_commitment_refines hblst hg1 v hv indices cells evals powers hs hb hcell
+  apply interpolation_commitment_refines v hv indices cells evals powers hs hb hcell
   · simp [hkernel]
   · exact hp
 
-theorem pairing_consumes_cells [e : KzgExternals]
-    (hblst : BlstCorrect e) (hg1 : UncompressG1.BlstMatchesSpec)
+theorem pairing_consumes_cells [cpu : RuntimeFeatures] [KzgExternals]
     (v : verify.CellBatchVerifier) (hv : StateInvariant v)
+    (hblst : BlstPairing.CorrectFor v.curve_work)
     (indices : Slice U64) (cells : Slice (Aeneas.Std.Array U8 2048#usize))
     (commitments proofs : _root_.Array G1) (evals : _root_.Array CosetEvals) (r : Fr)
     (hb : indices.val.length * 2048 ≤ Isize.max.toNat)
@@ -61,8 +82,9 @@ theorem pairing_consumes_cells [e : KzgExternals]
     ∃ next, verify.CellBatchVerifier.pairing_holds v (frEncode r) indices cells =
       ok (Bls.pairingCheck (Model.pairingInputs embeddedSetup commitments proofs
         (v.commitments.index_of_cell.val.map (·.val)).toArray
-        (indices.val.map (·.val)).toArray evals r), next) ∧ StateInvariant next := by
-  exact pairing_holds_refines hblst hg1 v hv indices cells commitments proofs evals r hb hs
+        (indices.val.map (·.val)).toArray evals r), next) ∧ StateInvariant next ∧
+      CurveWork.isLanes next.curve_work = CurveWork.isLanes v.curve_work := by
+  exact pairing_holds_refines v hv hblst indices cells commitments proofs evals r hb hs
     hc hp hcell he hunique hci hproofs hvalid
 
 
@@ -77,21 +99,21 @@ theorem msm_accepts_arbitrary_aligned_lengths
         (words.val.map (fun w => Fr.ofNat (limbs w.val))).toArray) := by
   exact LeanBlsSimd.Msm8.msm_refinement state ps words hlen hp hw
 
-theorem kernel_lincomb_requires_no_blst_law [e : KzgExternals]
-    (scratch : verify.Lincomb) (state : msm8.Msm8) (hroute : scratch.msm = some state)
+theorem kernel_lincomb_requires_no_blst_law [RuntimeFeatures]
+    (scratch : verify.CurveWork) (hroute : CurveWork.isLanes scratch = true)
     (ps : Slice blst.blst_p1_affine) (fs : Slice blst.blst_fr)
     (hlen : ps.val.length = fs.val.length)
     (hp : ∀ p ∈ ps.val, G1AffineValid p) (hf : ∀ f ∈ fs.val, FrReduced f) :
-    ∃ point next, scratch.sum ps fs = ok (point, next) ∧ next.msm.isSome = true ∧
+    ∃ point next, scratch.sum ps fs = ok (point, next) ∧ CurveWork.isLanes next = true ∧
       G1Rep point (G1.msm (ps.val.map g1ReadAffine).toArray (fs.val.map frRead).toArray) := by
-  exact verify_lincomb_raw_kernel_refinement scratch state hroute ps fs hlen hp hf
+  exact verify_lincomb_raw_kernel_refinement scratch hroute ps fs hlen hp hf
 
-theorem verifier_preserves_kernel_choices [KzgExternals]
+theorem verifier_preserves_kernel_choices [RuntimeFeatures] [KzgExternals]
     (self next : verify.CellBatchVerifier) (commitments : Slice (Aeneas.Std.Array U8 48#usize))
     (indices : Slice U64) (cells : Slice (Aeneas.Std.Array U8 2048#usize))
     (proofs : Slice (Aeneas.Std.Array U8 48#usize)) (verdict : Bool)
     (h : self.verify commitments indices cells proofs = ok (verdict, next)) :
-    next.kernel.isSome = self.kernel.isSome ∧ next.lincomb.msm.isSome = self.lincomb.msm.isSome := by
+    next.kernel.isSome = self.kernel.isSome ∧ CurveWork.isLanes next.curve_work = CurveWork.isLanes self.curve_work := by
   exact Routes.verify_preserves_routes self next commitments indices cells proofs verdict h
 
 end silver_kzg.Kzg

@@ -1,11 +1,11 @@
-import LeanBlsSimd.Kzg.Externals
+import LeanBlsSimd.Kzg.ScalarConstants
 import LeanBlsSimd.Kzg.Extender.Model
 import LeanBlsSimd.Model.SignedLimbs
 
 open Aeneas Aeneas.Std Result
-open EthCryptographySpecs Bls Kzg
+open EthLib.Cryptography Bls Kzg
 open silver_crypto_simd silver_crypto_simd.kzg
-open scoped EthCryptographySpecs.Bls.Fr
+open scoped EthLib.Cryptography.Bls.Fr
 
 attribute [-instance] Lean.Grind.Fin.instHPowFinNatOfNeZero
 attribute [-instance] Lean.Grind.Fin.instPowFinNatOfNeZero

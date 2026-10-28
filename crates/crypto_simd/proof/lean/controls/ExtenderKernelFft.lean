@@ -1,9 +1,8 @@
 import LeanBlsSimd.Kzg.Extender.Kernel.Fft
-import LeanBlsSimd.Kzg.SpecExternals
 
 open Aeneas Aeneas.Std Result
-open EthCryptographySpecs Bls Kzg Kzg.BitReversal
-open scoped EthCryptographySpecs.Bls.Fr BigOperators
+open EthLib.Cryptography Bls Kzg Kzg.BitReversal
+open scoped EthLib.Cryptography.Bls.Fr BigOperators
 open silver_crypto_simd silver_crypto_simd.kzg
 
 attribute [-instance] Lean.Grind.Fin.instHPowFinNatOfNeZero
@@ -39,9 +38,9 @@ def layoutInput : Slice blst.blst_fr :=
     scalar_tac⟩
 
 private theorem layout_table_exists :
-    ∃ table, @fft8.Fft8.new specExternals layoutInput 64#usize = ok table ∧
+    ∃ table, fft8.Fft8.new layoutInput 64#usize = ok table ∧
       FftInvariant table layoutRoots := by
-  obtain ⟨table, hnew, ht⟩ := @fft_new_refinement specExternals specExternals_correct.1
+  obtain ⟨table, hnew, ht⟩ := fft_new_refinement
     layoutInput layoutRoots 64#usize ⟨6, by decide, by decide, rfl⟩
     (by rw [layoutRoots_size]; decide) (by rw [layoutRoots_size]; decide) rfl
   exact ⟨table, hnew, by simpa only [UScalar.ofNatCore_val_eq, sampled_layout] using ht⟩
@@ -53,7 +52,7 @@ def swapShortTwiddles (table : fft8.Fft8) : fft8.Fft8 :=
       4#usize table.short.val[2]! }
 
 theorem swapped_short_twiddles_violates_generated_table :
-    ∃ table, @fft8.Fft8.new specExternals layoutInput 64#usize = ok table ∧
+    ∃ table, fft8.Fft8.new layoutInput 64#usize = ok table ∧
       FftInvariant table layoutRoots ∧ ¬ FftInvariant (swapShortTwiddles table) layoutRoots := by
   obtain ⟨table, hnew, ht⟩ := layout_table_exists
   refine ⟨table, hnew, ht, ?_⟩
@@ -76,7 +75,7 @@ def readNextWideVector (table : fft8.Fft8) : fft8.Fft8 :=
   { table with wide := alloc.vec.Vec.set table.wide 0#usize table.wide.val[1]! }
 
 theorem reading_next_wide_vector_violates_generated_table :
-    ∃ table, @fft8.Fft8.new specExternals layoutInput 64#usize = ok table ∧
+    ∃ table, fft8.Fft8.new layoutInput 64#usize = ok table ∧
       FftInvariant table layoutRoots ∧ ¬ FftInvariant (readNextWideVector table) layoutRoots := by
   obtain ⟨table, hnew, ht⟩ := layout_table_exists
   refine ⟨table, hnew, ht, ?_⟩

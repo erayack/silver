@@ -5,9 +5,9 @@
 use blst::blst_fr;
 
 use crate::kzg::{
-    CELLS_PER_EXT_BLOB, FIELD_ELEMENTS_PER_CELL,
-    blst_ops::{fr_from_u64, fr_inverse, fr_mul},
+    CELLS_PER_EXT_BLOB, FIELD_ELEMENTS_PER_CELL, INVERSE_CELL_SIZE,
     domain::{inverse_roots, reverse_bits, roots_of_unity},
+    fr::fr_mul,
 };
 
 const LOG_CELL: u32 = 6;
@@ -29,12 +29,13 @@ pub struct Cosets {
 impl Cosets {
     pub fn new() -> Self {
         let ext_roots = roots_of_unity(LOG_EXT_BLOB);
+        let inverse_ext_roots = inverse_roots(&ext_roots);
         let mut shift_inverse = Vec::with_capacity(CELLS_PER_EXT_BLOB);
         let mut shift_pow_cell = Vec::with_capacity(CELLS_PER_EXT_BLOB);
         for k in 0..CELLS_PER_EXT_BLOB {
-            let shift = ext_roots[reverse_bits(FIELD_ELEMENTS_PER_CELL * k, LOG_EXT_BLOB)];
-            shift_inverse.push(fr_inverse(&shift));
-            let mut power = shift;
+            let exponent = reverse_bits(FIELD_ELEMENTS_PER_CELL * k, LOG_EXT_BLOB);
+            shift_inverse.push(inverse_ext_roots[exponent]);
+            let mut power = ext_roots[exponent];
             for _ in 0..LOG_CELL {
                 power = fr_mul(&power, &power);
             }
@@ -42,7 +43,7 @@ impl Cosets {
         }
         Self {
             inverse_roots: inverse_roots(&roots_of_unity(LOG_CELL)),
-            inverse_size: fr_inverse(&fr_from_u64(FIELD_ELEMENTS_PER_CELL as u64)),
+            inverse_size: INVERSE_CELL_SIZE,
             shift_inverse,
             shift_pow_cell,
         }

@@ -3,7 +3,8 @@ use std::arch::x86_64::{__m512i, __mmask8, _mm512_set_epi64, _mm512_setzero_si51
 use crate::bls::{
     blst_p1_affine,
     constants::{BETA_MONT, LIMBS, TWO_POW_448_MOD_P},
-    fp8::{Fp8, LANES, Limbs, lanes, transpose8, unpack52},
+    fp8::{Fp8, lanes, transpose8},
+    limbs::{LANES, Limbs, unpack52},
 };
 
 /// Affine points by index, coordinates in R' form: row 2i holds the limbs of
@@ -24,12 +25,9 @@ impl PointStore {
         Self { rows: Vec::new(), len: 0 }
     }
 
+    #[cfg(test)]
     pub fn len(&self) -> usize {
         self.len
-    }
-
-    pub fn is_empty(&self) -> bool {
-        self.len == 0
     }
 
     pub fn capacity(&self) -> usize {

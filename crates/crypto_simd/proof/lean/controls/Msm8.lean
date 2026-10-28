@@ -12,7 +12,7 @@ open silver_crypto_simd silver_crypto_simd.bls
 noncomputable section
 
 namespace LeanBlsSimd.Controls.MsmInverse
-open EthCryptographySpecs.Bls
+open EthLib.Cryptography.Bls
 
 private def inverseWith (finish : Bool) (x : Fp8) : Fp8 :=
   let squared := x.pow_p_minus_3_over_4.square.square
@@ -88,7 +88,7 @@ end LeanBlsSimd.Controls.MsmBuckets
 namespace LeanBlsSimd.Controls.MsmDigits
 open SignedDigits
 
-private theorem tie_positive (self : msm8.buckets.SignedDigits)
+private theorem tie_positive (self : signed_digits.SignedDigits)
     (hb : self.bit.val < 256) (hwl : 1 ≤ self.window_bits.val) (hwh : self.window_bits.val ≤ 8)
     (hc : self.carry.val ≤ 1)
     (htie : value self.words / 2 ^ self.bit.val % 2 ^ self.window_bits.val + self.carry.val =
@@ -154,9 +154,9 @@ end LeanBlsSimd.Controls.MsmEqualX
 
 namespace LeanBlsSimd.Controls.MsmGlv
 
-example : GlvRefines.value msm8.glv.LAMBDA = Glv.lambda := GlvRefines.lambda_value
+example : GlvRefines.value glv.LAMBDA = Glv.lambda := GlvRefines.lambda_value
 
-example : GlvRefines.value msm8.glv.LAMBDA ≠ Glv.lambda + 1 := by
+example : GlvRefines.value glv.LAMBDA ≠ Glv.lambda + 1 := by
   rw [GlvRefines.lambda_value]
   omega
 
@@ -168,13 +168,13 @@ example : (Glv.first Glv.lambda + (Glv.lambda + 1) * Glv.second Glv.lambda) % Gl
 
 example : True := by
   fail_if_success
-    have : GlvRefines.value msm8.glv.LAMBDA = Glv.lambda + 1 := GlvRefines.lambda_value
+    have : GlvRefines.value glv.LAMBDA = Glv.lambda + 1 := GlvRefines.lambda_value
   trivial
 
 end LeanBlsSimd.Controls.MsmGlv
 
 namespace LeanBlsSimd.Controls.MsmWeights
-open EthCryptographySpecs.Bls
+open EthLib.Cryptography.Bls
 
 private def joinWith (extra : ℕ) (self : G1x8) (bits distance : ℕ) : G1x8 :=
   self.add_complete ((self.times_two_pow (distance * bits + extra)).permute (G1x8.lanesAbove distance))
@@ -242,7 +242,7 @@ example (self : msm8.pairs.BatchedAdds)
 end LeanBlsSimd.Controls.MsmQueue
 
 namespace LeanBlsSimd.Controls.MsmPlainWords
-open EthCryptographySpecs.Bls PlainWords Kzg silver_crypto_simd.kzg
+open EthLib.Cryptography.Bls PlainWords Kzg silver_crypto_simd.kzg
 
 example (input : Slice blst.blst_fr) (words : alloc.vec.Vec Word)
     (values : List Fr) (hinput : input.val = values.map frEncode) :

@@ -28,10 +28,10 @@ use silver_crypto_simd::{
         G2_COMPRESSED_LEN, blst_p2_affine,
         constants::P_U64,
         decompress_g2::{self, Batch},
-        fp8::LANES,
+        limbs::LANES,
         uncompress_in_g2, uncompress_in_g2_blst,
     },
-    simd_available,
+    ifma_available,
 };
 
 const VECTORS: &str = concat!(env!("CARGO_MANIFEST_DIR"), "/proof/decompress_g2_vectors.txt");
@@ -51,7 +51,7 @@ struct Output {
 
 impl Output {
     fn of(inputs: &[Encoding; LANES]) -> Output {
-        assert!(simd_available(), "the IFMA path is off");
+        assert!(ifma_available(), "the IFMA path is off");
         let batch: Batch = unsafe { decompress_g2::decompress(inputs) };
         Output {
             on_curve: batch.on_curve,
@@ -795,10 +795,10 @@ fn p_word(word: usize, above: bool) -> [u8; 48] {
 #[test]
 fn replay_vectors() {
     assert!(
-        simd_available() || std::env::var_os("SILVER_REQUIRE_IFMA").is_none(),
+        ifma_available() || std::env::var_os("SILVER_REQUIRE_IFMA").is_none(),
         "SILVER_REQUIRE_IFMA is set, but the IFMA path is off: no avx512ifma, or no simd feature"
     );
-    if !simd_available() {
+    if !ifma_available() {
         return;
     }
     let text = std::fs::read_to_string(VECTORS).expect(VECTORS);
@@ -955,8 +955,8 @@ mod g1 {
     use rand::{Rng, SeedableRng};
     use rand_chacha::ChaCha8Rng;
     use silver_crypto_simd::{
-        bls::{decompress, uncompress_in_g1, uncompress_in_g1_blst},
-        simd_available,
+        bls::{decompress, uncompress_in_g1},
+        ifma_available,
     };
 
     use super::{LANES, SEED, g2_cases, p_plus, p_word, small};
@@ -969,8 +969,14 @@ mod g1 {
         std::array::from_fn(|i| if i < 6 { p.x.l[i] } else { p.y.l[i - 6] })
     }
 
+    /// blst's verdict: `blst_p1_uncompress`, then `blst_p1_affine_in_g1`.
     fn scalar(bytes: &Encoding) -> Option<Point> {
-        uncompress_in_g1_blst(bytes).as_ref().map(point_words)
+        let mut p = blst_p1_affine::default();
+        let member = unsafe {
+            blst_p1_uncompress(&mut p, bytes.as_ptr()) == BLST_ERROR::BLST_SUCCESS &&
+                blst_p1_affine_in_g1(&p)
+        };
+        member.then(|| point_words(&p))
     }
 
     fn sentinel() -> blst_p1_affine {
@@ -1185,7 +1191,7 @@ mod g1 {
 
     impl Output {
         fn of(inputs: &[Encoding; LANES]) -> Self {
-            assert!(simd_available(), "G1 recording/replay requires AVX-512 IFMA");
+            assert!(ifma_available(), "G1 recording/replay requires AVX-512 IFMA");
             let b = unsafe { decompress::decompress(inputs) };
             Self {
                 valid: b.valid,
@@ -1314,11 +1320,11 @@ mod g1 {
     #[test]
     fn replay_vectors() {
         assert!(
-            simd_available() || std::env::var_os("SILVER_REQUIRE_IFMA").is_none(),
+            ifma_available() || std::env::var_os("SILVER_REQUIRE_IFMA").is_none(),
             "SILVER_REQUIRE_IFMA is set, but IFMA is unavailable"
         );
         let (batches, wrappers) = parse(&std::fs::read_to_string(VECTORS).unwrap());
-        if simd_available() {
+        if ifma_available() {
             for (index, b) in batches.iter().enumerate() {
                 assert_eq!(Output::of(&b.inputs), b.output, "G1 batch {index}");
             }
