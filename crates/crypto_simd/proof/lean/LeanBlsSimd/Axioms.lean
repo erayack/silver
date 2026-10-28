@@ -57,6 +57,9 @@ import LeanBlsSimd.Refines.Kernel
 import LeanBlsSimd.Refines.Complete
 import LeanBlsSimd.Refines.UncompressG1
 import LeanBlsSimd.Refines.UncompressG2
+import LeanBlsSimd.Refines.CheckedPoints
+import LeanBlsSimd.Refines.PointOperations
+import LeanBlsSimd.PairingProduct.Headline
 import LeanBlsSimd.Kzg
 import LeanBlsSimd.Kzg.Routes
 
@@ -88,6 +91,24 @@ def acceptedAxioms : List Name := []
 entry points must reach none of them. -/
 def checkedDefinitions : Array Name := #[``silver_crypto_simd.bls.decompress_g2.decompress,
   ``silver_crypto_simd.bls.uncompress_in_g1, ``silver_crypto_simd.bls.uncompress_in_g2,
+  ``silver_crypto_simd.bls.g1_point.G1Point.from_blst,
+  ``silver_crypto_simd.bls.g2_point.G2Point.from_blst,
+  ``silver_crypto_simd.bls.g1_point.G1Point.from_trusted,
+  ``silver_crypto_simd.bls.g2_point.G2Point.from_trusted,
+  ``silver_crypto_simd.bls.g1_point.G1Point.as_blst,
+  ``silver_crypto_simd.bls.g2_point.G2Point.as_blst,
+  ``silver_crypto_simd.bls.g1_point.G1Point.into_blst,
+  ``silver_crypto_simd.bls.g2_point.G2Point.into_blst,
+  ``silver_crypto_simd.bls.g1_point.G1Point.negative_generator,
+  ``silver_crypto_simd.bls.g1_point.G1Point.weighted_sum,
+  ``silver_crypto_simd.bls.g2_point.G2Point.weighted_sum,
+  ``silver_crypto_simd.bls.g2_point.G2Point.hash_to_curve,
+  ``silver_crypto_simd.bls.pairing_product.PairingProduct.Insts.CoreDefaultDefault.default,
+  ``silver_crypto_simd.bls.pairing_product.PairingProduct.with_capacity,
+  ``silver_crypto_simd.bls.pairing_product.PairingProduct.push,
+  ``silver_crypto_simd.bls.pairing_product.PairingProduct.clear,
+  ``silver_crypto_simd.bls.pairing_product.PairingProduct.is_one,
+  ``silver_crypto_simd.bls.pairing_product.PairingProduct.two_pairs_are_one,
   ``silver_crypto_simd.kzg.verify.CellBatchVerifier.new,
   ``silver_crypto_simd.kzg.verify.CellBatchVerifier.verify,
   ``silver_crypto_simd.kzg.verify.CellBatchVerifier.Insts.CoreDefaultDefault.default,

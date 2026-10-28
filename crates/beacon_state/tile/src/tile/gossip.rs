@@ -340,7 +340,7 @@ impl BeaconStateTile {
         }
 
         let verified =
-            VerifiedSingleAttestation { data_root: p.data_root, signature: *signature.as_sig() };
+            VerifiedSingleAttestation { data_root: p.data_root, signature: signature.into_sig() };
         let outcome = self.attestation_pool.insert_verified(
             &p.buf,
             p.committee_position,
@@ -687,7 +687,7 @@ impl BeaconStateTile {
             p.subnet,
             p.block_root,
             &p.positions,
-            signature.as_sig(),
+            &signature.into_sig(),
         );
         debug_assert!(outcome != InsertOutcome::Invalid);
         if outcome == InsertOutcome::Full {
@@ -1566,7 +1566,7 @@ impl BeaconStateTile {
         if !sig_batch.verify_all() {
             return None;
         }
-        sig_batch.last_signature().copied()
+        sig_batch.last_signature()
     }
 
     #[timed]

@@ -26,7 +26,13 @@ pub mod decompress;
 #[allow(clippy::missing_safety_doc)]
 #[doc(hidden)]
 pub mod decompress_g2;
-#[cfg(target_arch = "x86_64")]
+#[cfg_attr(
+    not(target_arch = "x86_64"),
+    allow(
+        dead_code,
+        reason = "only the point types' range check is used without the x86 decoders"
+    )
+)]
 pub(crate) mod encoding;
 #[cfg(target_arch = "x86_64")]
 #[allow(clippy::missing_safety_doc)]
@@ -39,15 +45,19 @@ pub mod fp2x8;
 #[allow(clippy::missing_safety_doc)]
 #[doc(hidden)]
 pub mod fp8;
+mod g1_point;
 #[cfg(target_arch = "x86_64")]
 #[allow(clippy::missing_safety_doc)]
 #[doc(hidden)]
 pub mod g1x8;
+mod g2_point;
 #[cfg(target_arch = "x86_64")]
 #[allow(clippy::missing_safety_doc)]
 #[doc(hidden)]
 pub mod g2x8;
 pub(crate) mod glv;
+#[cfg(target_arch = "x86_64")]
+mod lane_pairs;
 pub mod limbs;
 #[cfg(target_arch = "x86_64")]
 pub(crate) mod miller_lines;
@@ -57,6 +67,8 @@ pub(crate) mod msm8;
 #[cfg(target_arch = "x86_64")]
 #[allow(clippy::missing_safety_doc)]
 pub(crate) mod pairing;
+mod pairing_product;
+pub use pairing_product::PairingProduct;
 pub(crate) mod signed_digits;
 #[cfg(test)]
 pub(crate) mod spec_pairing;
@@ -68,6 +80,8 @@ use blst::{
     BLST_ERROR, blst_p1_affine_in_g1, blst_p1_uncompress, blst_p2_affine_in_g2, blst_p2_uncompress,
 };
 pub use blst::{blst_p1_affine, blst_p2_affine};
+pub use g1_point::G1Point;
+pub use g2_point::G2Point;
 
 use crate::ifma_available;
 #[cfg(target_arch = "x86_64")]
@@ -105,7 +119,7 @@ pub fn uncompress_in_g1_blst(bytes: &[u8; COMPRESSED_LEN]) -> Option<blst_p1_aff
 /// then `blst_p1_affine_in_g1`. On IFMA, undecided lanes and short tails use
 /// the portable decoder. Without IFMA, every input uses blst.
 #[cfg(target_arch = "x86_64")]
-pub fn uncompress_in_g1(inputs: &[[u8; COMPRESSED_LEN]], out: &mut [Option<blst_p1_affine>]) {
+pub fn uncompress_in_g1(inputs: &[[u8; COMPRESSED_LEN]], out: &mut [Option<G1Point>]) {
     assert!(out.len() == inputs.len(), "one verdict slot per input");
     if !ifma_available() {
         uncompress_all_in_g1_blst(inputs, out);
@@ -124,19 +138,23 @@ pub fn uncompress_in_g1(inputs: &[[u8; COMPRESSED_LEN]], out: &mut [Option<blst_
 
 /// Sets each `out[i]` to blst's verdict on `inputs[i]`.
 #[cfg(not(target_arch = "x86_64"))]
-pub fn uncompress_in_g1(inputs: &[[u8; COMPRESSED_LEN]], out: &mut [Option<blst_p1_affine>]) {
+pub fn uncompress_in_g1(inputs: &[[u8; COMPRESSED_LEN]], out: &mut [Option<G1Point>]) {
     assert!(out.len() == inputs.len(), "one verdict slot per input");
     uncompress_all_in_g1_blst(inputs, out);
 }
 
-fn uncompress_all_in_g1_blst(inputs: &[[u8; COMPRESSED_LEN]], out: &mut [Option<blst_p1_affine>]) {
+#[allow(clippy::manual_map, reason = "Aeneas does not translate `Option::map`")]
+fn uncompress_all_in_g1_blst(inputs: &[[u8; COMPRESSED_LEN]], out: &mut [Option<G1Point>]) {
     for i in 0..inputs.len() {
-        out[i] = uncompress_in_g1_blst(&inputs[i]);
+        out[i] = match uncompress_in_g1_blst(&inputs[i]) {
+            Some(point) => Some(G1Point::from_trusted(point)),
+            None => None,
+        };
     }
 }
 
 #[cfg(target_arch = "x86_64")]
-fn decompress_g1_chunk(chunk: &[[u8; COMPRESSED_LEN]; LANES], out: &mut [Option<blst_p1_affine>]) {
+fn decompress_g1_chunk(chunk: &[[u8; COMPRESSED_LEN]; LANES], out: &mut [Option<G1Point>]) {
     // SAFETY: `ifma_available` confirmed avx512f and avx512ifma on this CPU.
     let batch = unsafe { decompress::decompress(chunk) };
     for lane in 0..LANES {
@@ -144,7 +162,7 @@ fn decompress_g1_chunk(chunk: &[[u8; COMPRESSED_LEN]; LANES], out: &mut [Option<
         out[lane] = if batch.undecided & bit != 0 {
             uncompress_one_in_g1(&chunk[lane])
         } else if batch.valid & bit != 0 {
-            Some(batch.points[lane])
+            Some(G1Point::from_trusted(batch.points[lane]))
         } else {
             None
         };
@@ -152,19 +170,19 @@ fn decompress_g1_chunk(chunk: &[[u8; COMPRESSED_LEN]; LANES], out: &mut [Option<
 }
 
 /// `Some` iff blst accepts the encoding as a point of G2.
-pub fn uncompress_in_g2_blst(bytes: &[u8; G2_COMPRESSED_LEN]) -> Option<blst_p2_affine> {
+pub fn uncompress_in_g2_blst(bytes: &[u8; G2_COMPRESSED_LEN]) -> Option<G2Point> {
     let mut point = blst_p2_affine::default();
     // SAFETY: both pointers are valid for the lengths blst reads and writes.
     let ok = unsafe {
         blst_p2_uncompress(&mut point, bytes.as_ptr()) == BLST_ERROR::BLST_SUCCESS &&
             blst_p2_affine_in_g2(&point)
     };
-    ok.then_some(point)
+    if ok { Some(G2Point::from_trusted(point)) } else { None }
 }
 
 /// Sets each `out[i]` to a verdict identical to
 /// `uncompress_in_g2_blst(&inputs[i])`.
-pub fn uncompress_in_g2(inputs: &[[u8; G2_COMPRESSED_LEN]], out: &mut [Option<blst_p2_affine>]) {
+pub fn uncompress_in_g2(inputs: &[[u8; G2_COMPRESSED_LEN]], out: &mut [Option<G2Point>]) {
     assert!(out.len() == inputs.len(), "one verdict slot per input");
     let simd = ifma_available();
     let mut start = 0;
@@ -184,7 +202,7 @@ pub fn uncompress_in_g2(inputs: &[[u8; G2_COMPRESSED_LEN]], out: &mut [Option<bl
 
 /// A short chunk repeats its last input in the unused lanes.
 #[cfg(target_arch = "x86_64")]
-fn decompress_g2_chunk(chunk: &[[u8; G2_COMPRESSED_LEN]], out: &mut [Option<blst_p2_affine>]) {
+fn decompress_g2_chunk(chunk: &[[u8; G2_COMPRESSED_LEN]], out: &mut [Option<G2Point>]) {
     let mut lanes = [[0u8; G2_COMPRESSED_LEN]; LANES];
     for lane in 0..LANES {
         lanes[lane] = chunk[if lane < chunk.len() { lane } else { chunk.len() - 1 }];
@@ -196,7 +214,7 @@ fn decompress_g2_chunk(chunk: &[[u8; G2_COMPRESSED_LEN]], out: &mut [Option<blst
         out[lane] = if batch.undecided & bit != 0 {
             uncompress_in_g2_blst(&chunk[lane])
         } else if batch.valid & bit != 0 {
-            Some(batch.points[lane])
+            Some(G2Point::from_trusted(batch.points[lane]))
         } else {
             None
         };
@@ -204,7 +222,7 @@ fn decompress_g2_chunk(chunk: &[[u8; G2_COMPRESSED_LEN]], out: &mut [Option<blst
 }
 
 #[cfg(not(target_arch = "x86_64"))]
-fn decompress_g2_chunk(chunk: &[[u8; G2_COMPRESSED_LEN]], out: &mut [Option<blst_p2_affine>]) {
+fn decompress_g2_chunk(chunk: &[[u8; G2_COMPRESSED_LEN]], out: &mut [Option<G2Point>]) {
     for lane in 0..chunk.len() {
         out[lane] = uncompress_in_g2_blst(&chunk[lane]);
     }

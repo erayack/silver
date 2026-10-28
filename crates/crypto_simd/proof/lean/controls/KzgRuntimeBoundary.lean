@@ -29,19 +29,48 @@ run_cmd do
     ``silver_crypto_simd.kzg.cell_extender.CellExtender.new,
     ``silver_crypto_simd.kzg.cell_extender.CellExtender.compute,
     ``silver_crypto_simd.kzg.cell_extender.CellExtender.Insts.CoreDefaultDefault.default]
+  let constructors := #[``silver_crypto_simd.bls.PointExternals,
+    ``silver_crypto_simd.bls.PointExternals.fromG1,
+    ``silver_crypto_simd.bls.PointExternals.fromG2,
+    ``silver_crypto_simd.bls.g1_point.G1Point.from_blst,
+    ``silver_crypto_simd.bls.g2_point.G2Point.from_blst,
+    ``LeanBlsSimd.CheckedPoints.ConstructorsMatchSpec]
   let forbidden := #[``silver_crypto_simd.bls.BlsExternals,
     ``silver_crypto_simd.bls.BlsExternals.uncompressG2,
-    ``silver_crypto_simd.bls.uncompress_in_g2_blst]
+    ``silver_crypto_simd.bls.uncompress_in_g2_blst,
+    ``silver_crypto_simd.bls.PointOperationExternals] ++ constructors
+  let pairing := #[``silver_crypto_simd.bls.PairingExternals,
+    ``silver_crypto_simd.bls.PairingExternals.check,
+    ``silver_crypto_simd.bls.pairing_product.PairingInputs.blst_is_one,
+    ``LeanBlsSimd.PairingProduct.BlstMatchesSpec]
   let env ← getEnv
   let used := dependencies env roots
-  for declName in forbidden do
+  for declName in forbidden ++ pairing do
     if used.contains declName then
-      throwError "KZG dependency closure reaches signature-only external {declName}"
+      throwError "KZG dependency closure reaches an excluded external {declName}"
   let signature := dependencies env #[``silver_crypto_simd.bls.uncompress_in_g2]
   unless signature.contains ``silver_crypto_simd.bls.uncompress_in_g2_blst do
     throwError "signature-path control no longer reaches the opaque G2 decoder"
-  logInfo m!"{roots.size} KZG headlines and runtime entry points exclude the opaque G2 decoder; \
-    signature-path control reaches it"
+  let decoders := dependencies env #[``LeanBlsSimd.UncompressG1.uncompress_in_g1_eq_spec_list,
+    ``LeanBlsSimd.UncompressG2.uncompress_in_g2_eq_spec_list]
+  for declName in #[``silver_crypto_simd.bls.PointOperationExternals] ++ constructors ++ pairing do
+    if decoders.contains declName then
+      throwError "decoder headline reaches an excluded external {declName}"
+  let admission := dependencies env #[``LeanBlsSimd.CheckedPoints.g1_from_blst_some_iff,
+    ``LeanBlsSimd.CheckedPoints.g2_from_blst_some_iff]
+  for declName in constructors do
+    unless admission.contains declName do
+      throwError "raw-constructor control no longer reaches {declName}"
+  let operation := dependencies env #[``silver_crypto_simd.bls.g2_point.G2Point.hash_to_curve]
+  unless operation.contains ``silver_crypto_simd.bls.PointOperationExternals do
+    throwError "point-operation control no longer reaches its dictionary"
+  let pairingBoundary := dependencies env #[``LeanBlsSimd.PairingProduct.blst_is_one_eq_spec]
+  for declName in pairing do
+    unless pairingBoundary.contains declName do
+      throwError "pairing control no longer reaches {declName}"
+  logInfo m!"{roots.size} KZG headlines and runtime entry points exclude the opaque G2 decoder \
+    and point operations/constructors and pairing; decoder headlines exclude those same externals; \
+    positive controls reach their respective external dictionaries and constructor contract"
 
 private def requireIndependent (root : Name) : CommandElabM Unit := do
   let env ← getEnv

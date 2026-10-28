@@ -14,7 +14,9 @@ The main APIs are:
 
 - `kzg::CellBatchVerifier`: create one with `new()`, then call `verify(commitments, cell_indices, cells, proofs)` per batch. It returns true exactly when the spec's `verify_cell_kzg_proof_batch` does. Reuse the verifier to retain its allocated buffers between calls.
 - `kzg::CellExtender`: create one with `new()`, then call `compute(blob, cells)` per blob. It fills all 128 cells, or returns false and leaves `cells` unchanged when the spec rejects the blob.
-- `bls::uncompress_in_g1` and `bls::uncompress_in_g2`: batch decoding of compressed points with subgroup checks, one `Option` per input.
+- `bls::uncompress_in_g1` and `bls::uncompress_in_g2`: batch decoding of compressed points with subgroup checks. They fill a caller's slice of `Option<G1Point>` or `Option<G2Point>`, one verdict per input.
+- `bls::G1Point` and `bls::G2Point`: canonical, on-curve points in the prime-order subgroup, including infinity. `from_blst` checks all three properties. `G1Point::from_trusted` skips validation. Its caller must ensure all three properties hold.
+- `bls::PairingProduct`: create one with `with_capacity`, `push` pairs, then call `is_one()`. It returns true exactly when the spec's `pairingCheck` does on the pushed pairs. `push` drops pairs with an infinity point, as the spec does. `two_pairs_are_one` checks two pairs without allocating.
 
 `ifma_available()` reports whether this process uses the AVX-512 IFMA kernels. The other public modules, including the `#[doc(hidden)]` kernels, are internals.
 
@@ -30,10 +32,12 @@ The crate selects code at run time based on CPU features. It reads no environmen
 
 ### Uses of blst
 
-- The `bls` API returns blst's point types, `blst_p1_affine` and `blst_p2_affine`, re-exported from `bls`.
+- The `bls` API returns `G1Point` and `G2Point`, which own canonical subgroup points in blst's affine layout.
 - G2 decoding falls back to blst for lanes the IFMA kernel leaves undecided and for batches too short for the kernel. It also uses blst on every CPU without the IFMA route. `bls::uncompress_in_g2_blst` exposes that decoder.
 - G1 decoding uses blst on CPUs without IFMA. Undecided IFMA lanes and short tails use the portable Rust decoder. `bls::uncompress_in_g1_blst` exposes the blst decoder.
 - KZG pairing uses blst without IFMA, filtering pairs with either point at infinity. Its MSM uses portable Rust. KZG extension and SHA-256 do not call blst.
+- Signature pairing uses blst on every CPU without the IFMA route. If an active IFMA lane produces zero output Z, `PairingProduct` recomputes the whole filtered product with blst.
+- Checked raw-point constructors, `G2Point::hash_to_curve`, both `weighted_sum` methods and `G1Point::negative_generator` use blst.
 
 ## Reusing the project
 
