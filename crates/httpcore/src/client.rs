@@ -202,8 +202,15 @@ fn parse_response_head(buf: &[u8]) -> io::Result<Option<(u16, Framing)>> {
     }
     match content_length {
         Some(value) if !value.is_empty() && value.iter().all(|b| b.is_ascii_digit()) => {
-            let cl = value.iter().copied().fold(0usize, |acc, b| acc * 10 + (b - b'0') as usize);
-            Ok(Some((status, Framing::Length { body_start: header_end, total: header_end + cl })))
+            let total = value
+                .iter()
+                .copied()
+                .try_fold(0usize, |acc, b| acc.checked_mul(10)?.checked_add((b - b'0') as usize))
+                .and_then(|cl| header_end.checked_add(cl))
+                .ok_or_else(|| {
+                    io::Error::new(io::ErrorKind::InvalidData, "invalid Content-Length")
+                })?;
+            Ok(Some((status, Framing::Length { body_start: header_end, total })))
         }
         Some(_) => Err(io::Error::new(io::ErrorKind::InvalidData, "invalid Content-Length")),
         None => Err(io::Error::new(io::ErrorKind::InvalidData, "missing Content-Length")),
@@ -487,6 +494,58 @@ mod tests {
         let err = feed(&mut conn, b"HTTP/1.1 200 OK\r\nContent-Length: abc\r\n\r\n{}").unwrap_err();
         assert_eq!(err.kind(), io::ErrorKind::InvalidData);
         assert_eq!(err.to_string(), "invalid Content-Length");
+    }
+
+    #[test]
+    fn overflowing_decimal_content_length_is_error() {
+        for value in [
+            format!("{}0", usize::MAX),
+            "9".repeat(usize::BITS as usize),
+            (usize::MAX as u128 + 1).to_string(),
+        ] {
+            let mut conn = machine();
+            let response = format!("HTTP/1.1 200 OK\r\nContent-Length: {value}\r\n\r\n");
+            let err = feed(&mut conn, response.as_bytes()).unwrap_err();
+            assert_eq!(err.kind(), io::ErrorKind::InvalidData);
+            assert_eq!(err.to_string(), "invalid Content-Length");
+        }
+    }
+
+    #[test]
+    fn content_length_overflowing_with_headers_is_error() {
+        let mut conn = machine();
+        let response = format!("HTTP/1.1 200 OK\r\nContent-Length: {}\r\n\r\n", usize::MAX);
+        let err = feed(&mut conn, response.as_bytes()).unwrap_err();
+        assert_eq!(err.kind(), io::ErrorKind::InvalidData);
+        assert_eq!(err.to_string(), "invalid Content-Length");
+    }
+
+    #[test]
+    fn valid_content_lengths_preserve_the_body() {
+        for (value, body) in [("0", ""), ("000", ""), ("2", "{}"), ("0002", "{}")] {
+            let mut conn = machine();
+            let response = format!("HTTP/1.1 200 OK\r\nContent-Length: {value}\r\n\r\n{body}");
+            feed(&mut conn, response.as_bytes()).unwrap();
+            assert_eq!(conn.take_response().unwrap().body, body.as_bytes());
+        }
+    }
+
+    #[test]
+    fn overflowing_content_length_is_ignored_when_overridden() {
+        let value = format!("{}0", usize::MAX);
+        for status in [100, 101, 199, 204, 304] {
+            let mut conn = machine();
+            let response = format!("HTTP/1.1 {status} Status\r\nContent-Length: {value}\r\n\r\n");
+            feed(&mut conn, response.as_bytes()).unwrap();
+            assert!(conn.take_response().unwrap().body.is_empty());
+        }
+
+        let mut conn = machine();
+        let response = format!(
+            "HTTP/1.1 200 OK\r\nContent-Length: {value}\r\nTransfer-Encoding: chunked\r\n\r\n2\r\n{{}}\r\n0\r\n\r\n"
+        );
+        feed(&mut conn, response.as_bytes()).unwrap();
+        assert_eq!(conn.take_response().unwrap().body, b"{}");
     }
 
     #[test]
