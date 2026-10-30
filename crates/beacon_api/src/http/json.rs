@@ -5,11 +5,11 @@
 use std::io::Write;
 
 use silver_beacon_state_data::{
-    B256, BLSPubkey, BeaconBlockHeader, Checkpoint, FAR_FUTURE_EPOCH, Fork, ForkName, SpecConfig,
-    Version,
+    B256, BLSPubkey, BeaconBlockHeader, Builder, Checkpoint, FAR_FUTURE_EPOCH, Fork, ForkName,
+    SpecConfig, Version,
 };
 use silver_common::{
-    AGENT_VERSION,
+    AGENT_VERSION, PreparedPayloadAttributes,
     ssz_view::{
         AttestationView, BEACON_BLOCK_HEADER_SIZE, BYTES_PER_KZG_COMMITMENT, BeaconBlockHeaderView,
         IndexedAttestationView, PAYLOAD_ATTESTATION_DATA_SIZE, PROPOSER_SLASHING_SIZE,
@@ -17,7 +17,7 @@ use silver_common::{
         SIGNED_PROPOSER_PREFERENCES_SIZE, SIGNED_VOLUNTARY_EXIT_SIZE, SINGLE_ATT_SIZE,
         SYNC_COMMITTEE_CONTRIBUTION_SIZE, SignedBlsToExecutionChangeView,
         SignedProposerPreferencesView, SignedVoluntaryExitView, SingleAttestationView,
-        SyncCommitteeContributionView,
+        SyncCommitteeContributionView, WITHDRAWAL_SIZE, WithdrawalView,
     },
 };
 
@@ -32,6 +32,16 @@ use crate::{
 };
 
 const HEX_LOWER: &[u8; 16] = b"0123456789abcdef";
+
+const HEX_PAIRS: [[u8; 2]; 256] = {
+    let mut pairs = [[0; 2]; 256];
+    let mut byte = 0;
+    while byte < 256 {
+        pairs[byte] = [HEX_LOWER[byte >> 4], HEX_LOWER[byte & 0xf]];
+        byte += 1;
+    }
+    pairs
+};
 
 /// Appends JSON to a buffer the caller owns — fresh or reused is the caller's
 /// affair. `start` is where this body begins, so bytes already in the buffer
@@ -79,19 +89,18 @@ impl<'a> Json<'a> {
 
     pub(crate) fn quoted_u64(&mut self, value: u64) {
         self.separate();
-        let mut digits = [0u8; 20];
-        let mut written = 0;
-        let mut rest = value;
-        loop {
-            digits[19 - written] = b'0' + (rest % 10) as u8;
-            rest /= 10;
-            written += 1;
-            if rest == 0 {
-                break;
-            }
+        self.unseparated_quoted_u64(value);
+    }
+
+    fn unseparated_quoted_u64(&mut self, value: u64) {
+        // Most validators' epochs are unset, and `u64::MAX` is itoa's slowest
+        // input.
+        if value == FAR_FUTURE_EPOCH {
+            self.out.extend_from_slice(b"\"18446744073709551615\"");
+            return;
         }
         self.out.push(b'"');
-        self.out.extend_from_slice(&digits[20 - written..]);
+        self.out.extend_from_slice(itoa::Buffer::new().format(value).as_bytes());
         self.out.push(b'"');
     }
 
@@ -107,10 +116,16 @@ impl<'a> Json<'a> {
 
     pub(crate) fn hex(&mut self, bytes: &[u8]) {
         self.separate();
+        self.unseparated_hex(bytes);
+    }
+
+    fn unseparated_hex(&mut self, bytes: &[u8]) {
         self.out.extend_from_slice(b"\"0x");
         let base = self.out.len();
         self.out.resize(base + bytes.len() * 2, 0);
-        hex::encode_to_slice(bytes, &mut self.out[base..]).expect("hex encode_to_slice");
+        for (pair, byte) in self.out[base..].chunks_exact_mut(2).zip(bytes) {
+            pair.copy_from_slice(&HEX_PAIRS[*byte as usize]);
+        }
         self.out.push(b'"');
     }
 
@@ -256,14 +271,19 @@ impl Json<'_> {
     }
 
     pub(crate) fn flagged_envelope(&mut self, flags: ReadFlags, data: impl FnOnce(&mut Self)) {
+        self.begin_flagged_envelope(flags);
+        data(self);
+        self.end_object();
+    }
+
+    /// The envelope up to its `data` value, for a body rendered in parts.
+    pub(crate) fn begin_flagged_envelope(&mut self, flags: ReadFlags) {
         self.begin_object();
         self.key("execution_optimistic");
         self.bool(flags.execution_optimistic);
         self.key("finalized");
         self.bool(flags.finalized);
         self.key("data");
-        data(self);
-        self.end_object();
     }
 
     pub(crate) fn genesis(&mut self, genesis: &GenesisData) {
@@ -467,6 +487,64 @@ impl Json<'_> {
         self.hex(&head.roots.current_duty_dependent_root);
         self.key("execution_optimistic");
         self.bool(head.execution_optimistic);
+        self.end_object();
+    }
+
+    pub(crate) fn payload_attributes_event(
+        &mut self,
+        attributes: &PreparedPayloadAttributes,
+        withdrawals_ssz: &[u8],
+        gloas: bool,
+    ) {
+        self.begin_object();
+        self.key("proposer_index");
+        self.quoted_u64(attributes.proposer_index);
+        self.key("proposal_slot");
+        self.quoted_u64(attributes.proposal_slot);
+        if let Some(number) = attributes.parent_block_number {
+            self.key("parent_block_number");
+            self.quoted_u64(number);
+        }
+        self.key("parent_block_root");
+        self.hex(&attributes.parent_block_root);
+        self.key("parent_block_hash");
+        self.hex(&attributes.parent_block_hash);
+        self.key("payload_attributes");
+        self.begin_object();
+        self.key("timestamp");
+        self.quoted_u64(attributes.timestamp);
+        self.key("prev_randao");
+        self.hex(&attributes.prev_randao);
+        self.key("suggested_fee_recipient");
+        self.hex(&attributes.fee_recipient);
+        self.key("withdrawals");
+        self.begin_array();
+        for withdrawal in withdrawals_ssz.chunks_exact(WITHDRAWAL_SIZE) {
+            self.withdrawal(withdrawal.try_into().unwrap());
+        }
+        self.end_array();
+        self.key("parent_beacon_block_root");
+        self.hex(&attributes.parent_block_root);
+        if gloas {
+            self.key("slot_number");
+            self.quoted_u64(attributes.proposal_slot);
+            self.key("target_gas_limit");
+            self.quoted_u64(attributes.target_gas_limit);
+        }
+        self.end_object();
+        self.end_object();
+    }
+
+    fn withdrawal(&mut self, ssz: &[u8; WITHDRAWAL_SIZE]) {
+        self.begin_object();
+        self.key("index");
+        self.quoted_u64(WithdrawalView::index(ssz));
+        self.key("validator_index");
+        self.quoted_u64(WithdrawalView::validator_index(ssz));
+        self.key("address");
+        self.hex(WithdrawalView::address(ssz));
+        self.key("amount");
+        self.quoted_u64(WithdrawalView::amount(ssz));
         self.end_object();
     }
 
@@ -766,33 +844,58 @@ impl Json<'_> {
         self.end_object();
     }
 
-    /// `ValidatorResponse` (`apis/beacon/states/validator.yaml`).
+    /// `ValidatorResponse` (`apis/beacon/states/validator.yaml`). Keys are
+    /// literals, as a whole-registry read writes about a million of these.
     pub(crate) fn validator(&mut self, record: &ValidatorRecord) {
+        let lifecycle = &record.lifecycle;
+        self.separate();
+        self.out.extend_from_slice(b"{\"index\":");
+        self.unseparated_quoted_u64(record.index);
+        self.out.extend_from_slice(b",\"balance\":");
+        self.unseparated_quoted_u64(record.balance);
+        self.out.extend_from_slice(b",\"status\":\"");
+        self.out.extend_from_slice(record.status.name().as_bytes());
+        self.out.extend_from_slice(b"\",\"validator\":{\"pubkey\":");
+        self.unseparated_hex(&record.pubkey);
+        self.out.extend_from_slice(b",\"withdrawal_credentials\":");
+        self.unseparated_hex(&record.withdrawal_credentials.0);
+        self.out.extend_from_slice(b",\"effective_balance\":");
+        self.unseparated_quoted_u64(record.effective_balance);
+        self.out.extend_from_slice(if lifecycle.slashed {
+            b",\"slashed\":true,\"activation_eligibility_epoch\":".as_slice()
+        } else {
+            b",\"slashed\":false,\"activation_eligibility_epoch\":".as_slice()
+        });
+        self.unseparated_quoted_u64(lifecycle.activation_eligibility_epoch);
+        self.out.extend_from_slice(b",\"activation_epoch\":");
+        self.unseparated_quoted_u64(lifecycle.activation_epoch);
+        self.out.extend_from_slice(b",\"exit_epoch\":");
+        self.unseparated_quoted_u64(lifecycle.exit_epoch);
+        self.out.extend_from_slice(b",\"withdrawable_epoch\":");
+        self.unseparated_quoted_u64(lifecycle.withdrawable_epoch);
+        self.out.extend_from_slice(b"}}");
+    }
+
+    pub(crate) fn builder(&mut self, index: u64, status: &str, builder: &Builder) {
         self.begin_object();
         self.key("index");
-        self.quoted_u64(record.index);
-        self.key("balance");
-        self.quoted_u64(record.balance);
+        self.quoted_u64(index);
         self.key("status");
-        self.string(record.status.name());
-        self.key("validator");
+        self.string(status);
+        self.key("builder");
         self.begin_object();
         self.key("pubkey");
-        self.hex(&record.pubkey);
-        self.key("withdrawal_credentials");
-        self.hex(&record.withdrawal_credentials.0);
-        self.key("effective_balance");
-        self.quoted_u64(record.effective_balance);
-        self.key("slashed");
-        self.bool(record.lifecycle.slashed);
-        self.key("activation_eligibility_epoch");
-        self.quoted_u64(record.lifecycle.activation_eligibility_epoch);
-        self.key("activation_epoch");
-        self.quoted_u64(record.lifecycle.activation_epoch);
-        self.key("exit_epoch");
-        self.quoted_u64(record.lifecycle.exit_epoch);
+        self.hex(&builder.pubkey);
+        self.key("version");
+        self.quoted_u64(builder.version.into());
+        self.key("execution_address");
+        self.hex(&builder.execution_address);
+        self.key("balance");
+        self.quoted_u64(builder.balance);
+        self.key("deposit_epoch");
+        self.quoted_u64(builder.deposit_epoch);
         self.key("withdrawable_epoch");
-        self.quoted_u64(record.lifecycle.withdrawable_epoch);
+        self.quoted_u64(builder.withdrawable_epoch);
         self.end_object();
         self.end_object();
     }

@@ -37,7 +37,7 @@ impl ProductionRig {
             BlockSource::Gossip,
             false,
             &mut rig.adapter.producers,
-            |_| {},
+            |_, _| {},
         );
         assert_eq!(feedback, Feedback::BlockImported(root));
         let payload = PayloadFrame::parse(&frame).unwrap();
@@ -101,7 +101,9 @@ impl ProductionRig {
     fn publication_result(&mut self) -> Vec<Result<(), LocalGossipFailure>> {
         let mut results = Vec::new();
         self.sink.consume(|response: BeaconApiResponse, _| {
-            if let BeaconApiResponse::LocalGossipResponse { request_id: 42, response } = response {
+            if let BeaconApiResponse::LocalGossipResponse { request_id: 42, response, .. } =
+                response
+            {
                 results.push(response);
             }
         });
@@ -166,7 +168,12 @@ fn blobless_envelope_reaches_engine_and_storage_through_gossip() {
     let mut requests = Vec::new();
     rig.sink.consume(|request: BeaconApiRequest, _| requests.push(request));
     let [
-        BeaconApiRequest::LocalGossip { request_id: 42, topic: GossipTopic::ExecutionPayload, ssz },
+        BeaconApiRequest::LocalGossip {
+            request_id: 42,
+            topic: GossipTopic::ExecutionPayload,
+            ssz,
+            validation: BroadcastValidation::Gossip,
+        },
     ] = requests[..]
     else {
         panic!("release signed envelope")

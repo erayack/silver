@@ -3,7 +3,11 @@ use std::net::{IpAddr, Ipv4Addr, SocketAddr};
 
 #[cfg(test)]
 use silver_beacon_state_data::BeaconStateOwner;
-use silver_beacon_state_data::{BeaconStateReader, SLOTS_PER_EPOCH, SpecConfig, StateReadView};
+use silver_beacon_state_data::{
+    BeaconStateReader, PinnedState, SLOTS_PER_EPOCH, SpecConfig, StateReadView,
+};
+#[cfg(test)]
+use silver_common::SyncUpdate;
 use silver_common::{Enr, Identify, Keypair};
 
 use crate::{
@@ -30,6 +34,7 @@ pub(crate) struct ApiCtx {
     pub(crate) has_sidecar: bool,
     pub(crate) pools: OperationPools,
     pub(crate) proposer_preferences: ProposerPreferences,
+    pub(crate) registry_downloads: usize,
 }
 
 impl ApiCtx {
@@ -57,6 +62,7 @@ impl ApiCtx {
             has_sidecar,
             pools: OperationPools::default(),
             proposer_preferences: ProposerPreferences::default(),
+            registry_downloads: 0,
         }
     }
 
@@ -104,6 +110,20 @@ impl ApiCtx {
                 json.flagged_envelope(read_flags(node_status, &view), |json| render(&view, json));
             });
         });
+    }
+
+    /// Resolves `{state_id}` to a state that stays readable through
+    /// `BeaconStateReader::read_pinned` until the next finalize, for a body
+    /// too large to render under one read.
+    pub(crate) fn pin_state(
+        &self,
+        req: &Request<'_>,
+        resp: &mut Response<'_>,
+    ) -> Option<PinnedState> {
+        if !self.serves_state(req, resp) {
+            return None;
+        }
+        Some(self.state.pin().expect("beacon api needs the anchor state published"))
     }
 
     /// [`Self::state_response`] whose `render` may refuse the read; the
@@ -163,7 +183,7 @@ pub(crate) struct StateRead<R> {
     pub(crate) data: R,
 }
 
-fn read_flags(node_status: NodeStatus, view: &StateReadView<'_>) -> ReadFlags {
+pub(crate) fn read_flags(node_status: NodeStatus, view: &StateReadView<'_>) -> ReadFlags {
     ReadFlags {
         execution_optimistic: node_status.execution_optimistic(),
         finalized: node_status.is_finalized(view.slot.state().latest_block_header.slot),
@@ -207,5 +227,7 @@ pub(crate) fn test_ctx(spec: &SpecConfig, state: BeaconStateReader) -> ApiCtx {
     let enr = Enr::builder().build(keypair.secret_key()).unwrap();
     let mut identify = Identify::default();
     identify.tcp_ipv4 = Some(SocketAddr::new(IpAddr::V4(Ipv4Addr::new(1, 2, 3, 4)), 9000));
-    ApiCtx::new(&keypair, &enr, &identify, spec, state, false)
+    let mut ctx = ApiCtx::new(&keypair, &enr, &identify, spec, state, false);
+    ctx.node_status.target = Some(SyncUpdate::Following);
+    ctx
 }

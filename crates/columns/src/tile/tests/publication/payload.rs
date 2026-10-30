@@ -134,7 +134,8 @@ fn cached_and_submitted_blobs_publish_every_gloas_column() {
         assert_eq!(requests, [BeaconApiRequest::LocalGossip {
             request_id: 42,
             topic: GossipTopic::ExecutionPayload,
-            ssz: proposal.ssz
+            ssz: proposal.ssz,
+            validation: silver_common::BroadcastValidation::Gossip,
         }]);
         rig.inj.consume(|_: BeaconApiResponse, _| panic!("Control must confirm the broadcast"));
     }
@@ -159,7 +160,7 @@ fn misplaced_proofs_release_neither_columns_nor_envelope() {
         });
         let mut failures = Vec::new();
         rig.inj.consume(|response: BeaconApiResponse, _| {
-            if let BeaconApiResponse::LocalGossipResponse { request_id, response } = response {
+            if let BeaconApiResponse::LocalGossipResponse { request_id, response, .. } = response {
                 failures.push((request_id, response));
             }
         });

@@ -6,13 +6,13 @@ use std::{
 };
 
 use mio::{Events, Interest, Registry, Token, event::Event};
-use silver_beacon_state_data::{BeaconStateReader, SpecConfig};
+use silver_beacon_state_data::{B256, BeaconStateReader, SpecConfig};
 use silver_common::{
     BeaconApiRequest, BeaconApiResponse, BeaconStateEvent, BlockStage, DataColumnsEvent,
-    ELSyncStatus, EngineResp, Enr, GossipTopic, HeadChange, Identify, Keypair, LocalGossipFailure,
-    LocalGossipResult, PayloadValidationStatus, PeerEvent, SyncUpdate, TCacheError, TCacheId,
-    TCacheProducer, TCacheRead, TCacheReader, TCacheTable, TProducer, TReadMode, TileId,
-    block_root,
+    ELSyncStatus, EngineResp, Enr, ForkName, GossipTopic, HeadChange, Identify, Keypair,
+    LocalGossipFailure, LocalGossipResult, PayloadValidationStatus, PeerEvent,
+    PreparedPayloadAttributes, SyncUpdate, TCacheError, TCacheId, TCacheProducer, TCacheRead,
+    TCacheReader, TCacheTable, TProducer, TReadMode, TileId, block_root,
     column_util::kzg_commitments_from_sidecar,
     ssz_view::{SignedBeaconBlockView, StatusView},
 };
@@ -24,7 +24,10 @@ use silver_pbs::{BuilderConfig, PreferenceFailures, PreferencesBody, SidecarCall
 
 use crate::{
     HeadStatus, NodeStatus,
-    beacon::blocks::Kind,
+    beacon::{
+        blocks::Kind,
+        validators::{Batch, RegistryStream},
+    },
     ctx::ApiCtx,
     events::{self, Channel, ChannelSet, HeadEvent, head_verdict::HeadVerdict},
     http::{
@@ -33,8 +36,11 @@ use crate::{
         router::{Outcome, Router},
     },
     node::peers::Peer,
-    routes::ROUTES,
-    submission::{AcceptedEntry, BuilderForward, SubmissionFailure, failure_message},
+    routes::{ROUTES, SERVED_WHILE_SYNCING},
+    submission::{
+        AcceptedEntry, BuilderForward, Integration, RecentImports, SubmissionFailure,
+        failure_message,
+    },
     validator::{
         aggregate_attestation::AggregateRequest, execution_payload_envelope::EnvelopeRequest,
         produce_block::ProduceBlockRequest, sync_contribution::SyncCommitteeContributionRequest,
@@ -78,6 +84,7 @@ struct Connection {
 enum State {
     Requests(Requests),
     Subscription(Subscription),
+    Download(Download),
 }
 
 struct Requests {
@@ -106,10 +113,9 @@ struct PendingSubmission {
     first_id: u64,
     body_len: usize,
     unanswered: usize,
-    broadcast_only: bool,
-    awaits_envelope_validation: bool,
     failures: Vec<SubmissionFailure>,
     forward: Option<BuilderForward>,
+    integration: Integration,
 }
 
 impl PendingSubmission {
@@ -122,30 +128,47 @@ impl PendingSubmission {
         self.body_index(request_id).is_some()
     }
 
-    /// Whether this was the last answer awaited.
-    fn record(&mut self, request_id: u64, result: LocalGossipResult) -> bool {
+    /// Returns the builder forward once every entry is broadcast: the builder
+    /// releases the payload on the block, not on its import.
+    fn record(
+        &mut self,
+        request_id: u64,
+        result: LocalGossipResult,
+        block_root: Option<B256>,
+        imports: &RecentImports,
+    ) -> Option<BuilderForward> {
         let body_index = self.body_index(request_id).expect("awaited");
         self.unanswered -= 1;
-        if let Err(failure) = result &&
-            !self.failures.iter().any(|failed| failed.body_index == body_index)
-        {
-            self.failures.push(SubmissionFailure { body_index, message: failure_message(failure) });
+        match result {
+            Ok(()) if self.integration.awaits_import() => {
+                self.integration.on_published(block_root);
+                self.integration.update(imports, Instant::now());
+            }
+            Ok(()) => {}
+            Err(failure) => {
+                if !self.failures.iter().any(|failed| failed.body_index == body_index) {
+                    let message = failure_message(failure);
+                    self.failures.push(SubmissionFailure { body_index, message });
+                }
+            }
         }
-        self.settled()
+        let published = self.unanswered == 0 && self.failures.is_empty();
+        if published { self.forward.take() } else { None }
     }
 
     fn settled(&self) -> bool {
-        self.unanswered == 0 && (!self.awaits_envelope_validation || !self.failures.is_empty())
+        let integration_known =
+            matches!(self.integration, Integration::Integrated | Integration::BroadcastOnly);
+        self.unanswered == 0 && (!self.failures.is_empty() || integration_known)
     }
 
-    /// Returns the builder forward of a submission published whole.
-    fn respond(&mut self, resp: &mut Response<'_>) -> Option<BuilderForward> {
-        if self.failures.is_empty() {
-            resp.status_only(if self.broadcast_only { 202 } else { 200 });
-            self.forward.take()
-        } else {
+    fn respond(&self, resp: &mut Response<'_>) {
+        if !self.failures.is_empty() {
             resp.indexed_failures(&self.failures);
-            None
+        } else if self.integration == Integration::BroadcastOnly {
+            resp.status_only(202);
+        } else {
+            resp.status_only(200);
         }
     }
 }
@@ -182,14 +205,17 @@ impl Pending {
             Outcome::AwaitingVerdicts(submission) => {
                 for &AcceptedEntry { body_index, topic, ssz } in &submission.accepted {
                     let request_id = first_id + body_index as u64;
+                    let validation = submission.validation;
                     emit(match submission.envelope {
                         Some(publication) => BeaconApiRequest::PublishPayloadEnvelope {
                             request_id,
                             ssz,
                             blob_data_included: publication.blob_data_included,
-                            validation: publication.validation,
+                            validation,
                         },
-                        None => BeaconApiRequest::LocalGossip { request_id, topic, ssz },
+                        None => {
+                            BeaconApiRequest::LocalGossip { request_id, topic, ssz, validation }
+                        }
                     });
                 }
                 let body_len = submission.body_len();
@@ -197,10 +223,9 @@ impl Pending {
                     first_id,
                     body_len,
                     unanswered: submission.accepted.len(),
-                    broadcast_only: false,
-                    awaits_envelope_validation: submission.envelope.is_some(),
                     failures: submission.failures,
                     forward: submission.forward,
+                    integration: submission.integration,
                 };
                 (Self::Submission(pending), body_len as u64)
             }
@@ -214,7 +239,7 @@ impl Pending {
                 emit(BeaconApiRequest::LockBlindedBlock { request_id: first_id, ssz });
                 (Self::BlindedBlockLock { request_id: first_id, ssz }, 1)
             }
-            Outcome::Response(_) | Outcome::Stream(_) => {
+            Outcome::Response(_) | Outcome::Stream(_) | Outcome::Download(_) => {
                 unreachable!("answered without deferring")
             }
         }
@@ -240,6 +265,14 @@ struct Subscription {
     channels: ChannelSet,
 }
 
+/// The pump renders the next batch once the last has left the buffer, so a
+/// client reading slowly holds back only its own body.
+struct Download {
+    body: ChunkedResponse,
+    registry: RegistryStream,
+    rendered_all: bool,
+}
+
 impl Connection {
     fn new(stream: Stream, now: Instant) -> Self {
         Self { stream, state: State::Requests(Requests::new(now)) }
@@ -248,14 +281,14 @@ impl Connection {
     fn requests_mut(&mut self) -> Option<&mut Requests> {
         match &mut self.state {
             State::Requests(requests) => Some(requests),
-            State::Subscription(_) => None,
+            State::Subscription(_) | State::Download(_) => None,
         }
     }
 
     fn pending(&self) -> Option<&Pending> {
         match &self.state {
             State::Requests(requests) => requests.pending.as_ref(),
-            State::Subscription(_) => None,
+            State::Subscription(_) | State::Download(_) => None,
         }
     }
 
@@ -273,6 +306,15 @@ impl Connection {
         Self { stream: self.stream, state: State::Subscription(Subscription { body, channels }) }
     }
 
+    fn downloading(self, registry: RegistryStream, now: Instant) -> Self {
+        let State::Requests(requests) = self.state else {
+            unreachable!("only a request handler begins a download")
+        };
+        let body = requests.http.into_stream(now);
+        let download = Download { body, registry, rendered_all: false };
+        Self { stream: self.stream, state: State::Download(download) }
+    }
+
     fn expired(
         &self,
         now: Instant,
@@ -285,6 +327,7 @@ impl Connection {
             State::Subscription(subscription) => {
                 subscription.body.stalled(now, streams.send_deadline)
             }
+            State::Download(download) => download.body.stalled(now, streams.send_deadline),
         }
     }
 
@@ -301,6 +344,9 @@ impl Connection {
             }
             State::Subscription(subscription) => {
                 subscription.handle_event(&mut self.stream, registry, event, now)
+            }
+            State::Download(download) => {
+                download.handle_event(&mut self.stream, registry, event, now)
             }
         }
     }
@@ -436,6 +482,36 @@ impl Requests {
 }
 
 impl Subscription {
+    /// `false` once the subscriber is gone, its registration dropped.
+    fn deliver(
+        &mut self,
+        stream: &mut Stream,
+        registry: &Registry,
+        token: Token,
+        chunk: &[u8],
+        now: Instant,
+    ) -> bool {
+        let outcome = self.body.deliver(stream, chunk, now).and_then(|interest| match interest {
+            Some(interest) => registry.reregister(stream, token, interest).map_err(Closed::Lost),
+            None => Ok(()),
+        });
+        match outcome {
+            Ok(()) => true,
+            Err(Closed::AtCap { pending }) => {
+                silver_log::warn!(
+                    "beacon api subscriber would exceed send cap with {pending} bytes already pending, closing"
+                );
+                let _ = registry.deregister(stream);
+                false
+            }
+            Err(Closed::Lost(e)) => {
+                silver_log::warn!("beacon api subscriber lost: {e}");
+                let _ = registry.deregister(stream);
+                false
+            }
+        }
+    }
+
     fn handle_event(
         &mut self,
         stream: &mut Stream,
@@ -451,6 +527,59 @@ impl Subscription {
             registry.reregister(stream, event.token(), Interest::READABLE)?;
         }
 
+        Ok(false)
+    }
+}
+
+impl Download {
+    /// `Ok(true)` once the whole body has left.
+    fn handle_event(
+        &mut self,
+        stream: &mut Stream,
+        registry: &Registry,
+        event: &Event,
+        now: Instant,
+    ) -> io::Result<bool> {
+        if event.is_readable() && drop_inbound(stream, self.body.discard_space()).is_none() {
+            return Ok(true);
+        }
+        if event.is_writable() && self.body.drain_into(stream, now)? {
+            if self.rendered_all {
+                return Ok(true);
+            }
+            registry.reregister(stream, event.token(), Interest::READABLE)?;
+        }
+        Ok(false)
+    }
+
+    /// Renders and sends the next batch if the last one has left. `Ok(true)`
+    /// once the whole body has left.
+    fn advance(
+        &mut self,
+        stream: &mut Stream,
+        registry: &Registry,
+        token: Token,
+        ctx: &ApiCtx,
+        now: Instant,
+    ) -> io::Result<bool> {
+        if !self.body.pending_write().is_empty() {
+            return Ok(false);
+        }
+        let mut batch = Batch::Superseded;
+        let fits = self.body.push_rendered(now, |out| batch = self.registry.render_next(ctx, out));
+        assert!(fits, "a batch fits the send cap");
+        // The torn batch is never written: the connection closes first.
+        if batch == Batch::Superseded {
+            return Err(io::Error::other("a finalize superseded the pinned state"));
+        }
+        if batch == Batch::Last {
+            assert!(self.body.push_last(now), "the last chunk fits behind a batch");
+            self.rendered_all = true;
+        }
+        if self.body.drain_into(stream, now)? {
+            return Ok(self.rendered_all);
+        }
+        registry.reregister(stream, token, Interest::READABLE | Interest::WRITABLE)?;
         Ok(false)
     }
 }
@@ -504,12 +633,18 @@ pub struct BeaconApi {
     last_keep_alive: Instant,
     next_connection_offset: usize,
     connections: HashMap<Token, Connection>,
+    downloads: Vec<Token>,
     frame: Vec<u8>,
     router: Router,
     ctx: ApiCtx,
     next_request_id: u64,
     head_verdict: HeadVerdict,
     reader: TCacheReader,
+    payload_attributes_wanted: bool,
+    latest_payload_attributes: LatestPayloadAttributes,
+    /// Connections whose published block still awaits its import.
+    awaiting_import: Vec<Token>,
+    recent_imports: RecentImports,
 }
 
 impl BeaconApi {
@@ -561,12 +696,17 @@ impl BeaconApi {
             next_connection_offset: listeners.len(),
             listeners,
             connections: HashMap::new(),
+            downloads: Vec::new(),
             frame: Vec::new(),
-            router: Router::new(ROUTES),
+            router: Router::new(ROUTES, SERVED_WHILE_SYNCING),
             ctx: ApiCtx::new(keypair, &local_enr, identify, spec, state, has_sidecar),
             next_request_id: 0,
             head_verdict: HeadVerdict::default(),
             reader: TCacheReader::new(tcaches),
+            payload_attributes_wanted: false,
+            latest_payload_attributes: LatestPayloadAttributes::default(),
+            awaiting_import: Vec::new(),
+            recent_imports: RecentImports::default(),
         }
     }
 
@@ -665,7 +805,24 @@ impl BeaconApi {
                 block_root,
                 stage: BlockStage::Applied,
                 ..
-            } => self.publish_block(slot, &block_root),
+            } => {
+                if let Some(imports) = self.watched_imports() {
+                    imports.on_imported(&block_root);
+                }
+                self.publish_block(slot, &block_root)
+            }
+            BeaconStateEvent::BlockReceived {
+                block_root, stage: BlockStage::AlreadyKnown, ..
+            } => {
+                if let Some(imports) = self.watched_imports() {
+                    imports.on_already_known(&block_root);
+                }
+            }
+            BeaconStateEvent::BlockRejected { block_root, .. } => {
+                if let Some(imports) = self.watched_imports() {
+                    imports.on_rejected(&block_root);
+                }
+            }
             BeaconStateEvent::AttestersShuffling { id, indices } => {
                 let posted = self.reader.acquire(indices);
                 match posted.buffer() {
@@ -688,12 +845,62 @@ impl BeaconApi {
                     }
                 })
             }
+            BeaconStateEvent::PayloadAttributes(attributes) => {
+                self.publish_payload_attributes(&attributes)
+            }
             _ => {}
+        }
+    }
+
+    /// Rendered with no subscriber too, for one that arrives before the next
+    /// announcement.
+    fn publish_payload_attributes(&mut self, attributes: &PreparedPayloadAttributes) {
+        let acquired = attributes.withdrawals.map(|ssz| self.reader.acquire(ssz));
+        let withdrawals = match acquired.as_ref().map(|acquired| acquired.buffer()) {
+            None => &[][..],
+            Some(Ok((withdrawals, _))) => withdrawals,
+            Some(Err(e)) => {
+                silver_log::warn!(
+                    ?e,
+                    slot = attributes.proposal_slot,
+                    "prepared withdrawals unavailable to payload_attributes"
+                );
+                return;
+            }
+        };
+        let fork = self.ctx.spec.fork_at_slot(attributes.proposal_slot);
+        let gloas = fork >= ForkName::Gloas;
+        let mut frame = mem::take(&mut self.latest_payload_attributes.frame);
+        frame_event(&mut frame, "payload_attributes", |json| {
+            json.versioned_envelope(fork.name(), |json| {
+                json.payload_attributes_event(attributes, withdrawals, gloas)
+            })
+        });
+        self.fan_out(Some(Channel::PayloadAttributes), &frame, Instant::now());
+        self.latest_payload_attributes =
+            LatestPayloadAttributes { proposal_slot: attributes.proposal_slot, frame };
+    }
+
+    fn replay_payload_attributes(&mut self, token: Token, now: Instant) {
+        let Self { latest_payload_attributes: latest, connections, registry, ctx, .. } = self;
+        if latest.frame.is_empty() || latest.proposal_slot < ctx.node_status.wall_slot {
+            return;
+        }
+        let Some(Connection { stream, state: State::Subscription(subscription) }) =
+            connections.get_mut(&token)
+        else {
+            return;
+        };
+        if !subscription.deliver(stream, registry, token, &latest.frame, now) {
+            connections.remove(&token);
         }
     }
 
     pub fn handle_engine_resp(&mut self, resp: EngineResp) {
         let EngineResp::NewPayload(r) = resp else { return };
+        if let Some(imports) = self.watched_imports() {
+            imports.on_execution(&r.block_root, r.status);
+        }
         let gloas_head = self.ctx.spec.is_gloas_at_slot(self.ctx.node_status.head.slot);
         if !self.ctx.node_status.is_following() || gloas_head {
             return;
@@ -701,6 +908,36 @@ impl BeaconApi {
         let Some(head) = self.head_verdict.on_verdict(r.block_root, r.status) else { return };
         self.ctx.node_status.head.optimistic = false;
         self.publish_head(&head);
+    }
+
+    /// Imports are recorded only while a published block awaits its own.
+    fn watched_imports(&mut self) -> Option<&mut RecentImports> {
+        (!self.awaiting_import.is_empty()).then_some(&mut self.recent_imports)
+    }
+
+    /// Answers published blocks whose import settled or ran out of time.
+    fn settle_imports(&mut self, submissions: &mut TProducer, now: Instant) -> bool {
+        let mut answered = false;
+        let mut i = 0;
+        while let Some(&token) = self.awaiting_import.get(i) {
+            let requests = self.connections.get_mut(&token).and_then(Connection::requests_mut);
+            if let Some(requests) = requests &&
+                let Some(Pending::Submission(pending)) = &mut requests.pending
+            {
+                pending.integration.update(&self.recent_imports, now);
+                if pending.settled() {
+                    pending.respond(&mut Response::new(requests.http.write_buf_mut(), submissions));
+                    requests.pending = None;
+                    self.resume_writing(token);
+                    answered = true;
+                } else if pending.integration.awaits_import() {
+                    i += 1;
+                    continue;
+                }
+            }
+            self.awaiting_import.swap_remove(i);
+        }
+        answered
     }
 
     pub fn handle_sync_update(&mut self, update: SyncUpdate) {
@@ -782,10 +1019,17 @@ impl BeaconApi {
         }
     }
 
+    fn want_payload_attributes(&mut self, wanted: bool, emit: &mut impl FnMut(BeaconApiRequest)) {
+        if wanted != self.payload_attributes_wanted {
+            self.payload_attributes_wanted = wanted;
+            emit(BeaconApiRequest::PayloadAttributesWanted(wanted));
+        }
+    }
+
     fn has_subscriber(&self, channel: Channel) -> bool {
         self.connections.values().any(|conn| match &conn.state {
             State::Subscription(subscription) => subscription.channels.contains(channel),
-            State::Requests(_) => false,
+            State::Requests(_) | State::Download(_) => false,
         })
     }
 
@@ -855,15 +1099,7 @@ impl BeaconApi {
 
     fn publish(&mut self, channel: Channel, event: &str, render: impl FnOnce(&mut Json<'_>)) {
         let mut frame = mem::take(&mut self.frame);
-        frame.clear();
-        write!(frame, "event: {event}\ndata: ").unwrap();
-        let data_start = frame.len();
-        render(&mut Json::new(&mut frame));
-        debug_assert!(
-            !frame[data_start..].contains(&b'\n'),
-            "a multi-line body needs one data: line per line"
-        );
-        frame.extend_from_slice(b"\n\n");
+        frame_event(&mut frame, event, render);
         self.fan_out(Some(channel), &frame, Instant::now());
         self.frame = frame;
     }
@@ -879,30 +1115,9 @@ impl BeaconApi {
             if channel.is_some_and(|channel| !subscription.channels.contains(channel)) {
                 return true;
             }
-            let outcome = subscription.body.deliver(stream, chunk, now).and_then(|interest| {
-                pushed = true;
-                match interest {
-                    Some(interest) => {
-                        registry.reregister(stream, *token, interest).map_err(Closed::Lost)
-                    }
-                    None => Ok(()),
-                }
-            });
-            match outcome {
-                Ok(()) => true,
-                Err(Closed::AtCap { pending }) => {
-                    silver_log::warn!(
-                        "beacon api subscriber would exceed send cap with {pending} bytes already pending, closing"
-                    );
-                    let _ = registry.deregister(stream);
-                    false
-                }
-                Err(Closed::Lost(e)) => {
-                    silver_log::warn!("beacon api subscriber lost: {e}");
-                    let _ = registry.deregister(stream);
-                    false
-                }
-            }
+            let open = subscription.deliver(stream, registry, *token, chunk, now);
+            pushed |= open;
+            open
         });
         pushed
     }
@@ -929,7 +1144,7 @@ impl BeaconApi {
             return;
         };
 
-        let Self { connections, reader, ctx, .. } = self;
+        let Self { connections, reader, ctx, recent_imports, .. } = self;
         let requests = connections
             .get_mut(&token)
             .and_then(Connection::requests_mut)
@@ -1000,21 +1215,25 @@ impl BeaconApi {
                 BeaconApiResponse::PayloadEnvelopeValidation { consensus_valid, .. },
                 Pending::Submission(pending),
             ) => {
-                pending.broadcast_only = !consensus_valid;
-                pending.awaits_envelope_validation = false;
+                pending.integration = if consensus_valid {
+                    Integration::Integrated
+                } else {
+                    Integration::BroadcastOnly
+                };
                 let settled = pending.settled();
                 if settled {
-                    forward = pending.respond(&mut resp);
+                    pending.respond(&mut resp);
                 }
                 settled
             }
             (
-                BeaconApiResponse::LocalGossipResponse { response, .. },
+                BeaconApiResponse::LocalGossipResponse { response, block_root, .. },
                 Pending::Submission(pending),
             ) => {
-                let settled = pending.record(request_id, response);
+                forward = pending.record(request_id, response, block_root, recent_imports);
+                let settled = pending.settled();
                 if settled {
-                    forward = pending.respond(&mut resp);
+                    pending.respond(&mut resp);
                 }
                 settled
             }
@@ -1134,8 +1353,17 @@ impl BeaconApi {
             };
         }
 
+        did_work |= self.advance_downloads(now);
+        if !self.awaiting_import.is_empty() {
+            did_work |= self.settle_imports(submissions, now);
+        }
+
         if self.idle.due(now) {
             did_work |= self.close_expired(now);
+            // Subscribers also leave on failed writes and reads, so the
+            // last one is noticed here, within a sweep interval.
+            let wanted = self.has_subscriber(Channel::PayloadAttributes);
+            self.want_payload_attributes(wanted, emit);
         }
         if now.duration_since(self.last_keep_alive) >= self.streams.keep_alive_every {
             self.last_keep_alive = now;
@@ -1143,6 +1371,32 @@ impl BeaconApi {
         }
 
         did_work
+    }
+
+    /// One batch per download per pump, so a download shares the tile with
+    /// everything else it serves.
+    fn advance_downloads(&mut self, now: Instant) -> bool {
+        let Self { downloads, connections, registry, ctx, .. } = self;
+        let mut rendered = false;
+        downloads.retain(|token| {
+            let Some(conn) = connections.get_mut(token) else { return false };
+            let State::Download(download) = &mut conn.state else { return false };
+            rendered |= download.body.pending_write().is_empty();
+            let finished = match download.advance(&mut conn.stream, registry, *token, ctx, now) {
+                Ok(finished) => finished,
+                Err(e) => {
+                    silver_log::warn!("beacon api download cut short: {e}");
+                    true
+                }
+            };
+            if finished {
+                let _ = registry.deregister(&mut conn.stream);
+                connections.remove(token);
+            }
+            !finished
+        });
+        ctx.registry_downloads = downloads.len();
+        rendered
     }
 
     fn accept_all(&mut self, listener_index: usize, now: Instant) -> bool {
@@ -1213,13 +1467,34 @@ impl BeaconApi {
         match outcome {
             Ok(false) => match dispatched {
                 Outcome::Response(_) => {}
+                Outcome::Download(registry) => {
+                    let conn = self.connections.remove(&token).expect("looked up above");
+                    self.connections.insert(token, conn.downloading(registry, now));
+                    // A closed download's token may be reused before the pump
+                    // prunes it.
+                    if !self.downloads.contains(&token) {
+                        self.downloads.push(token);
+                    }
+                    self.ctx.registry_downloads = self.downloads.len();
+                }
                 Outcome::Stream(channels) => {
                     let conn = self.connections.remove(&token).expect("looked up above");
                     self.connections.insert(token, conn.subscribed(channels, now));
+                    // Beacon State announces the next slot to a first
+                    // subscriber; a later one hears the latest announcement.
+                    if channels.contains(Channel::PayloadAttributes) {
+                        if self.payload_attributes_wanted {
+                            self.replay_payload_attributes(token, now);
+                        }
+                        self.want_payload_attributes(true, emit);
+                    }
                 }
                 deferred => {
                     let (pending, ids_used) = Pending::defer(deferred, self.next_request_id, emit);
                     self.next_request_id += ids_used;
+                    if matches!(&pending, Pending::Submission(p) if p.integration.awaits_import()) {
+                        self.awaiting_import.push(token);
+                    }
                     let requests = conn.requests_mut().expect("only a request handler defers");
                     requests.pending = Some(pending);
                 }
@@ -1270,6 +1545,11 @@ impl BeaconApi {
                     streams.send_deadline,
                     subscription.body.pending_write().len()
                 ),
+                State::Download(download) => silver_log::warn!(
+                    "beacon api download made no write progress for over {:?} with {} bytes pending, closing",
+                    streams.send_deadline,
+                    download.body.pending_write().len()
+                ),
                 State::Requests(Requests { linger_since: Some(since), .. }) => silver_log::warn!(
                     "beacon api connection still sending {:?} after its answer, closing",
                     now.duration_since(*since)
@@ -1284,6 +1564,26 @@ impl BeaconApi {
         });
         connections.len() != before
     }
+}
+
+/// The last `payload_attributes` event, for a subscriber that arrives after
+/// it was sent.
+#[derive(Default)]
+struct LatestPayloadAttributes {
+    proposal_slot: u64,
+    frame: Vec<u8>,
+}
+
+fn frame_event(frame: &mut Vec<u8>, event: &str, render: impl FnOnce(&mut Json<'_>)) {
+    frame.clear();
+    write!(frame, "event: {event}\ndata: ").unwrap();
+    let data_start = frame.len();
+    render(&mut Json::new(frame));
+    debug_assert!(
+        !frame[data_start..].contains(&b'\n'),
+        "a multi-line body needs one data: line per line"
+    );
+    frame.extend_from_slice(b"\n\n");
 }
 
 fn would_block(err: &io::Error) -> bool {
@@ -1314,11 +1614,14 @@ mod tests {
     };
 
     use serde_json::Value;
-    use silver_beacon_state_data::{BeaconStateOwner, SLOTS_PER_EPOCH};
+    use silver_beacon_state_data::{
+        BeaconState, BeaconStateOwner, EpochStateFinalized, FAR_FUTURE_EPOCH, SLOTS_PER_EPOCH,
+        ValSeed,
+    };
     use silver_common::{
-        BlockLookup, ColumnOrigin, EngineNewPayloadResp, ForkName, GossipDomain, HeadRoots,
-        LOCAL_GOSSIP_STREAM_ID, LocalGossipFailure, MessageId, Nanos, P2pStreamId, PayloadFrame,
-        PayloadResolution, ProduceBlockFailure, ProducedBlock, ServedBlock, SszCache,
+        BlockLookup, BlockSource, ColumnOrigin, EngineNewPayloadResp, ForkName, GossipDomain,
+        HeadRoots, LOCAL_GOSSIP_STREAM_ID, LocalGossipFailure, MessageId, Nanos, P2pStreamId,
+        PayloadFrame, PayloadResolution, ProduceBlockFailure, ProducedBlock, ServedBlock, SszCache,
         StreamProtocol, TCache, TCacheId, TCacheProducer, TProducer, body_root,
         ssz_view::{
             ATTESTATION_FIXED, BEACON_BLOCK_BODY_FIXED, BYTES_PER_BLOB, BYTES_PER_KZG_COMMITMENT,
@@ -1401,6 +1704,7 @@ mod tests {
                 tcaches,
             );
             api.open_tcaches().unwrap();
+            api.ctx.node_status.target = Some(SyncUpdate::Following);
             Self {
                 readiness,
                 api,
@@ -2049,7 +2353,7 @@ mod tests {
             .values()
             .map(|conn| match &conn.state {
                 State::Subscription(subscription) => subscription.body.pending_write().len(),
-                State::Requests(_) => 0,
+                State::Requests(_) | State::Download(_) => 0,
             })
             .sum()
     }
@@ -2399,6 +2703,182 @@ mod tests {
                 serde_json::from_str(&entry(attester_index, committee_index)).unwrap();
             assert_eq!(event.data, posted);
         }
+    }
+
+    fn wanted_signals(server: &mut Server) -> Vec<bool> {
+        let mut signals = Vec::new();
+        server.requests.retain(|request| match request {
+            BeaconApiRequest::PayloadAttributesWanted(wanted) => {
+                signals.push(*wanted);
+                false
+            }
+            _ => true,
+        });
+        signals
+    }
+
+    #[test]
+    fn first_payload_attributes_subscriber_and_last_one_leaving_are_signalled() {
+        let mut server = server_with(64, LONG_TIMEOUT);
+        let mut head = connect(tcp_addr(&server));
+        subscribe(&mut head, "head");
+        pump_until(&mut server, "head subscribed", |server| subscribers(server) == 1);
+        assert!(wanted_signals(&mut server).is_empty(), "other topics want nothing");
+
+        let mut first = connect(tcp_addr(&server));
+        subscribe(&mut first, "head,payload_attributes");
+        let mut second = connect(tcp_addr(&server));
+        subscribe(&mut second, "payload_attributes");
+        pump_until(&mut server, "all subscribed", |server| subscribers(server) == 3);
+        assert_eq!(wanted_signals(&mut server), [true]);
+
+        drop(first);
+        pump_until(&mut server, "first left", |server| subscribers(server) == 2);
+        drop(second);
+        pump_until(&mut server, "last left", |server| {
+            server
+                .requests
+                .iter()
+                .any(|r| matches!(r, BeaconApiRequest::PayloadAttributesWanted(_)))
+        });
+        assert_eq!(wanted_signals(&mut server), [false]);
+        assert_eq!(subscribers(&server), 1, "the head subscriber stays");
+    }
+
+    /// One reconnecting before the sweep notices it left hears the latest
+    /// announcement; the subscriber already there hears it once.
+    #[test]
+    fn later_subscriber_alone_hears_the_latest_payload_attributes() {
+        let mut server = server_with(64, LONG_TIMEOUT);
+        let mut first = connect(tcp_addr(&server));
+        subscribe(&mut first, "payload_attributes");
+        let first = read_events_until_marker(first);
+        pump_until(&mut server, "first subscribed", |server| subscribers(server) == 1);
+        let attributes = PreparedPayloadAttributes {
+            proposal_slot: server.api.ctx.node_status.wall_slot + 1,
+            proposer_index: 7,
+            parent_block_root: [1; 32],
+            parent_block_hash: [2; 32],
+            parent_block_number: Some(100),
+            timestamp: 1_000,
+            prev_randao: [3; 32],
+            fee_recipient: [6; 20],
+            target_gas_limit: 0,
+            withdrawals: None,
+        };
+        server.api.handle_beacon_state_event(BeaconStateEvent::PayloadAttributes(attributes));
+
+        let mut second = connect(tcp_addr(&server));
+        subscribe(&mut second, "payload_attributes");
+        let second = read_events_until_marker(second);
+        pump_until(&mut server, "second subscribed", |server| subscribers(server) == 2);
+        assert_eq!(wanted_signals(&mut server), [true], "only the first is signalled");
+        finish_events(&mut server);
+
+        let (first, second) = serve_both(&mut server, first, second, "both hear the marker");
+        assert_eq!(first.len(), 1);
+        assert_eq!(second.len(), 1);
+        assert_eq!(first[0].data, second[0].data);
+    }
+
+    #[test]
+    fn payload_attributes_render_per_fork() {
+        let mut server = server_with(64, LONG_TIMEOUT);
+        server.api.ctx.spec.fulu_fork_epoch = 0;
+        server.api.ctx.spec.gloas_fork_epoch = 2;
+        let mut handoff = TCache::producer(TCacheId::BeaconStateHandoff, 1 << 16);
+        server.api.reader = TCacheReader::new(TCacheTable::from_iter([handoff.cache_ref()]));
+        server
+            .api
+            .reader
+            .open(TCacheId::BeaconStateHandoff, "api_test", TReadMode::Sliding)
+            .unwrap();
+        let mut client = connect(tcp_addr(&server));
+        subscribe(&mut client, "payload_attributes");
+        let reader = read_events_until_marker(client);
+        pump_until(&mut server, "subscribed", |server| subscribers(server) == 1);
+
+        let mut withdrawal = Vec::new();
+        withdrawal.extend_from_slice(&9u64.to_le_bytes());
+        withdrawal.extend_from_slice(&3u64.to_le_bytes());
+        withdrawal.extend_from_slice(&[4; 20]);
+        withdrawal.extend_from_slice(&5u64.to_le_bytes());
+        let withdrawals =
+            handoff.write_with(withdrawal.len(), |out| out.copy_from_slice(&withdrawal)).unwrap();
+        let fulu = PreparedPayloadAttributes {
+            proposal_slot: 33,
+            proposer_index: 7,
+            parent_block_root: [1; 32],
+            parent_block_hash: [2; 32],
+            parent_block_number: Some(100),
+            timestamp: 1_000,
+            prev_randao: [3; 32],
+            fee_recipient: [6; 20],
+            target_gas_limit: 0,
+            withdrawals: Some(withdrawals),
+        };
+        let gloas = PreparedPayloadAttributes {
+            proposal_slot: 64,
+            parent_block_number: None,
+            target_gas_limit: 60_000_000,
+            withdrawals: None,
+            ..fulu
+        };
+        for attributes in [fulu, gloas] {
+            server.api.handle_beacon_state_event(BeaconStateEvent::PayloadAttributes(attributes));
+        }
+        finish_events(&mut server);
+
+        let events = serve(&mut server, reader, "payload_attributes events and marker");
+        assert_eq!(events.len(), 2);
+        assert!(events.iter().all(|event| event.topic == "payload_attributes"));
+        let hex = |byte: u8, len: usize| format!("0x{}", hex::encode(vec![byte; len]));
+        assert_eq!(
+            events[1].data,
+            serde_json::json!({
+                "version": "gloas",
+                "data": {
+                    "proposer_index": "7",
+                    "proposal_slot": "64",
+                    "parent_block_root": hex(1, 32),
+                    "parent_block_hash": hex(2, 32),
+                    "payload_attributes": {
+                        "timestamp": "1000",
+                        "prev_randao": hex(3, 32),
+                        "suggested_fee_recipient": hex(6, 20),
+                        "withdrawals": [],
+                        "parent_beacon_block_root": hex(1, 32),
+                        "slot_number": "64",
+                        "target_gas_limit": "60000000",
+                    },
+                },
+            })
+        );
+        assert_eq!(
+            events[0].data,
+            serde_json::json!({
+                "version": "fulu",
+                "data": {
+                    "proposer_index": "7",
+                    "proposal_slot": "33",
+                    "parent_block_number": "100",
+                    "parent_block_root": hex(1, 32),
+                    "parent_block_hash": hex(2, 32),
+                    "payload_attributes": {
+                        "timestamp": "1000",
+                        "prev_randao": hex(3, 32),
+                        "suggested_fee_recipient": hex(6, 20),
+                        "withdrawals": [{
+                            "index": "9",
+                            "validator_index": "3",
+                            "address": hex(4, 20),
+                            "amount": "5",
+                        }],
+                        "parent_beacon_block_root": hex(1, 32),
+                    },
+                },
+            })
+        );
     }
 
     fn relayed_preferences(ssz: TCacheRead, local: bool) -> PeerEvent {
@@ -2816,7 +3296,8 @@ mod tests {
             BeaconApiRequest::LockBlindedBlock { request_id, .. } => *request_id,
             BeaconApiRequest::BeaconCommitteeSubscriptions { .. } |
             BeaconApiRequest::SyncCommitteeSubscriptions { .. } |
-            BeaconApiRequest::ProposerPreparations { .. } => unreachable!("never answered"),
+            BeaconApiRequest::ProposerPreparations { .. } |
+            BeaconApiRequest::PayloadAttributesWanted(_) => unreachable!("never answered"),
         }
     }
 
@@ -2963,12 +3444,13 @@ mod tests {
         server.api.ctx = submission::ctx();
         server.api.ctx.has_sidecar = true;
         let block = blinded_block();
+        let fork = server.api.ctx.spec.fork_at_slot(SignedBeaconBlockView::slot(&block)).name();
         let mut client = connect(tcp_addr(server));
         write!(
             client,
             "POST /eth/v2/beacon/blinded_blocks HTTP/1.1\r\nHost: x\r\n\
-             Content-Type: application/octet-stream\r\nContent-Length: {}\r\n\
-             Connection: close\r\n\r\n",
+             Content-Type: application/octet-stream\r\nEth-Consensus-Version: {fork}\r\n\
+             Content-Length: {}\r\nConnection: close\r\n\r\n",
             block.len()
         )
         .unwrap();
@@ -2979,25 +3461,54 @@ mod tests {
         };
         assert_eq!(server.submissions.read_buffer(ssz).unwrap(), block);
         assert!(server.sidecar.is_empty(), "nothing reaches the sidecar before the lock");
-        server.answer(BeaconApiResponse::LocalGossipResponse { request_id, response: lock });
+        server.answer(BeaconApiResponse::LocalGossipResponse {
+            request_id,
+            response: lock,
+            block_root: None,
+        });
         client
     }
 
-    /// A Gloas block goes to the builder the VC names once it is published,
-    /// and not when it is refused.
+    /// The builder gets the block at its verdict, and not when it is refused.
+    /// The answer waits on the import the verdict names, which may come first:
+    /// 200 once imported, 202 once broadcast but not integrated.
     #[test]
     fn published_gloas_block_is_forwarded_to_its_builder() {
+        let block = gloas_block();
+        let root = block_root(&block, true);
+        let received = BeaconStateEvent::BlockReceived {
+            slot: SignedBeaconBlockView::slot(&block),
+            block_root: root,
+            stage: BlockStage::Applied,
+            source: BlockSource::Gossip,
+            parent_slot: None,
+            parent_empty: false,
+        };
+        let rejected =
+            BeaconStateEvent::BlockRejected { block_root: root, source: BlockSource::Gossip };
+        let refused_by_el = EngineResp::NewPayload(EngineNewPayloadResp {
+            block_root: root,
+            status: PayloadValidationStatus::Invalid,
+            latest_valid_hash: None,
+        });
         let refused = Err(LocalGossipFailure::ConflictingProposal);
-        for (verdict, forwarded) in [(Ok(()), true), (refused, false)] {
+        for (verdict, block_root, import, import_first, status) in [
+            (Ok(()), Some(root), Some(Ok(received)), false, "200 OK"),
+            (Ok(()), Some(root), Some(Ok(received)), true, "200 OK"),
+            (Ok(()), Some(root), Some(Ok(rejected)), false, "202 Accepted"),
+            (Ok(()), Some(root), Some(Err(refused_by_el)), true, "202 Accepted"),
+            (Ok(()), None, None, false, "202 Accepted"),
+            (refused, None, None, false, "400 Bad Request"),
+        ] {
             let mut server = server_with(64, LONG_TIMEOUT);
             server.api.ctx = submission::ctx();
             server.api.ctx.spec.gloas_fork_epoch = 0;
-            let block = gloas_block();
             let mut client = connect(tcp_addr(&server));
             write!(
                 client,
                 "POST /eth/v2/beacon/blocks HTTP/1.1\r\nHost: x\r\n\
-                 Content-Type: application/octet-stream\r\nEth-Builder-Url: http://b:18550\r\n\
+                 Content-Type: application/octet-stream\r\nEth-Consensus-Version: gloas\r\n\
+                 Eth-Builder-Url: http://b:18550\r\n\
                  Content-Length: {}\r\nConnection: close\r\n\r\n",
                 block.len()
             )
@@ -3007,10 +3518,33 @@ mod tests {
             else {
                 panic!("the block is published locally")
             };
+            let deliver = |server: &mut Server| match import {
+                Some(Ok(event)) => server.api.handle_beacon_state_event(event),
+                Some(Err(resp)) => server.api.handle_engine_resp(resp),
+                None => {}
+            };
+            if import_first {
+                deliver(&mut server);
+            }
             assert!(server.forwarded.is_empty(), "nothing is forwarded before the verdict");
-            server.answer(BeaconApiResponse::LocalGossipResponse { request_id, response: verdict });
-            let expected = forwarded.then(|| ("http://b:18550".to_owned(), block));
+            server.answer(BeaconApiResponse::LocalGossipResponse {
+                request_id,
+                response: verdict,
+                block_root,
+            });
+            let expected = verdict.is_ok().then(|| ("http://b:18550".to_owned(), block.clone()));
             assert_eq!(server.forwarded, Vec::from_iter(expected), "{verdict:?}");
+            if import.is_some() && !import_first {
+                server.pump();
+                let token = server.api.awaiting_import[0];
+                assert!(server.api.connections[&token].pending().is_some(), "awaits the import");
+                deliver(&mut server);
+            }
+            let reader = std::thread::spawn(move || read_to_eof(client));
+            let response = String::from_utf8(serve(&mut server, reader, "verdict")).unwrap();
+            let status = format!("HTTP/1.1 {status}\r\n");
+            assert!(response.starts_with(&status), "{verdict:?}: {response}");
+            assert!(server.api.awaiting_import.is_empty());
         }
     }
 
@@ -3104,6 +3638,7 @@ mod tests {
             server.answer(BeaconApiResponse::LocalGossipResponse {
                 request_id: request_id(request),
                 response,
+                block_root: None,
             });
         }
 
@@ -3147,12 +3682,7 @@ mod tests {
         let failures = vec![SubmissionFailure { body_index: 2, message: "refused" }];
         let mut ids = Vec::new();
         let (_, ids_used) = Pending::defer(
-            Outcome::AwaitingVerdicts(Submission {
-                accepted,
-                failures,
-                forward: None,
-                envelope: None,
-            }),
+            Outcome::AwaitingVerdicts(Submission { accepted, failures, ..Submission::default() }),
             10,
             &mut |request| ids.push(request_id(&request)),
         );
@@ -3791,7 +4321,11 @@ mod tests {
             assert_eq!(server.submissions.read_buffer(ssz).unwrap(), signed);
             let validation =
                 BeaconApiResponse::PayloadEnvelopeValidation { request_id, consensus_valid };
-            let broadcast = BeaconApiResponse::LocalGossipResponse { request_id, response: Ok(()) };
+            let broadcast = BeaconApiResponse::LocalGossipResponse {
+                request_id,
+                response: Ok(()),
+                block_root: None,
+            };
             let responses =
                 if validation_first { [validation, broadcast] } else { [broadcast, validation] };
             server.answer(responses[0]);
@@ -3804,5 +4338,72 @@ mod tests {
             let status = if consensus_valid { "200 OK" } else { "202 Accepted" };
             assert!(response.starts_with(format!("HTTP/1.1 {status}\r\n").as_bytes()));
         }
+    }
+
+    /// The body spans several batches, each its own chunk, and ends with the
+    /// last chunk before the server closes the connection.
+    #[test]
+    fn whole_registry_downloads_in_chunks_and_closes() {
+        const VALIDATORS: u64 = 1500;
+        let seeds: Vec<_> = (0..VALIDATORS)
+            .map(|i| ValSeed {
+                pubkey: [i as u8; 48],
+                effective_balance: 32_000_000_000,
+                balance: 32_000_000_000,
+                activation_epoch: i % 2,
+                exit_epoch: FAR_FUTURE_EPOCH,
+                ..ValSeed::default()
+            })
+            .collect();
+        let state = BeaconState::for_test(EpochStateFinalized::default(), &seeds, 0);
+        let mut owner = BeaconStateOwner::new(state);
+        let anchor = owner.roll_fresh();
+        owner.publish_state_id(anchor);
+        let mut server = server_with(4, LONG_TIMEOUT);
+        server.api.ctx.state = owner.reader();
+        let addr = tcp_addr(&server);
+
+        let client = std::thread::spawn(move || {
+            let mut stream = connect(addr);
+            stream
+                .write_all(
+                    b"GET /eth/v1/beacon/states/head/validators?status=active HTTP/1.1\r\n\
+                      Host: x\r\n\r\n",
+                )
+                .unwrap();
+            read_to_eof(stream)
+        });
+        let response = serve(&mut server, client, "registry downloaded");
+
+        let at = response.windows(4).position(|w| w == b"\r\n\r\n").unwrap() + 4;
+        assert!(
+            response[..at].ends_with(b"Transfer-Encoding: chunked\r\nConnection: close\r\n\r\n")
+        );
+        let mut chunks = &response[at..];
+        let mut body = Vec::new();
+        let mut chunk_count = 0;
+        loop {
+            let line_end = chunks.windows(2).position(|w| w == b"\r\n").unwrap();
+            let len = usize::from_str_radix(std::str::from_utf8(&chunks[..line_end]).unwrap(), 16);
+            let len = len.unwrap();
+            chunks = &chunks[line_end + 2..];
+            if len == 0 {
+                assert_eq!(chunks, b"\r\n");
+                break;
+            }
+            body.extend_from_slice(&chunks[..len]);
+            chunks = &chunks[len + 2..];
+            chunk_count += 1;
+        }
+        assert!(chunk_count > 2, "{chunk_count} chunks");
+        let body: Value = serde_json::from_slice(&body).unwrap();
+        let indices: Vec<_> = body["data"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|record| record["index"].as_str().unwrap().parse::<u64>().unwrap())
+            .collect();
+        assert_eq!(indices, (0..VALIDATORS).step_by(2).collect::<Vec<_>>());
+        assert!(server.api.connections.is_empty() && server.api.downloads.is_empty());
     }
 }

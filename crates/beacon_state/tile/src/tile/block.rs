@@ -137,7 +137,7 @@ impl BeaconStateTile {
         source: BlockSource,
         pre_verified: bool,
         producers: &mut Producers,
-        mut send_gossip: impl FnMut(&mut Producers),
+        mut send_gossip: impl FnMut(B256, &mut Producers),
     ) -> Feedback {
         if let Err(e) = Self::check_block_size(data) {
             silver_log::warn!(?source, "{e}");
@@ -148,14 +148,12 @@ impl BeaconStateTile {
         let parsed = match self.parse_and_verify_block(data, pre_verified) {
             Ok(parsed) => {
                 if parsed.relay_eligible {
-                    send_gossip(producers);
+                    send_gossip(parsed.block_root, producers);
                 }
                 parsed
             }
-            Err(e) => {
-                if let PrecheckError::AwaitingData { block_root } = e &&
-                    matches!(source, BlockSource::Rpc)
-                {
+            Err(PrecheckError::AwaitingData { block_root }) => {
+                if matches!(source, BlockSource::Rpc) {
                     self.emit_block_received(
                         data,
                         block_root,
@@ -164,6 +162,9 @@ impl BeaconStateTile {
                         producers,
                     );
                 }
+                return Feedback::AwaitData(block_root);
+            }
+            Err(e) => {
                 let f = e.feedback();
                 if let Feedback::BlockKnown(block_root) = f {
                     self.emit_block_received(

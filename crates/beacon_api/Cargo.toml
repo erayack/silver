@@ -8,13 +8,14 @@ version.workspace = true
 [dependencies]
 flux-profiler.workspace = true
 hex.workspace = true
+itoa.workspace = true
 mio.workspace = true
 rustc-hash.workspace = true
 silver_beacon_state_data.workspace = true
 silver_common.workspace = true
 silver_httpcore.workspace = true
 serde.workspace = true
-serde_json.workspace = true
+serde_json = { workspace = true, features = ["raw_value"] }
 silver_log.workspace = true
 silver_pbs.workspace = true
 smallvec.workspace = true

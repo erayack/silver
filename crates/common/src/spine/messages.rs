@@ -84,6 +84,7 @@ pub enum BeaconApiRequest {
         request_id: u64,
         topic: GossipTopic,
         ssz: TCacheRead,
+        validation: BroadcastValidation,
     },
     AggregateAttestation {
         request_id: u64,
@@ -112,6 +113,9 @@ pub enum BeaconApiRequest {
     ProposerPreparations {
         preparations: TCacheRead,
     },
+    /// Sent when the first `payload_attributes` subscriber arrives and after
+    /// the last one leaves.
+    PayloadAttributesWanted(bool),
     ProduceBlock {
         request_id: u64,
         slot: u64,
@@ -139,9 +143,10 @@ pub enum BeaconApiRequest {
     },
 }
 
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 #[repr(u8)]
 pub enum BroadcastValidation {
+    #[default]
     Gossip,
     Consensus,
     ConsensusAndEquivocation,
@@ -236,6 +241,8 @@ pub enum BeaconApiResponse {
     LocalGossipResponse {
         request_id: u64,
         response: LocalGossipResult,
+        /// A block's root, when Beacon State relayed it or already had it.
+        block_root: Option<[u8; 32]>,
     },
     /// `ssz` points into the `beacon_state` tcache.
     AggregateAttestation {
@@ -357,6 +364,9 @@ pub struct NewGossipMsg {
     /// Originating fork domain: fixed at receipt, never rewritten.
     pub domain: GossipDomain,
     pub ssz_cache: SszCache,
+    /// What a local block must pass before it is relayed; anything else is
+    /// relayed once it passes gossip validation.
+    pub validation: BroadcastValidation,
     pub msg_hash: MessageId,
     pub recv_ts: Nanos,
     /// Decompressed message SSZ
@@ -1259,6 +1269,8 @@ pub enum BeaconStateEvent {
     LocalGossipVerdict {
         hash: MessageId,
         result: LocalGossipResult,
+        /// A block's root, when it was relayed or already known.
+        block_root: Option<[u8; 32]>,
     },
     Status {
         ssz: [u8; STATUS_V2_SIZE],
@@ -1308,6 +1320,26 @@ pub enum BeaconStateEvent {
         block_root: [u8; 32],
     },
     PoolChange(PoolChange),
+    PayloadAttributes(PreparedPayloadAttributes),
+}
+
+/// The attributes an EL was just asked to build on.
+#[derive(Clone, Copy, Debug)]
+#[repr(C)]
+pub struct PreparedPayloadAttributes {
+    pub proposal_slot: u64,
+    pub proposer_index: u64,
+    pub parent_block_root: B256,
+    pub parent_block_hash: B256,
+    /// `None` for a Gloas proposal: the event no longer carries it.
+    pub parent_block_number: Option<u64>,
+    pub timestamp: u64,
+    pub prev_randao: B256,
+    pub fee_recipient: ExecutionAddress,
+    pub target_gas_limit: u64,
+    /// SSZ `Withdrawal`s back to back in the Beacon State handoff cache, so
+    /// the event stays small. `None` when there are none.
+    pub withdrawals: Option<TCacheRead>,
 }
 
 /// A membership change in Beacon State's operation pools. Exits and BLS
@@ -1633,7 +1665,8 @@ impl BeaconStateEvent {
             Self::BlockReceived { .. } |
             Self::AttestersShuffling { .. } |
             Self::Reorg { .. } |
-            Self::PoolChange(_) => SszView::None,
+            Self::PoolChange(_) |
+            Self::PayloadAttributes(_) => SszView::None,
         }
     }
 }

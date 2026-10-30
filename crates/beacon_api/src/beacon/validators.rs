@@ -1,12 +1,12 @@
 use serde::Deserialize;
 use silver_beacon_state_data::{
-    BLSPubkey, Epoch, FAR_FUTURE_EPOCH, StateReadView, ValidatorsView, Withdrawals,
+    BLSPubkey, Epoch, FAR_FUTURE_EPOCH, PinnedState, StateReadView, ValidatorsView, Withdrawals,
 };
 use silver_common::json_fields::parse_uint64;
-use silver_httpcore::Query;
+use silver_httpcore::{ChunkedResponse, Query};
 
 use crate::{
-    ctx::ApiCtx,
+    ctx::{ApiCtx, read_flags},
     http::{
         ids::{each_body_entry, parse_pubkey},
         json::Json,
@@ -17,15 +17,55 @@ use crate::{
 
 const MAX_VALIDATOR_IDS: usize = 32 * 1024;
 
+/// About 0.25 MB of JSON and 40 µs of rendering per batch.
+const VALIDATORS_PER_BATCH: usize = 512;
+
+/// The longest record [`Json::validator`] writes, with its separator: every
+/// number at 20 digits and the longest status.
+const MAX_VALIDATOR_JSON: usize = 550;
+
+/// A batch's chunk framing, and the envelope that opens the first batch and
+/// closes the last.
+const BATCH_OVERHEAD: usize = 128;
+
+const _: () = assert!(
+    VALIDATORS_PER_BATCH * MAX_VALIDATOR_JSON + BATCH_OVERHEAD <= ChunkedResponse::PENDING_MAX
+);
+
+/// Each open download renders a batch on every pump of the API tile.
+const MAX_REGISTRY_DOWNLOADS: usize = 2;
+
 pub(crate) fn get_state_validators(req: &Request<'_>, ctx: &ApiCtx, resp: &mut Response<'_>) {
-    respond_selection(req, ctx, resp, Selection::from_query(req.query), Selection::render);
+    respond_validators(req, ctx, resp, Selection::from_query(req.query));
 }
 
 pub(crate) fn post_state_validators(req: &Request<'_>, ctx: &ApiCtx, resp: &mut Response<'_>) {
     let selection = serde_json::from_slice::<SelectionBody>(req.body)
         .map_err(|_| Rejection::bad_request("invalid request body"))
         .and_then(|body| Selection::from_body(&body));
-    respond_selection(req, ctx, resp, selection, Selection::render);
+    respond_validators(req, ctx, resp, selection);
+}
+
+/// A status filter alone selects the registry it admits, as helix's relay
+/// asks for `active,pending`. On mainnet that body is over 500 MB, so it is
+/// streamed.
+fn respond_validators(
+    req: &Request<'_>,
+    ctx: &ApiCtx,
+    resp: &mut Response<'_>,
+    selection: Result<Selection, Rejection>,
+) {
+    match selection {
+        Ok(selection) if selection.ids.is_empty() && selection.statuses.filters() => {
+            if ctx.registry_downloads >= MAX_REGISTRY_DOWNLOADS {
+                return resp.error(503, "too many registry downloads in progress");
+            }
+            if let Some(pin) = ctx.pin_state(req, resp) {
+                resp.begin_registry_download(RegistryStream::new(pin, selection.statuses));
+            }
+        }
+        selection => respond_selection(req, ctx, resp, selection, Selection::render),
+    }
 }
 
 pub(crate) fn get_state_validator_balances(
@@ -81,6 +121,72 @@ fn respond_selection(
     selection.ids.sort_unstable();
     selection.ids.dedup();
     ctx.state_response(req, resp, |view, json| render(&selection, view, json));
+}
+
+/// The registry from one pinned state, rendered a batch at a time so neither
+/// the render nor the body holds the tile for the whole registry.
+#[derive(Debug, PartialEq, Eq)]
+pub(crate) struct RegistryStream {
+    pin: PinnedState,
+    statuses: StatusSet,
+    next: usize,
+    rendered_any: bool,
+}
+
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub(crate) enum Batch {
+    More,
+    Last,
+    Superseded,
+}
+
+impl RegistryStream {
+    fn new(pin: PinnedState, statuses: StatusSet) -> Self {
+        Self { pin, statuses, next: 0, rendered_any: false }
+    }
+
+    /// Appends the next batch of the body to `out`. `Superseded` means a
+    /// finalize ended the pinned state, and the body can no longer be whole.
+    pub(crate) fn render_next(&mut self, ctx: &ApiCtx, out: &mut Vec<u8>) -> Batch {
+        let rendered = ctx.state.read_pinned(self.pin, |view| {
+            if self.next == 0 {
+                let mut json = Json::new(out);
+                json.begin_flagged_envelope(read_flags(ctx.node_status, &view));
+                json.begin_array();
+            }
+            self.render_batch(&view, out);
+            self.next == view.validators.count()
+        });
+        match rendered {
+            None => Batch::Superseded,
+            Some(true) => Batch::Last,
+            Some(false) => Batch::More,
+        }
+    }
+
+    /// Batches are framed apart, so `rendered_any` carries the separator
+    /// across them.
+    fn render_batch(&mut self, view: &StateReadView<'_>, out: &mut Vec<u8>) {
+        let current_epoch = view.slot.current_epoch();
+        let count = view.validators.count();
+        let end = count.min(self.next + VALIDATORS_PER_BATCH);
+        for index in self.next..end {
+            let record = ValidatorRecord::read(view, current_epoch, index);
+            if self.statuses.admits(record.status) {
+                if self.rendered_any {
+                    out.push(b',');
+                }
+                Json::new(out).validator(&record);
+                self.rendered_any = true;
+            }
+        }
+        self.next = end;
+        if end == count {
+            let mut json = Json::new(out);
+            json.end_array();
+            json.end_object();
+        }
+    }
 }
 
 pub(crate) fn state_validator(req: &Request<'_>, ctx: &ApiCtx, resp: &mut Response<'_>) {
@@ -356,7 +462,7 @@ impl ValidatorStatus {
 }
 
 /// One bit per status; the empty set is the absence of a filter.
-#[derive(Clone, Copy, Default)]
+#[derive(Clone, Copy, Default, PartialEq, Eq, Debug)]
 struct StatusSet(u16);
 
 impl StatusSet {
@@ -372,6 +478,10 @@ impl StatusSet {
         Self(self.0 | other.0)
     }
 
+    fn filters(self) -> bool {
+        self.0 != 0
+    }
+
     fn admits(self, status: ValidatorStatus) -> bool {
         self.0 == 0 || self.0 & 1 << status as u8 != 0
     }
@@ -379,6 +489,8 @@ impl StatusSet {
 
 #[cfg(test)]
 mod tests {
+    use std::time::{Duration, Instant};
+
     use silver_beacon_state_data::{
         BeaconState, BeaconStateOwner, EpochStateFinalized, SLOTS_PER_EPOCH, SpecConfig, ValSeed,
     };
@@ -388,8 +500,8 @@ mod tests {
     use crate::{
         ctx::test_ctx,
         http::router::{Outcome, Router},
-        routes::ROUTES,
-        testing::submissions,
+        routes::{ROUTES, SERVED_WHILE_SYNCING},
+        testing::{self, posting, request, submissions},
     };
 
     const HEAD_SLOT: u64 = 100 * SLOTS_PER_EPOCH;
@@ -455,7 +567,12 @@ mod tests {
         };
         let mut out = Vec::new();
         assert_eq!(
-            Router::new(ROUTES).dispatch(&req, &ctx(), &mut submissions(), &mut out),
+            Router::new(ROUTES, SERVED_WHILE_SYNCING).dispatch(
+                &req,
+                &ctx(),
+                &mut submissions(),
+                &mut out
+            ),
             Outcome::Response(None)
         );
         out
@@ -463,6 +580,19 @@ mod tests {
 
     fn get(path: &str, query: &str) -> Vec<u8> {
         dispatch("GET", path, query, "")
+    }
+
+    /// The `data` of a whole-registry download, rendered batch by batch.
+    fn downloaded(ctx: &ApiCtx, req: &ParsedRequest<'_>) -> String {
+        let (Outcome::Download(mut registry), head) = testing::dispatch(ctx, req) else {
+            panic!("a whole-registry selection downloads")
+        };
+        assert!(head.ends_with(b"Transfer-Encoding: chunked\r\nConnection: close\r\n\r\n"));
+        let mut body = Vec::new();
+        while registry.render_next(ctx, &mut body) == Batch::More {}
+        let body = String::from_utf8(body).unwrap();
+        let data = body.find(",\"data\":").unwrap();
+        body[data + ",\"data\":".len()..body.len() - 1].to_string()
     }
 
     fn post(body: &str) -> Vec<u8> {
@@ -555,10 +685,90 @@ mod tests {
         assert_eq!(statuses(&format!("{all}&status=withdrawal")), Vec::<String>::new());
     }
 
+    /// The housekeeper of helix's relay refreshes its known validators so.
+    #[test]
+    fn status_filter_alone_selects_the_registry_it_admits() {
+        let path = "/eth/v1/beacon/states/head/validators";
+        let pending = record_json(
+            1,
+            32_000_000_000,
+            "pending_initialized",
+            &format!(
+                "{{\"pubkey\":\"{}\",\"withdrawal_credentials\":\"{}\",\
+                 \"effective_balance\":\"32000000000\",\"slashed\":false,\
+                 \"activation_eligibility_epoch\":\"{FAR_FUTURE_EPOCH}\",\
+                 \"activation_epoch\":\"{}\",\"exit_epoch\":\"{FAR_FUTURE_EPOCH}\",\
+                 \"withdrawable_epoch\":\"{FAR_FUTURE_EPOCH}\"}}",
+                hex(&pubkey(0xa2)),
+                hex(&[0; 32]),
+                EPOCH + 1,
+            ),
+        );
+        let active = record_json(0, 32_000_000_123, "active_ongoing", &active_validator());
+        let get = |query| downloaded(&ctx(), &ParsedRequest { query, ..request("GET", path) });
+        assert_eq!(get("status=active,pending"), format!("[{active},{pending}]"));
+        assert_eq!(get("status=exited").matches("\"index\"").count(), 1);
+        assert_eq!(get("status=withdrawal"), "[]");
+        let body = r#"{"statuses":["pending"]}"#;
+        assert_eq!(downloaded(&ctx(), &posting(path, body)), format!("[{pending}]"));
+    }
+
+    #[test]
+    fn registry_downloads_are_capped() {
+        let mut ctx = ctx();
+        let req = ParsedRequest {
+            query: "status=active",
+            ..request("GET", "/eth/v1/beacon/states/head/validators")
+        };
+        ctx.registry_downloads = MAX_REGISTRY_DOWNLOADS - 1;
+        assert!(matches!(testing::dispatch(&ctx, &req).0, Outcome::Download(_)));
+        ctx.registry_downloads = MAX_REGISTRY_DOWNLOADS;
+        assert_eq!(status_code(&testing::dispatch(&ctx, &req).1), "503");
+    }
+
+    #[test]
+    fn longest_validator_record_is_its_bound() {
+        let lifecycle = Lifecycle {
+            slashed: false,
+            activation_eligibility_epoch: u64::MAX,
+            activation_epoch: u64::MAX,
+            exit_epoch: u64::MAX,
+            withdrawable_epoch: u64::MAX,
+        };
+        let record = ValidatorRecord {
+            index: u64::MAX,
+            balance: u64::MAX,
+            status: ValidatorStatus::WithdrawalPossible,
+            pubkey: [0xff; 48],
+            withdrawal_credentials: Withdrawals([0xff; 32]),
+            effective_balance: u64::MAX,
+            lifecycle,
+        };
+        let mut out = Vec::new();
+        Json::new(&mut out).validator(&record);
+        assert_eq!(out.len() + ",".len(), MAX_VALIDATOR_JSON);
+    }
+
+    #[test]
+    fn download_ends_when_a_finalize_supersedes_its_state() {
+        let mut owner = BeaconStateOwner::published_empty_test(HEAD_SLOT);
+        let ctx = test_ctx(&SpecConfig::mainnet(), owner.reader());
+        let req = ParsedRequest {
+            query: "status=active",
+            ..request("GET", "/eth/v1/beacon/states/head/validators")
+        };
+        let (Outcome::Download(mut registry), _) = testing::dispatch(&ctx, &req) else {
+            panic!("a whole-registry selection downloads")
+        };
+        drop(owner.write());
+        assert_eq!(registry.render_next(&ctx, &mut Vec::new()), Batch::Superseded);
+    }
+
     #[test]
     fn list_rejects_malformed_filters_and_an_empty_selection() {
         let path = "/eth/v1/beacon/states/head/validators";
-        for query in ["id=0&status=running", "id=abc", "id=0&id=0x12", "status=active", ""] {
+        for query in ["id=0&status=running", "id=abc", "id=0&id=0x12", "status=active,running", ""]
+        {
             assert_eq!(status_code(&get(path, query)), "400", "{query:?}");
         }
     }
@@ -659,6 +869,66 @@ mod tests {
         ];
         for (lifecycle, epoch, balance, expected) in cases {
             assert_eq!(lifecycle.status(epoch, balance), expected);
+        }
+    }
+
+    /// Helix's relay asks for the whole active and pending registry every
+    /// ten minutes; on mainnet that is about 1.1M validators. Each batch is
+    /// as long as the download holds the tile in one go.
+    #[test]
+    #[ignore = "timing; run with --release --ignored --nocapture"]
+    fn registry_download_timing() {
+        const VALIDATORS: u64 = 1_100_000;
+        let seeds: Vec<_> = (0..VALIDATORS)
+            .map(|i| {
+                let mut pubkey = [0xa5; 48];
+                pubkey[..8].copy_from_slice(&i.to_le_bytes());
+                ValSeed {
+                    pubkey,
+                    withdrawal_credentials: Withdrawals([i as u8; 32]),
+                    effective_balance: 32_000_000_000,
+                    balance: 32_000_000_000 + i,
+                    activation_epoch: 5 + i % EPOCH,
+                    exit_epoch: FAR_FUTURE_EPOCH,
+                }
+            })
+            .collect();
+        let state = BeaconState::for_test(EpochStateFinalized::default(), &seeds, HEAD_SLOT);
+        let mut owner = BeaconStateOwner::new(state);
+        let anchor = owner.roll_fresh();
+        owner.publish_state_id(anchor);
+        let ctx = test_ctx(&SpecConfig::mainnet(), owner.reader());
+        let req = ParsedRequest {
+            query: "status=active,pending",
+            ..request("GET", "/eth/v1/beacon/states/head/validators")
+        };
+
+        let mut batch = Vec::new();
+        for _ in 0..3 {
+            let (Outcome::Download(mut registry), _) = testing::dispatch(&ctx, &req) else {
+                panic!("a whole-registry selection downloads")
+            };
+            let (mut total, mut slowest, mut bytes, mut batches) =
+                (Duration::ZERO, Duration::ZERO, 0, 0);
+            loop {
+                batch.clear();
+                let started = Instant::now();
+                let rendered = registry.render_next(&ctx, &mut batch);
+                let elapsed = started.elapsed();
+                total += elapsed;
+                slowest = slowest.max(elapsed);
+                bytes += batch.len();
+                batches += 1;
+                if rendered != Batch::More {
+                    assert_eq!(rendered, Batch::Last);
+                    break;
+                }
+            }
+            println!(
+                "{batches} batches, {} MB: total {total:?}, slowest {slowest:?}, largest {} KB",
+                bytes / 1_000_000,
+                batch.capacity() / 1000,
+            );
         }
     }
 }

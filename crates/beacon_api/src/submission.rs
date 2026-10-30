@@ -1,5 +1,10 @@
+use std::time::{Duration, Instant};
+
 use serde::Deserialize;
-use silver_common::{BroadcastValidation, GossipTopic, LocalGossipFailure, TCacheRead};
+use silver_beacon_state_data::{B256, Slot, SpecConfig};
+use silver_common::{
+    BroadcastValidation, GossipTopic, LocalGossipFailure, PayloadValidationStatus, TCacheRead,
+};
 
 use crate::{
     ctx::ApiCtx,
@@ -11,7 +16,7 @@ pub(crate) fn post_submission<'a, T: Deserialize<'a> + SubmittedEntry>(
     ctx: &ApiCtx,
     resp: &mut Response<'_>,
 ) {
-    if !reads_submission(req, ctx, resp) {
+    if !reads_submission(req, resp) {
         return;
     }
     let parsed =
@@ -30,7 +35,7 @@ pub(crate) fn post_single_submission<'a, T: Deserialize<'a> + SubmittedEntry>(
     ctx: &ApiCtx,
     resp: &mut Response<'_>,
 ) {
-    if !reads_submission(req, ctx, resp) {
+    if !reads_submission(req, resp) {
         return;
     }
     match serde_json::from_slice::<T>(req.body) {
@@ -39,10 +44,7 @@ pub(crate) fn post_single_submission<'a, T: Deserialize<'a> + SubmittedEntry>(
     }
 }
 
-fn reads_submission(req: &Request<'_>, ctx: &ApiCtx, resp: &mut Response<'_>) -> bool {
-    if !ctx.follows_chain(resp) {
-        return false;
-    }
+fn reads_submission(req: &Request<'_>, resp: &mut Response<'_>) -> bool {
     if !req.body_is_json() {
         resp.error(415, "only application/json bodies are read");
         return false;
@@ -90,13 +92,147 @@ pub(crate) struct Submission {
     pub(crate) accepted: Vec<AcceptedEntry>,
     pub(crate) failures: Vec<SubmissionFailure>,
     pub(crate) forward: Option<BuilderForward>,
+    pub(crate) validation: BroadcastValidation,
     pub(crate) envelope: Option<EnvelopePublication>,
+    pub(crate) integration: Integration,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) struct EnvelopePublication {
     pub(crate) blob_data_included: bool,
-    pub(crate) validation: BroadcastValidation,
+}
+
+/// `None` for a level the schema does not define.
+pub(crate) fn requested_validation(req: &Request<'_>) -> Option<BroadcastValidation> {
+    match req.query_value("broadcast_validation").as_deref() {
+        None | Some("gossip") => Some(BroadcastValidation::Gossip),
+        Some("consensus") => Some(BroadcastValidation::Consensus),
+        Some("consensus_and_equivocation") => Some(BroadcastValidation::ConsensusAndEquivocation),
+        _ => None,
+    }
+}
+
+/// What a broadcast submission's answer waits on: 200 once integrated, 202
+/// once broadcast but not integrated.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub(crate) enum Integration {
+    #[default]
+    Integrated,
+    BroadcastOnly,
+    AwaitingEnvelopeCheck,
+    /// A published block, whose root comes with its verdict.
+    AwaitingImport {
+        block_root: Option<B256>,
+        awaits_execution: bool,
+        deadline: Instant,
+    },
+}
+
+impl Integration {
+    /// A quarter slot answers within helix's 4 s publish timeout and
+    /// Lighthouse's half slot, so a late import reaches them as a 202. A Gloas
+    /// block carries no payload.
+    pub(crate) fn import_of_block(slot: Slot, spec: &SpecConfig, now: Instant) -> Self {
+        Self::AwaitingImport {
+            block_root: None,
+            awaits_execution: !spec.is_gloas_at_slot(slot),
+            deadline: now + Duration::from_millis(spec.seconds_per_slot() * 1000 / 4),
+        }
+    }
+
+    pub(crate) fn awaits_import(&self) -> bool {
+        matches!(self, Self::AwaitingImport { .. })
+    }
+
+    /// An import is integrated once imported and, before Gloas, executed;
+    /// an EL still syncing leaves it optimistically imported. It is only
+    /// broadcast once rejected, or once its deadline passes.
+    pub(crate) fn update(&mut self, imports: &RecentImports, now: Instant) {
+        let Self::AwaitingImport { block_root, awaits_execution, deadline } = *self else {
+            return;
+        };
+        if let Some(progress) = block_root.and_then(|root| imports.get(&root)) {
+            if progress.rejected || progress.execution == Some(PayloadValidationStatus::Invalid) {
+                *self = Self::BroadcastOnly;
+                return;
+            }
+            if progress.imported && (progress.execution.is_some() || !awaits_execution) {
+                *self = Self::Integrated;
+                return;
+            }
+        }
+        if now >= deadline {
+            *self = Self::BroadcastOnly;
+        }
+    }
+
+    /// A published block's verdict names it; one that names none cannot be
+    /// followed, so it is known only to be broadcast.
+    pub(crate) fn on_published(&mut self, published_root: Option<B256>) {
+        if let Self::AwaitingImport { block_root, .. } = self {
+            match published_root {
+                Some(root) => *block_root = Some(root),
+                None => *self = Self::BroadcastOnly,
+            }
+        }
+    }
+}
+
+const RECENT_IMPORTS: usize = 32;
+
+/// What happened to the last blocks seen while a publication awaits its
+/// import. Its verdict, which names the block, can trail these events.
+#[derive(Default)]
+pub(crate) struct RecentImports {
+    blocks: [ImportProgress; RECENT_IMPORTS],
+    next: usize,
+}
+
+#[derive(Clone, Copy, Default)]
+struct ImportProgress {
+    block_root: B256,
+    imported: bool,
+    execution: Option<PayloadValidationStatus>,
+    rejected: bool,
+}
+
+impl RecentImports {
+    pub(crate) fn on_imported(&mut self, block_root: &B256) {
+        self.entry(block_root).imported = true;
+    }
+
+    /// Imported before it was published, so its execution was settled then.
+    pub(crate) fn on_already_known(&mut self, block_root: &B256) {
+        let progress = self.entry(block_root);
+        progress.imported = true;
+        progress.execution.get_or_insert(PayloadValidationStatus::Valid);
+    }
+
+    pub(crate) fn on_rejected(&mut self, block_root: &B256) {
+        self.entry(block_root).rejected = true;
+    }
+
+    pub(crate) fn on_execution(&mut self, block_root: &B256, status: PayloadValidationStatus) {
+        self.entry(block_root).execution = Some(status);
+    }
+
+    fn get(&self, block_root: &B256) -> Option<&ImportProgress> {
+        self.blocks.iter().find(|progress| progress.block_root == *block_root)
+    }
+
+    /// The oldest entry gives way to a block not yet seen.
+    fn entry(&mut self, block_root: &B256) -> &mut ImportProgress {
+        let at = match self.blocks.iter().position(|progress| progress.block_root == *block_root) {
+            Some(at) => at,
+            None => {
+                let at = self.next;
+                self.next = (at + 1) % RECENT_IMPORTS;
+                self.blocks[at] = ImportProgress { block_root: *block_root, ..Default::default() };
+                at
+            }
+        };
+        &mut self.blocks[at]
+    }
 }
 
 /// A block for the builder whose bid it commits to, sent once every verdict
@@ -138,9 +274,12 @@ pub(crate) fn failure_message(failure: LocalGossipFailure) -> &'static str {
 
 #[cfg(test)]
 pub(crate) mod tests {
+    use std::time::Duration;
+
     use silver_beacon_state_data::{BeaconStateOwner, SLOTS_PER_EPOCH, ShufflingId, SpecConfig};
     use silver_common::SyncUpdate;
 
+    use super::*;
     use crate::ctx::{ApiCtx, test_ctx};
 
     const ACTIVE: usize = 4;
@@ -162,5 +301,79 @@ pub(crate) mod tests {
     pub(crate) fn posted_committees(ctx: &ApiCtx) -> u64 {
         ctx.read_state(|view| ctx.shufflings.committees_per_slot(&view, SLOT / SLOTS_PER_EPOCH))
             .expect("the fixture posts a shuffling")
+    }
+
+    fn awaited(awaits_execution: bool, deadline: Instant) -> Integration {
+        Integration::AwaitingImport { block_root: Some([1; 32]), awaits_execution, deadline }
+    }
+
+    fn updated(mut import: Integration, imports: &RecentImports, now: Instant) -> Integration {
+        import.update(imports, now);
+        import
+    }
+
+    #[test]
+    fn block_is_integrated_once_imported_and_executed_in_either_order() {
+        let now = Instant::now();
+        let import = awaited(true, now + Duration::from_secs(1));
+
+        let mut imports = RecentImports::default();
+        imports.on_imported(&[1; 32]);
+        assert_eq!(updated(import, &imports, now), import, "the EL has not answered");
+        imports.on_execution(&[1; 32], PayloadValidationStatus::Syncing);
+        let integrated = updated(import, &imports, now);
+        assert_eq!(integrated, Integration::Integrated, "optimistic import counts");
+
+        let mut imports = RecentImports::default();
+        imports.on_execution(&[1; 32], PayloadValidationStatus::Valid);
+        assert_eq!(updated(import, &imports, now), import, "not yet imported");
+        imports.on_imported(&[1; 32]);
+        assert_eq!(updated(import, &imports, now), Integration::Integrated);
+
+        let mut imports = RecentImports::default();
+        imports.on_imported(&[1; 32]);
+        let gloas = awaited(false, now + Duration::from_secs(1));
+        assert_eq!(updated(gloas, &imports, now), Integration::Integrated, "Gloas waits on no EL");
+
+        let mut imports = RecentImports::default();
+        imports.on_already_known(&[1; 32]);
+        assert_eq!(updated(import, &imports, now), Integration::Integrated);
+    }
+
+    #[test]
+    fn refused_or_late_import_is_not_integrated() {
+        let now = Instant::now();
+        let later = now + Duration::from_secs(1);
+        let import = awaited(true, later);
+
+        let mut imports = RecentImports::default();
+        imports.on_rejected(&[1; 32]);
+        assert_eq!(updated(import, &imports, now), Integration::BroadcastOnly);
+
+        let mut imports = RecentImports::default();
+        imports.on_imported(&[1; 32]);
+        imports.on_execution(&[1; 32], PayloadValidationStatus::Invalid);
+        assert_eq!(updated(import, &imports, now), Integration::BroadcastOnly);
+
+        let imports = RecentImports::default();
+        assert_eq!(updated(import, &imports, now), import);
+        assert_eq!(updated(import, &imports, later), Integration::BroadcastOnly, "out of time");
+        let unnamed = Integration::AwaitingImport {
+            block_root: None,
+            awaits_execution: true,
+            deadline: later,
+        };
+        assert_eq!(updated(unnamed, &imports, now), unnamed, "its verdict has not come");
+    }
+
+    #[test]
+    fn oldest_import_gives_way_to_a_new_block() {
+        let mut imports = RecentImports::default();
+        for fill in 0..=RECENT_IMPORTS as u8 {
+            imports.on_imported(&[fill; 32]);
+        }
+        assert!(imports.get(&[0; 32]).is_none());
+        assert!(imports.get(&[1; 32]).is_some_and(|progress| progress.imported));
+        assert!(imports.get(&[RECENT_IMPORTS as u8; 32]).is_some());
     }
 }

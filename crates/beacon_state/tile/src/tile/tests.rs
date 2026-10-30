@@ -217,6 +217,7 @@ fn gossip_pending(
             recv_ts: Nanos(0),
             ssz: read,
             protobuf: read,
+            validation: silver_common::BroadcastValidation::Gossip,
         },
         pin,
     )
@@ -1274,7 +1275,7 @@ fn short_gossip_block_rejected_before_any_field_read() {
             BlockSource::Gossip,
             false,
             &mut adapter.producers,
-            |_| panic!("a malformed block must never be relayed"),
+            |_, _| panic!("a malformed block must never be relayed"),
         );
         assert!(
             matches!(feedback, Feedback::Reject { block_root: None, .. }),
@@ -1295,7 +1296,7 @@ fn short_gossip_block_rejected_before_any_field_read() {
         BlockSource::Gossip,
         false,
         &mut adapter.producers,
-        |_| panic!("an unimportable block must never be relayed"),
+        |_, _| panic!("an unimportable block must never be relayed"),
     );
     assert!(matches!(feedback, Feedback::RequestParent { .. }), "{feedback:?}");
 }
@@ -1430,10 +1431,14 @@ fn a_block_already_in_fork_choice_is_reported_already_known() {
 
     let (data, read) = publish_block_bytes(&mut gp, &bytes);
     let pinned = tile.reader.acquire(read);
-    let feedback =
-        tile.apply_block(&data, &pinned, BlockSource::Rpc, false, &mut adapter.producers, |_| {
-            panic!("a repeat is never relayed")
-        });
+    let feedback = tile.apply_block(
+        &data,
+        &pinned,
+        BlockSource::Rpc,
+        false,
+        &mut adapter.producers,
+        |_, _| panic!("a repeat is never relayed"),
+    );
     assert_eq!(feedback, Feedback::BlockKnown(block_root));
     assert_eq!(block_stages(&mut sink), [(block_root, BlockStage::AlreadyKnown)]);
 }
@@ -1502,17 +1507,27 @@ fn a_block_is_applied_once_and_already_known_on_repeat() {
     // bypasses proposer-signature verification.
     let (data, read) = publish_block_bytes(&mut gp, &block_ssz);
     let pinned = tile.reader.acquire(read);
-    let feedback =
-        tile.apply_block(&data, &pinned, BlockSource::Gossip, true, &mut adapter.producers, |_| {});
+    let feedback = tile.apply_block(
+        &data,
+        &pinned,
+        BlockSource::Gossip,
+        true,
+        &mut adapter.producers,
+        |_, _| {},
+    );
     let Feedback::BlockImported(block_root) = feedback else { panic!("{feedback:?}") };
     assert_eq!(block_stages(&mut sink), [(block_root, BlockStage::Applied)]);
 
     let (data, read) = publish_block_bytes(&mut gp, &block_ssz);
     let pinned = tile.reader.acquire(read);
-    let feedback =
-        tile.apply_block(&data, &pinned, BlockSource::Rpc, false, &mut adapter.producers, |_| {
-            panic!("a repeat is never relayed")
-        });
+    let feedback = tile.apply_block(
+        &data,
+        &pinned,
+        BlockSource::Rpc,
+        false,
+        &mut adapter.producers,
+        |_, _| panic!("a repeat is never relayed"),
+    );
     assert_eq!(feedback, Feedback::BlockKnown(block_root));
     assert_eq!(block_stages(&mut sink), [(block_root, BlockStage::AlreadyKnown)]);
 }
@@ -1532,8 +1547,14 @@ fn block_before_slot_tick_takes_proposer_boost() {
     tile.ticker.set_current_slot(slot);
     let (data, read) = publish_block_bytes(&mut gp, &block_ssz);
     let pinned = tile.reader.acquire(read);
-    let feedback =
-        tile.apply_block(&data, &pinned, BlockSource::Gossip, true, &mut adapter.producers, |_| {});
+    let feedback = tile.apply_block(
+        &data,
+        &pinned,
+        BlockSource::Gossip,
+        true,
+        &mut adapter.producers,
+        |_, _| {},
+    );
 
     assert_eq!(feedback, Feedback::BlockImported(tile.fork_choice.proposer_boost_root));
 }
@@ -1697,7 +1718,7 @@ fn payload_timestamp_and_blob_count_are_checked_before_relay() {
             BlockSource::Gossip,
             true, // pre_verified: the signature is not what these cases are about
             &mut adapter.producers,
-            |_| relayed = true,
+            |_, _| relayed = true,
         );
 
         // The well-formed case still fails the STF (synthetic parent root), so
@@ -1778,7 +1799,7 @@ fn non_canonical_body_is_rejected_before_relay() {
             BlockSource::Gossip,
             true,
             &mut adapter.producers,
-            |_| relayed = true,
+            |_, _| relayed = true,
         );
 
         assert_eq!(
@@ -1813,7 +1834,7 @@ fn block_at_the_finalized_start_slot_is_ignored() {
             BlockSource::Gossip,
             true,
             &mut adapter.producers,
-            |_| {},
+            |_, _| {},
         );
 
         assert_eq!(matches!(feedback, Feedback::Ignore), want_ignore, "slot {slot}: {feedback:?}");
@@ -3087,6 +3108,7 @@ fn gossip_msg(producer: &mut TProducer, bytes: &[u8], topic: GossipTopic) -> New
         recv_ts: Nanos(0),
         ssz,
         protobuf,
+        validation: silver_common::BroadcastValidation::Gossip,
     }
 }
 
@@ -3118,6 +3140,7 @@ fn gossip_att_msg(
         recv_ts: Nanos(0),
         ssz: read,
         protobuf: read,
+        validation: silver_common::BroadcastValidation::Gossip,
     }
 }
 
@@ -3258,7 +3281,7 @@ fn ignored_local_attestation_emits_a_terminal_verdict() {
 
     let mut verdicts = Vec::new();
     adapter.consume(|event: BeaconStateEvent, _| {
-        if let BeaconStateEvent::LocalGossipVerdict { hash, result } = event {
+        if let BeaconStateEvent::LocalGossipVerdict { hash, result, .. } = event {
             verdicts.push((hash, result));
         }
     });
@@ -3291,7 +3314,7 @@ fn accepted_local_attestation_is_relayed_and_emits_success() {
 
     let mut verdicts = Vec::new();
     adapter.consume(|event: BeaconStateEvent, _| {
-        if let BeaconStateEvent::LocalGossipVerdict { hash, result } = event {
+        if let BeaconStateEvent::LocalGossipVerdict { hash, result, .. } = event {
             verdicts.push((hash, result));
         }
     });
@@ -3354,7 +3377,7 @@ fn vote_on_an_unseen_payload_requests_the_envelope() {
     assert_eq!(requested, [(unseen, att_slot)]);
     let mut verdicts = Vec::new();
     adapter.consume(|event: BeaconStateEvent, _| {
-        if let BeaconStateEvent::LocalGossipVerdict { hash, result } = event {
+        if let BeaconStateEvent::LocalGossipVerdict { hash, result, .. } = event {
             verdicts.push((hash, result));
         }
     });
@@ -3386,7 +3409,7 @@ fn ignored_local_aggregate_emits_a_terminal_verdict() {
 
     let mut verdicts = Vec::new();
     adapter.consume(|event: BeaconStateEvent, _| {
-        if let BeaconStateEvent::LocalGossipVerdict { hash, result } = event {
+        if let BeaconStateEvent::LocalGossipVerdict { hash, result, .. } = event {
             verdicts.push((hash, result));
         }
     });
@@ -5569,9 +5592,20 @@ fn registered_proposer_gets_a_payload_prepared_on_the_head() {
     seed_tile(&mut tile, 4, 10);
     let mut sink = SpineAdapter::connect_tile(&Sink, &mut spine.spine);
     engine_requests(&mut sink);
+    sink.consume(|_: BeaconStateEvent, _| {});
     register_proposer(&mut tile, 0, [7; 20]);
+    tile.payload_attributes.wanted = true;
 
     assert!(tile.prepare_payload(11, None, &mut adapter.producers).is_ok());
+    let mut parent_block_numbers = Vec::new();
+    sink.consume(|event: BeaconStateEvent, _| {
+        if let BeaconStateEvent::PayloadAttributes(attributes) = event {
+            parent_block_numbers.push(attributes.parent_block_number);
+        }
+    });
+    let head = tile.state.read_view(tile.last_applied);
+    let parent_block_number = head.slot.state().latest_execution_payload_header.block_number;
+    assert_eq!(parent_block_numbers, [Some(parent_block_number)]);
 
     let [EngineReq::PreparePayload(request)] = engine_requests(&mut sink)[..] else {
         panic!("expected one payload preparation");
@@ -5973,8 +6007,14 @@ fn import_produced_fixture_block(reuse_produced_state: bool) {
     let produced_states = tile.block_production.state_ids_mut().count();
     assert_eq!(produced_states, usize::from(reuse_produced_state));
     let pinned = tile.reader.acquire(read);
-    let feedback =
-        tile.apply_block(&data, &pinned, BlockSource::Gossip, true, &mut adapter.producers, |_| {});
+    let feedback = tile.apply_block(
+        &data,
+        &pinned,
+        BlockSource::Gossip,
+        true,
+        &mut adapter.producers,
+        |_, _| {},
+    );
     // Checked before a blob block is staged on its columns.
     assert!(matches!(feedback, Feedback::AwaitData(_)), "{feedback:?}");
     assert_eq!(tile.block_production.state_ids_mut().count(), 0, "import takes the post-state");

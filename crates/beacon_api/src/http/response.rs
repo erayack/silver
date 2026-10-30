@@ -2,17 +2,19 @@ use std::{io::Write, mem, str};
 
 use serde::Deserialize;
 use silver_common::{
-    BeaconApiRequest, GossipTopic, LocalGossipFailure, TCacheProducer, TCacheRead, TProducer,
+    BeaconApiRequest, BroadcastValidation, GossipTopic, LocalGossipFailure, TCacheProducer,
+    TCacheRead, TProducer,
 };
 use silver_httpcore::{ClientResponse, frame_chunked_head, frame_response_with_headers};
 use silver_pbs::{PreferenceFailures, SidecarCall};
 
 use crate::{
+    beacon::validators::RegistryStream,
     events::ChannelSet,
     http::{json::Json, router::Outcome},
     submission::{
-        AcceptedEntry, BuilderForward, EnvelopePublication, Submission, SubmissionFailure,
-        failure_message,
+        AcceptedEntry, BuilderForward, EnvelopePublication, Integration, Submission,
+        SubmissionFailure, failure_message,
     },
 };
 
@@ -56,11 +58,36 @@ impl<'a> Response<'a> {
         submission.forward = Some(BuilderForward { url: url.into(), ssz: entry.ssz });
     }
 
-    pub(crate) fn await_payload_envelope(&mut self, body: &[u8], publication: EnvelopePublication) {
-        self.await_verdicts(0, [GossipTopic::ExecutionPayload], body.len(), |out| {
-            out.copy_from_slice(body)
-        });
-        self.submission().envelope = Some(publication);
+    pub(crate) fn await_payload_envelope(
+        &mut self,
+        body: &[u8],
+        publication: EnvelopePublication,
+        validation: BroadcastValidation,
+    ) {
+        self.await_published(GossipTopic::ExecutionPayload, body, validation);
+        let submission = self.submission();
+        submission.envelope = Some(publication);
+        submission.integration = Integration::AwaitingEnvelopeCheck;
+    }
+
+    pub(crate) fn await_block(
+        &mut self,
+        body: &[u8],
+        validation: BroadcastValidation,
+        import: Integration,
+    ) {
+        self.await_published(GossipTopic::BeaconBlock, body, validation);
+        self.submission().integration = import;
+    }
+
+    fn await_published(
+        &mut self,
+        topic: GossipTopic,
+        body: &[u8],
+        validation: BroadcastValidation,
+    ) {
+        self.await_verdicts(0, [topic], body.len(), |out| out.copy_from_slice(body));
+        self.submission().validation = validation;
     }
 
     pub(crate) fn fail_entry(&mut self, body_index: usize, message: &'static str) {
@@ -86,6 +113,12 @@ impl<'a> Response<'a> {
         debug_assert!(self.out.is_empty(), "a stream head follows no other response");
         frame_chunked_head(self.out, content_type, headers);
         self.outcome = Outcome::Stream(channels);
+    }
+
+    pub(crate) fn begin_registry_download(&mut self, registry: RegistryStream) {
+        debug_assert!(self.out.is_empty(), "a stream head follows no other response");
+        frame_chunked_head(self.out, JSON_CONTENT_TYPE, &[]);
+        self.outcome = Outcome::Download(registry);
     }
 
     pub(crate) fn defer(&mut self, outcome: Outcome) {

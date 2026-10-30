@@ -1,6 +1,7 @@
+use std::time::Instant;
+
 use silver_beacon_state_data::{BodyFork, BodyOffsets};
 use silver_common::{
-    GossipTopic,
     block_contents::SignedBlockContents,
     ssz_view::{BeaconBlockBodyGloasView, ExecutionPayloadHeaderFuluView, SignedBeaconBlockView},
 };
@@ -8,6 +9,7 @@ use silver_common::{
 use crate::{
     ctx::ApiCtx,
     http::{response::Response, router::Request},
+    submission::{Integration, requested_validation},
 };
 
 const MAX_BUILDER_URL_SIZE: usize = 2048;
@@ -16,14 +18,15 @@ pub(crate) fn post_block_v2(req: &Request<'_>, ctx: &ApiCtx, resp: &mut Response
     if !req.body_is_ssz() {
         return resp.error(415, "only application/octet-stream bodies are read");
     }
-    if !ctx.follows_chain(resp) {
-        return;
-    }
+    let Some(validation) = requested_validation(req) else {
+        return resp.error(400, "invalid broadcast_validation");
+    };
     let body = req.body;
     // Gloas blocks are posted bare, Fulu blocks as `SignedBlockContents`; the
     // leading offset (100 or 12) tells the two apart.
-    if SignedBeaconBlockView::check_size(body) {
-        if !ctx.spec.is_gloas_at_slot(SignedBeaconBlockView::slot(body)) {
+    let slot = if SignedBeaconBlockView::check_size(body) {
+        let slot = SignedBeaconBlockView::slot(body);
+        if !ctx.spec.is_gloas_at_slot(slot) {
             return resp.error(400, "only Gloas blocks are published without their blobs");
         }
         let block_body = SignedBeaconBlockView::body(body);
@@ -32,16 +35,26 @@ pub(crate) fn post_block_v2(req: &Request<'_>, ctx: &ApiCtx, resp: &mut Response
         {
             return resp.error(400, "invalid SignedBeaconBlock");
         }
+        slot
     } else {
         let Some(contents) = SignedBlockContents::parse(body) else {
             return resp.error(400, "invalid SignedBlockContents");
         };
-        if ctx.spec.is_gloas_at_slot(SignedBeaconBlockView::slot(contents.signed_block)) {
+        let slot = SignedBeaconBlockView::slot(contents.signed_block);
+        if ctx.spec.is_gloas_at_slot(slot) {
             return resp.error(400, "Gloas blocks are published without their blobs");
         }
+        slot
+    };
+    if req.eth_consensus_version != Some(ctx.spec.fork_at_slot(slot).name()) {
+        return resp.error(400, "Eth-Consensus-Version must name the block's fork");
     }
 
-    resp.await_verdicts(0, [GossipTopic::BeaconBlock], body.len(), |out| out.copy_from_slice(body));
+    resp.await_block(
+        body,
+        validation,
+        Integration::import_of_block(slot, &ctx.spec, Instant::now()),
+    );
     if let Some(url) = req.eth_builder_url.filter(|_| SignedBeaconBlockView::check_size(body)) {
         if url.starts_with("http://") && url.len() <= MAX_BUILDER_URL_SIZE {
             resp.forward_to_builder(url);
@@ -52,21 +65,27 @@ pub(crate) fn post_block_v2(req: &Request<'_>, ctx: &ApiCtx, resp: &mut Response
 }
 
 pub(crate) fn post_blinded_block_v2(req: &Request<'_>, ctx: &ApiCtx, resp: &mut Response<'_>) {
-    if !ctx.follows_chain(resp) {
-        return;
-    }
     if !ctx.has_sidecar {
         return resp.error(500, "no sidecar is configured to reveal the payload");
     }
     if !req.body_is_ssz() {
         return resp.error(415, "only application/octet-stream bodies are read");
     }
+    // The relay broadcasts the revealed block, so the level is checked but
+    // not applied here.
+    if requested_validation(req).is_none() {
+        return resp.error(400, "invalid broadcast_validation");
+    }
     let block = req.body;
     if !SignedBeaconBlockView::check_size(block) {
         return resp.error(400, "invalid SignedBlindedBeaconBlock");
     }
-    if ctx.spec.is_gloas_at_slot(SignedBeaconBlockView::slot(block)) {
+    let slot = SignedBeaconBlockView::slot(block);
+    if ctx.spec.is_gloas_at_slot(slot) {
         return resp.error(400, "only Fulu blinded blocks are published");
+    }
+    if req.eth_consensus_version != Some(ctx.spec.fork_at_slot(slot).name()) {
+        return resp.error(400, "Eth-Consensus-Version must name the block's fork");
     }
     let body = BodyOffsets::validated(SignedBeaconBlockView::body(block), BodyFork::FuluBlinded);
     if !body
@@ -80,7 +99,7 @@ pub(crate) fn post_blinded_block_v2(req: &Request<'_>, ctx: &ApiCtx, resp: &mut 
 #[cfg(test)]
 pub(crate) mod tests {
     use silver_common::{
-        TCache, TCacheId, TCacheProducer,
+        BroadcastValidation, GossipTopic, TCache, TCacheId, TCacheProducer,
         ssz_hash_gloas::EMPTY_EXECUTION_REQUESTS,
         ssz_view::{
             BEACON_BLOCK_BODY_FIXED, BYTES_PER_BLOB, BYTES_PER_KZG_COMMITMENT,
@@ -119,6 +138,15 @@ pub(crate) mod tests {
         out
     }
 
+    fn publishing<'a>(body: &'a [u8], fork: &'static str) -> ParsedRequest<'a> {
+        ParsedRequest {
+            body,
+            content_type: Some(SSZ_MEDIA_TYPE),
+            eth_consensus_version: Some(fork),
+            ..posting(PATH, "")
+        }
+    }
+
     fn post(body: &[u8], content_type: &str) -> (Outcome, Vec<u8>) {
         dispatch(&ctx(), &ParsedRequest {
             body,
@@ -131,16 +159,59 @@ pub(crate) mod tests {
     fn contents_are_submitted_whole_on_the_block_topic() {
         let body = contents();
         let mut submissions = TCache::producer(TCacheId::BoundaryProcessing, 1 << 20);
-        let (outcome, out) = dispatch_into(
-            &ctx(),
-            &ParsedRequest { body: &body, content_type: Some(SSZ_MEDIA_TYPE), ..posting(PATH, "") },
-            &mut submissions,
-        );
+        let ctx = ctx();
+        let fork = ctx.spec.fork_at_slot(0).name();
+        let (outcome, out) = dispatch_into(&ctx, &publishing(&body, fork), &mut submissions);
         assert!(out.is_empty());
         let Outcome::AwaitingVerdicts(submission) = outcome else { panic!("{outcome:?}") };
         let [entry] = &submission.accepted[..] else { panic!("one entry") };
         assert_eq!(entry.topic, GossipTopic::BeaconBlock);
         assert_eq!(submissions.read_buffer(entry.ssz).unwrap(), body);
+    }
+
+    /// `BeaconClient::publish_block` in helix: Fulu contents under
+    /// `consensus_and_equivocation`, naming the block's fork.
+    #[test]
+    fn helix_publication_carries_its_validation_level() {
+        let ctx = ctx();
+        let body = contents();
+        let fork = ctx.spec.fork_at_slot(0).name();
+        let request = |query| ParsedRequest {
+            body: &body,
+            query,
+            content_type: Some(SSZ_MEDIA_TYPE),
+            eth_consensus_version: Some(fork),
+            ..posting(PATH, "")
+        };
+        for (query, validation) in [
+            (
+                "broadcast_validation=consensus_and_equivocation",
+                BroadcastValidation::ConsensusAndEquivocation,
+            ),
+            ("broadcast_validation=consensus", BroadcastValidation::Consensus),
+            ("", BroadcastValidation::Gossip),
+        ] {
+            let mut submissions = TCache::producer(TCacheId::BoundaryProcessing, 1 << 20);
+            let (outcome, _) = dispatch_into(&ctx, &request(query), &mut submissions);
+            let Outcome::AwaitingVerdicts(submission) = outcome else {
+                panic!("{query}: awaits its verdict")
+            };
+            assert_eq!(submission.validation, validation, "{query}");
+        }
+    }
+
+    #[test]
+    fn unknown_level_or_a_missing_or_wrong_version_is_a_400() {
+        let ctx = ctx();
+        let body = contents();
+        let request = publishing(&body, ctx.spec.fork_at_slot(0).name());
+        for refused in [
+            ParsedRequest { query: "broadcast_validation=full", ..request },
+            ParsedRequest { eth_consensus_version: Some("gloas"), ..request },
+            ParsedRequest { eth_consensus_version: None, ..request },
+        ] {
+            assert_eq!(status_code(&dispatch(&ctx, &refused).1), "400");
+        }
     }
 
     #[test]
@@ -177,11 +248,8 @@ pub(crate) mod tests {
     fn gloas_block_is_submitted_bare_on_the_block_topic() {
         let body = gloas_block();
         let mut submissions = submissions();
-        let (outcome, out) = dispatch_into(
-            &gloas_ctx(),
-            &ParsedRequest { body: &body, content_type: Some(SSZ_MEDIA_TYPE), ..posting(PATH, "") },
-            &mut submissions,
-        );
+        let (outcome, out) =
+            dispatch_into(&gloas_ctx(), &publishing(&body, "gloas"), &mut submissions);
         assert!(out.is_empty());
         let Outcome::AwaitingVerdicts(submission) = outcome else { panic!("{outcome:?}") };
         let [entry] = &submission.accepted[..] else { panic!("one entry") };
@@ -246,19 +314,27 @@ pub(crate) mod tests {
     #[test]
     fn blinded_block_waits_on_its_proposal_lock() {
         let body = blinded_block();
+        let ctx = sidecar_ctx();
+        let fork = ctx.spec.fork_at_slot(SignedBeaconBlockView::slot(&body)).name();
+        let request = ParsedRequest {
+            body: &body,
+            content_type: Some(SSZ_MEDIA_TYPE),
+            eth_consensus_version: Some(fork),
+            ..posting(BLINDED_PATH, "")
+        };
         let mut submissions = submissions();
-        let (outcome, out) = dispatch_into(
-            &sidecar_ctx(),
-            &ParsedRequest {
-                body: &body,
-                content_type: Some(SSZ_MEDIA_TYPE),
-                ..posting(BLINDED_PATH, "")
-            },
-            &mut submissions,
-        );
+        let (outcome, out) = dispatch_into(&ctx, &request, &mut submissions);
         assert!(out.is_empty(), "answered once the sidecar has");
         let Outcome::AwaitingBlindedBlockLock { ssz } = outcome else { panic!("{outcome:?}") };
         assert_eq!(submissions.read_buffer(ssz).unwrap(), body);
+
+        for refused in [
+            ParsedRequest { query: "broadcast_validation=full", ..request },
+            ParsedRequest { eth_consensus_version: Some("gloas"), ..request },
+            ParsedRequest { eth_consensus_version: None, ..request },
+        ] {
+            assert_eq!(status_code(&dispatch(&ctx, &refused).1), "400");
+        }
     }
 
     #[test]
