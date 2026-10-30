@@ -7,15 +7,14 @@
 
 use std::{
     collections::HashMap,
-    hash::BuildHasherDefault,
     net::{IpAddr, Ipv4Addr, SocketAddr},
     time::Instant,
 };
 
 use fxhash::FxHashMap;
 use silver_common::{
-    AgentString, CountingWitherFilter, GossipTopic, MessageId, MessageIdHasher, PeerId, PeerScores,
-    PeerTopicScores, StreamProtocol,
+    AgentString, CountingWitherFilter, GossipTopic, MessageId, MessageIdHashState, PeerId,
+    PeerScores, PeerTopicScores, StreamProtocol,
     rpc_rate_limit::{N_STREAM_PROTOCOLS, RpcRateLimit, RpcRateLimitSet},
 };
 
@@ -23,8 +22,6 @@ use crate::scoring::{self, ScoreBreakdown};
 
 /// Initial capacity hint; peers with larger custody sets may grow beyond it.
 pub(crate) const TOPICS_PER_PEER_CAP: usize = 96;
-
-pub(crate) type MsgIdBuild = BuildHasherDefault<MessageIdHasher>;
 
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub(crate) struct PartialCapabilities {
@@ -61,7 +58,7 @@ pub(crate) struct PeerState {
     // Note that this struct is NOT cleared or rotated. This means message ids may persist
     // longer than specced timeouts (4.2s for IWANT limits and 3s for IDONTWANT) - but would
     // argue that this is irrelevent - msg ids naturally age out.
-    pub msg_cache: CountingWitherFilter<MessageId, MessageIdHasher, 4096>,
+    pub msg_cache: CountingWitherFilter<MessageId, MessageIdHashState, 4096>,
 
     // Global score components.
     pub application_score: f64, // P5
@@ -70,6 +67,10 @@ pub(crate) struct PeerState {
     // Per-heartbeat rate-limit counters; reset every `heartbeat_interval`.
     pub ihaves_received: u16, // caps IWANT issuance via max_ihave_length
     pub iwant_ids_sent: u16,  // caps the per-heartbeat IWANT budget
+    // `msg_cache` slots are shared, so serve counts can be evicted; these
+    // bound re-serving after an eviction.
+    pub iwant_ids_served: u16,
+    pub idontwant_ids_received: u16,
 
     // Outbound protocol rate-limit state.
     pub outbound_rpc_limits: RpcRateLimitSet,
@@ -127,6 +128,8 @@ impl Default for PeerState {
             behaviour_penalty: 0.0,
             ihaves_received: 0,
             iwant_ids_sent: 0,
+            iwant_ids_served: 0,
+            idontwant_ids_received: 0,
             outbound_rpc_limits: RpcRateLimitSet::default(),
             outbound_in_flight: [0; N_STREAM_PROTOCOLS],
             backoffs: FxHashMap::default(),
@@ -167,6 +170,8 @@ impl PeerState {
         self.behaviour_penalty = 0.0;
         self.ihaves_received = 0;
         self.iwant_ids_sent = 0;
+        self.iwant_ids_served = 0;
+        self.idontwant_ids_received = 0;
         self.outbound_rpc_limits = RpcRateLimitSet::default();
         self.outbound_in_flight = [0; N_STREAM_PROTOCOLS];
         self.backoffs.clear();
@@ -370,6 +375,4 @@ impl IpPrefix {
     }
 }
 
-/// Type alias for a hashmap keyed by MessageId using the identity-hasher
-/// (MessageId is already a SHA-256 truncation — skip re-hashing).
-pub(crate) type MsgIdMap<V> = HashMap<MessageId, V, MsgIdBuild>;
+pub(crate) type MsgIdMap<V> = HashMap<MessageId, V, MessageIdHashState>;
