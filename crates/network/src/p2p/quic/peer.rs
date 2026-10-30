@@ -671,8 +671,11 @@ impl Peer {
 
         if let SpinResult::Protocol(protocol) = result {
             silver_log::debug!(?id, ?protocol, "incoming stream negotiated");
-            if protocol.is_gossip() {
-                self.inbound_gossip.replace(id);
+            if protocol.is_gossip() &&
+                let Some(superseded) = self.inbound_gossip.replace(id) &&
+                superseded != id
+            {
+                self.remove_stream(superseded, rpc_codec_pool);
             }
         }
     }
@@ -868,8 +871,13 @@ where
 
         if let SpinResult::Protocol(protocol) = result {
             silver_log::debug!(?id, ?protocol, "incoming stream negotiated");
-            if protocol.is_gossip() {
-                inbound_gossip.replace(*id);
+            // A slot is free: `to_remove` was checked before this spin and
+            // nothing else was pushed for this stream.
+            if protocol.is_gossip() &&
+                let Some(superseded) = inbound_gossip.replace(*id) &&
+                superseded != *id
+            {
+                to_remove.push(superseded);
             }
         }
     }
@@ -1282,7 +1290,10 @@ mod tests {
     use crate::{
         p2p::{
             ClusterNodes, P2p,
-            quic::leased::{GOSSIP_DELIVERY_TIMEOUT, OUTBOUND_LEASE_TICK},
+            quic::{
+                CONNECTION_RECEIVE_WINDOW,
+                leased::{GOSSIP_DELIVERY_TIMEOUT, OUTBOUND_LEASE_TICK},
+            },
         },
         socket::Socket,
     };
@@ -1856,6 +1867,30 @@ mod tests {
     }
 
     #[test]
+    fn transport_refuses_uni_streams_and_datagrams() {
+        let mut pair = PeerPair::new();
+        let connection = &mut pair.client_peer.connection;
+
+        assert!(connection.streams().open(Dir::Uni).is_none());
+        assert!(connection.datagrams().max_size().is_none());
+    }
+
+    #[test]
+    fn transport_caps_connection_receive_window() {
+        let mut pair = PeerPair::new();
+        let connection = &mut pair.client_peer.connection;
+        connection.set_send_window(u64::MAX);
+
+        let chunk = vec![0u8; 1 << 20];
+        let mut accepted = 0;
+        for _ in 0..32 {
+            let id = connection.streams().open(Dir::Bi).unwrap();
+            accepted += connection.send_stream(id).write(&chunk).unwrap_or(0);
+        }
+        assert_eq!(accepted as u64, CONNECTION_RECEIVE_WINDOW.into_inner());
+    }
+
+    #[test]
     fn cluster_frames_above_u16_size_round_trip_and_preserve_the_next_frame() {
         let mut client_h = PeerHarness::with_cluster_size(1 << 20);
         let mut server_h = PeerHarness::with_cluster_size(1 << 20);
@@ -2074,6 +2109,7 @@ mod tests {
         let mut pair = PeerPair::new();
 
         let sid = pair.client_peer.open_stream(StreamProtocol::GossipSub).unwrap();
+        pair.client_peer.outbound_gossip = Some(sid);
         let stream_id = P2pStreamId::new(
             pair.client_peer.id.connection,
             sid.into(),
@@ -2116,6 +2152,44 @@ mod tests {
 
         assert!(server_peer.connection.is_closed(), "stall must close the connection");
         assert!(server_peer.streams.is_empty(), "closing drops every stream");
+    }
+
+    #[test]
+    fn superseded_inbound_gossip_stream_releases_its_reservation() {
+        use crate::p2p::streams::{gossip_in::GossipReadState, gossip_out::GossipWriteState};
+
+        let mut client_h = PeerHarness::new();
+        let mut server_h = PeerHarness::new();
+        let mut pair = PeerPair::new();
+
+        let first = pair.client_peer.open_stream(StreamProtocol::GossipSub).unwrap();
+        wait_for(&mut pair, &mut client_h, &mut server_h, 50, |_, _| false);
+        assert_eq!(pair.server_peer.inbound_gossip, Some(first));
+
+        let reservation = server_h.context.gossip_producer.reserve(1024, false).expect("reserve");
+        let stream = pair.server_peer.streams.get_mut(&first).unwrap();
+        stream.state.replace(StreamState::Gossip {
+            read: GossipReadState::ReadingBody {
+                reservation,
+                remaining: 1024,
+                last_read: Instant::now() + Duration::from_secs(60),
+            },
+            write: GossipWriteState::Idle,
+        });
+
+        let stream_id = P2pStreamId::new(0, 0, StreamProtocol::GossipSub, false);
+        client_h.send_gossip(stream_id, b"ping", &mut pair.client_peer);
+        let second = pair.client_peer.outbound_gossip.unwrap();
+        wait_for(&mut pair, &mut client_h, &mut server_h, 200, |_, s| {
+            s.received.values().any(|bytes| bytes.ends_with(b"ping"))
+        });
+
+        assert!(
+            server_h.received.values().any(|bytes| bytes.ends_with(b"ping")),
+            "a pinned reservation blocks delivery behind it"
+        );
+        assert_eq!(pair.server_peer.inbound_gossip, Some(second));
+        assert!(!pair.server_peer.streams.contains_key(&first));
     }
 
     #[test]
